@@ -31,6 +31,91 @@ local expandOperatable  = true
 
 local pickupInterval    = 0.3
 
+local SETTINGS_SCHEMA = {
+    ENABLED = { kind = "boolean" },
+    PICKUP_RANGE = { kind = "number", minimum = 100, maximum = 5000 },
+    ICON_DISPLAY_RANGE = { kind = "number", minimum = 100, maximum = 5000 },
+    SHOW_PICKUP_UI = { kind = "boolean" },
+    PICKUP_INTERVAL = { kind = "number", minimum = 0.05, maximum = 2.0 },
+    ICON_RANGE_PATCH = { kind = "boolean" },
+    EXPAND_OPERATABLE = { kind = "boolean" },
+    DEBUG_HOOKS = { kind = "boolean" },
+}
+
+local function validatedSettings(external)
+    if type(external) ~= "table" then error("settings must be a table") end
+    for key in pairs(external) do
+        if SETTINGS_SCHEMA[key] == nil then
+            error("unknown setting: " .. tostring(key))
+        end
+    end
+    local result = {}
+    for key, rule in pairs(SETTINGS_SCHEMA) do
+        local value = external[key]
+        if rule.kind == "boolean" then
+            if type(value) ~= "boolean" then error(key .. " must be boolean") end
+        else
+            if type(value) ~= "number"
+                or value ~= value
+                or value == math.huge
+                or value == -math.huge
+                or value < rule.minimum
+                or value > rule.maximum then
+                error(string.format(
+                    "%s must be between %s and %s",
+                    key,
+                    tostring(rule.minimum),
+                    tostring(rule.maximum)
+                ))
+            end
+        end
+        result[key] = value
+    end
+    return result
+end
+
+local function applyExternalConfig(external)
+    local settings = validatedSettings(external)
+    CONFIG.ENABLED = settings.ENABLED
+    CONFIG.SHOW_PICKUP_UI = settings.SHOW_PICKUP_UI
+    iconPatchEnabled = settings.ICON_RANGE_PATCH
+    expandOperatable = settings.EXPAND_OPERATABLE
+    DEBUG_HOOKS = settings.DEBUG_HOOKS
+    CONFIG.PICKUP_RANGE = settings.PICKUP_RANGE
+    CONFIG.ICON_DISPLAY_RANGE = settings.ICON_DISPLAY_RANGE
+    pickupInterval = settings.PICKUP_INTERVAL
+end
+
+local SCRIPT_DIRECTORY = (function()
+    local source = (debug.getinfo(1, "S") or {}).source or ""
+    if source:sub(1, 1) == "@" then source = source:sub(2) end
+    local directory = source:match("^(.*[\\/])")
+    if directory == nil then
+        error("canonical AutoPickupMod Scripts directory is unavailable")
+    end
+    return directory
+end)()
+
+local MOD_MENU_BRIDGE = (function()
+    local path = SCRIPT_DIRECTORY .. "../../shared/ModMenuBridge.lua"
+    local ok, bridge = pcall(function() return dofile(path) end)
+    if not ok then error("canonical ModMenuBridge load failed: " .. tostring(bridge)) end
+    if type(bridge) ~= "table" then
+        error("canonical ModMenuBridge did not return a table")
+    end
+    return bridge
+end)()
+
+do
+    local settings, _, info =
+        MOD_MENU_BRIDGE.readSettings("AutoPickupMod", SCRIPT_DIRECTORY)
+    if settings == nil then
+        error("canonical settings load failed: " ..
+            tostring(info and info.error or "unknown settings error"))
+    end
+    applyExternalConfig(settings)
+end
+
 local NOTIFY_PICKUP_CLASSES = {
     "/Game/ROD/Blueprints/Placement/Gimmick/PickUpItem/BP_PickUpItemBase.BP_PickUpItemBase_C",
 }
@@ -50,7 +135,6 @@ local GIMMICK_FIND_CLASSES = {
 
 local pollLoopActive   = false
 local mapLeaving       = false
-local pendingFastTravel = false
 local pickupQuietUntil = 0
 local lastPickupAt     = 0
 local gimmickCooldown  = {}
@@ -94,19 +178,9 @@ local runInitialExpandScan
 local isValidObj
 local getHero
 local numField
-local startFastTravelArrivalWatch
-
-local TRAVEL_STUCK_MS = 30000
-local travelWatchdogId = 0
-local ftWatchId = 0
+local TRAVEL_TIMEOUT_MS = 30000
+local travelTimeoutId = 0
 local travelScanId = 0
-local ftEndToken = 0
-local ftResumeScheduled = false
-
-local FT_DISABLE = 0
-local FT_CANCEL  = 1
-local FT_DECIDE  = 2
-local FT_ENABLE  = 3
 
 local function clearWorldRefs()
     dbg("clearWorldRefs/enter")
@@ -163,7 +237,7 @@ local function schedulePostRestRangeRefresh()
             if sid ~= travelScanId or mapLeaving then return end
             local hero = resolveHero()
             if not isValidObj(hero) then return end
-            if expandOperatable and CONFIG.PICKUP_RANGE > 0 then
+            if expandOperatable then
                 local n = expandGimmicksInRange(hero, getScanRange(getEffectiveRange(hero)))
                 print(string.format("[%s] post-rest expand: %d items\n", MOD_NAME, n or 0))
             end
@@ -184,7 +258,7 @@ local function schedulePostTravelScan()
                 return
             end
             applyHeroPickupRange(hero)
-            if expandOperatable and CONFIG.PICKUP_RANGE > 0 then
+            if expandOperatable then
                 expandedGimmicks = {}
                 expandedCount = 0
                 local n = expandGimmicksInRange(hero, getScanRange(getEffectiveRange(hero)))
@@ -197,14 +271,10 @@ local function schedulePostTravelScan()
 end
 
 local function endTravelState()
-    dbg("endTravelState/enter", string.format("mapLeaving=%s pendingFT=%s",
-        tostring(mapLeaving), tostring(pendingFastTravel)))
+    dbg("endTravelState/enter", string.format("mapLeaving=%s",
+        tostring(mapLeaving)))
     mapLeaving = false
-    pendingFastTravel = false
-    travelWatchdogId = travelWatchdogId + 1
-    ftWatchId = ftWatchId + 1
-    ftEndToken = ftEndToken + 1
-    ftResumeScheduled = false
+    travelTimeoutId = travelTimeoutId + 1
     dbg("endTravelState/done")
 end
 
@@ -239,66 +309,12 @@ onWorldReady = function(reason, quietSec)
         end)
     end, debug and debug.traceback or tostring)
     if not ok then
+        CONFIG.ENABLED = false
         print(string.format("[%s] onWorldReady error: %s\n", MOD_NAME, tostring(err)))
         dbg("onWorldReady/error", tostring(err))
     else
         dbg("onWorldReady/done")
     end
-end
-
-local function readFastTravelStatus()
-    local ps = FindFirstOf("RODPlayerState")
-    if not isValidObj(ps) then
-        ps = FindFirstOf("PlayerState")
-    end
-    if not isValidObj(ps) then return nil end
-    local ok, st = pcall(function() return ps.FastTravelStatus end)
-    if not ok or st == nil then return nil end
-    if type(st) == "number" then return st end
-    local n = numField(st)
-    if n then return n end
-    local ok2, s = pcall(function() return tonumber(tostring(st)) end)
-    if ok2 then return s end
-    return nil
-end
-
-startFastTravelArrivalWatch = function()
-    dbg("startFastTravelArrivalWatch/enter")
-    ftWatchId = ftWatchId + 1
-    local wid = ftWatchId
-    local sawActive = false
-    local ticks = 0
-
-    local function tick()
-        if wid ~= ftWatchId or not mapLeaving or not pendingFastTravel then
-            dbg("startFastTravelArrivalWatch/abort", string.format(
-                "widOk=%s mapLeaving=%s pendingFT=%s",
-                tostring(wid == ftWatchId), tostring(mapLeaving), tostring(pendingFastTravel)))
-            return
-        end
-        ticks = ticks + 1
-
-        local st = readFastTravelStatus()
-        if st == FT_DECIDE or st == FT_ENABLE then
-            if not sawActive then
-                dbg("startFastTravelArrivalWatch/sawActive", tostring(st))
-            end
-            sawActive = true
-        elseif sawActive and (st == FT_DISABLE or st == FT_CANCEL) then
-            print(string.format("[%s] FastTravelStatus settled (%s) — resume\n", MOD_NAME, tostring(st)))
-            dbg("startFastTravelArrivalWatch/settled", tostring(st))
-            onWorldReady("FastTravelStatus", 1.0)
-            return
-        end
-
-        if ticks < 60 then
-            ExecuteWithDelay(500, tick)
-        else
-            dbg("startFastTravelArrivalWatch/timeout", string.format("ticks=%d lastSt=%s", ticks, tostring(st)))
-        end
-    end
-
-    ExecuteWithDelay(500, tick)
 end
 
 local function beginQuietOnly(reason, quietSec)
@@ -330,7 +346,7 @@ local function beginQuietOnly(reason, quietSec)
                 if sid ~= travelScanId or mapLeaving then return end
                 local hero = resolveHero()
                 if not isValidObj(hero) then return end
-                if expandOperatable and CONFIG.PICKUP_RANGE > 0 then
+                if expandOperatable then
                     local n = expandGimmicksInRange(hero, getScanRange(getEffectiveRange(hero)))
                     print(string.format("[%s] post-quiet expand: %d items\n", MOD_NAME, n or 0))
                 end
@@ -346,35 +362,29 @@ local function onSleepBegin(reason)
     dbg("onSleepBegin/done")
 end
 
-local function beginTravel(reason, isFastTravel)
-    dbg("beginTravel/enter", string.format("reason=%s isFT=%s mapLeaving=%s",
-        tostring(reason or "?"), tostring(isFastTravel), tostring(mapLeaving)))
+local function beginTravel(reason)
+    dbg("beginTravel/enter", string.format("reason=%s mapLeaving=%s",
+        tostring(reason or "?"), tostring(mapLeaving)))
     if mapLeaving then
-        if isFastTravel then pendingFastTravel = true end
-        dbg("beginTravel/alreadyLeaving", string.format("pendingFT=%s", tostring(pendingFastTravel)))
+        dbg("beginTravel/alreadyLeaving")
         return
     end
     mapLeaving = true
-    pendingFastTravel = isFastTravel and true or false
     travelScanId = travelScanId + 1
-    ftResumeScheduled = false
     clearWorldRefs()
     initialScanDone = false
     print(string.format("[%s] travel begin (%s) — pickup paused\n", MOD_NAME, tostring(reason or "?")))
-    dbg("beginTravel/paused", string.format("pendingFT=%s", tostring(pendingFastTravel)))
+    dbg("beginTravel/paused")
 
-    if pendingFastTravel then
-        startFastTravelArrivalWatch()
-    end
-
-    travelWatchdogId = travelWatchdogId + 1
-    local wid = travelWatchdogId
-    ExecuteWithDelay(TRAVEL_STUCK_MS, function()
-        if not mapLeaving or wid ~= travelWatchdogId then return end
-        print(string.format("[%s] travel watchdog — force resume after %dms (%s)\n",
-            MOD_NAME, TRAVEL_STUCK_MS, tostring(reason or "?")))
-        dbg("beginTravel/watchdog", tostring(reason or "?"))
-        onWorldReady("watchdog", 1.0)
+    travelTimeoutId = travelTimeoutId + 1
+    local timeoutId = travelTimeoutId
+    ExecuteWithDelay(TRAVEL_TIMEOUT_MS, function()
+        if not mapLeaving or timeoutId ~= travelTimeoutId then return end
+        print(string.format(
+            "[%s] TRAVEL ERROR | ClientRestart was not received after %dms; pickup remains paused\n",
+            MOD_NAME,
+            TRAVEL_TIMEOUT_MS
+        ))
     end)
     dbg("beginTravel/done")
 end
@@ -511,15 +521,7 @@ numField = function(v)
 end
 
 getEffectiveRange = function(hero)
-    if CONFIG.PICKUP_RANGE > 0 then return CONFIG.PICKUP_RANGE end
-    if isValidObj(hero) then
-        local ok, dist = pcall(function() return hero.TakeItemDistance end)
-        if ok then
-            dist = numField(dist)
-            if dist and dist > 0 then return dist end
-        end
-    end
-    return 300.0
+    return CONFIG.PICKUP_RANGE
 end
 
 local function getCapsuleRadius(hero)
@@ -534,16 +536,6 @@ local function readTakeItemDistance(hero)
 end
 
 applyHeroPickupRange = function(hero)
-    if CONFIG.PICKUP_RANGE <= 0 then
-        if DEBUG_HOOKS then
-            local now = os.clock()
-            if now - lastRangeSkipDbg >= 5.0 then
-                lastRangeSkipDbg = now
-                dbg("applyHeroPickupRange/skip", "CONFIG.PICKUP_RANGE<=0 (game default)")
-            end
-        end
-        return
-    end
     if not isValidObj(hero) then
         if DEBUG_HOOKS then
             local now = os.clock()
@@ -589,31 +581,20 @@ applyHeroPickupRange = function(hero)
 end
 
 local function formatRangeLabel(hero)
-    if CONFIG.PICKUP_RANGE > 0 then
-        return string.format("%.0f (~%.1fm)", CONFIG.PICKUP_RANGE, CONFIG.PICKUP_RANGE / 100)
-    end
-    local r = isValidObj(hero) and getEffectiveRange(hero) or 300.0
-    return string.format("game default %.0f (~%.1fm)", r, r / 100)
+    return string.format(
+        "%.0f (~%.1fm)",
+        CONFIG.PICKUP_RANGE,
+        CONFIG.PICKUP_RANGE / 100
+    )
 end
 
 local function formatIconDisplayLabel()
     local cm = CONFIG.ICON_DISPLAY_RANGE
-    if not cm or cm <= 0 then
-        cm = CONFIG.PICKUP_RANGE
-    end
-    if cm <= 0 then
-        return "game default"
-    end
     return string.format("%.0f (~%.1fm)", cm, cm / 100)
 end
 
 local function getIconDisplayTarget()
-    local base = CONFIG.ICON_DISPLAY_RANGE
-    if not base or base <= 0 then
-        base = CONFIG.PICKUP_RANGE
-    end
-    if base <= 0 then return nil end
-    return base
+    return CONFIG.ICON_DISPLAY_RANGE
 end
 
 local function readConfigField(gc, fieldName)
@@ -734,12 +715,9 @@ scheduleIconRangePatch = function(delayMs, retries)
 end
 
 local function getPlayerController(hero)
-    local pc
-    pcall(function() pc = hero:GetPlayerController() end)
-    if isValidObj(pc) then return pc end
-    pc = FindFirstOf("RODInGamePlayerController")
-    if isValidObj(pc) then return pc end
-    return FindFirstOf("PlayerController")
+    local ok, pc = pcall(function() return hero:GetPlayerController() end)
+    if ok and isValidObj(pc) then return pc end
+    return nil
 end
 
 getScanRange = function(maxRange)
@@ -749,18 +727,10 @@ end
 local function getCandidateGimmick(hero)
     if not isValidObj(hero) then return nil end
 
-    local target = nil
-    local okVA, vaTarget = pcall(function() return hero:GetVATargetGimmick() end)
-    if okVA and isValidObj(vaTarget) then
-        target = vaTarget
-    else
-        local okCur, curTarget = pcall(function() return hero.CurrentTargetGimmick end)
-        if okCur and isValidObj(curTarget) then
-            target = curTarget
-        end
-    end
+    local okVA, target = pcall(function() return hero:GetVATargetGimmick() end)
 
-    if not isValidObj(target) or not isPickupGimmick(target) then return nil end
+    if not okVA or not isValidObj(target)
+        or not isPickupGimmick(target) then return nil end
     return target
 end
 
@@ -985,7 +955,7 @@ end
 
 local function onNewPickupGimmick(gimmick)
     if mapLeaving then return end
-    if not expandOperatable or CONFIG.PICKUP_RANGE <= 0 then return end
+    if not expandOperatable then return end
     -- 스폰 폭주 시 로그 과다 방지 (초당 3회)
     if DEBUG_HOOKS then
         local now = os.clock()
@@ -1007,7 +977,7 @@ end
 
 runInitialExpandScan = function()
     if initialScanDone then return end
-    if not expandOperatable or CONFIG.PICKUP_RANGE <= 0 then return end
+    if not expandOperatable then return end
 
     initialScanDone = true
     local attempts = 0
@@ -1351,18 +1321,24 @@ startPoll = function()
     ExecuteWithDelay(500, poll)
 end
 
-local function safeRegisterHook(path, fn, label)
-    dbg("safeRegisterHook/try", label or path)
+local function requireLifecycleHook(path, fn, label)
+    if type(path) ~= "string" or path == ""
+        or type(fn) ~= "function"
+        or type(label) ~= "string" or label == "" then
+        CONFIG.ENABLED = false
+        error("[" .. MOD_NAME .. "] HOOK ERROR | invalid canonical hook registration")
+    end
+    dbg("requireLifecycleHook/try", label)
     local ok, err = pcall(function()
         RegisterHook(path, fn)
     end)
-    if ok then
-        print(string.format("[%s] hooked %s\n", MOD_NAME, label or path))
-        dbg("safeRegisterHook/ok", label or path)
-    else
-        print(string.format("[%s] hook failed %s: %s\n", MOD_NAME, label or path, tostring(err)))
-        dbg("safeRegisterHook/fail", string.format("%s err=%s", label or path, tostring(err)))
+    if not ok then
+        CONFIG.ENABLED = false
+        error(string.format("[%s] HOOK ERROR | %s: %s",
+            MOD_NAME, label, tostring(err)))
     end
+    print(string.format("[%s] hooked %s\n", MOD_NAME, label))
+    dbg("requireLifecycleHook/ok", label)
 end
 
 RegisterHook("/Script/Engine.PlayerController:ClientRestart", function()
@@ -1399,95 +1375,57 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function()
     end)
 end)
 
-safeRegisterHook("/Script/Engine.PlayerController:ClientTravelInternal", function()
+requireLifecycleHook("/Script/Engine.PlayerController:ClientTravelInternal", function()
     dbg("Hook/ClientTravelInternal")
-    beginTravel("ClientTravelInternal", false)
+    beginTravel("ClientTravelInternal")
 end, "ClientTravelInternal")
 
-safeRegisterHook("/Script/Engine.PlayerController:ClientTravel", function()
+requireLifecycleHook("/Script/Engine.PlayerController:ClientTravel", function()
     dbg("Hook/ClientTravel")
-    beginTravel("ClientTravel", false)
+    beginTravel("ClientTravel")
 end, "ClientTravel")
 
-safeRegisterHook("/Script/Engine.PlayerController:ClientPrepareMapChange", function()
+requireLifecycleHook("/Script/Engine.PlayerController:ClientPrepareMapChange", function()
     dbg("Hook/ClientPrepareMapChange")
-    beginTravel("ClientPrepareMapChange", false)
+    beginTravel("ClientPrepareMapChange")
 end, "ClientPrepareMapChange")
 
-safeRegisterHook("/Script/ROD.RODPlayerState:ServerDecideTown", function()
+requireLifecycleHook("/Script/ROD.RODPlayerState:ServerDecideTown", function()
     dbg("Hook/ServerDecideTown")
-    beginTravel("ServerDecideTown", false)
+    beginTravel("ServerDecideTown")
 end, "ServerDecideTown")
 
-safeRegisterHook("/Script/ROD.RODPlayerState:ServerDecideFastTravel", function()
+requireLifecycleHook("/Script/ROD.RODPlayerState:ServerDecideFastTravel", function()
     dbg("Hook/ServerDecideFastTravel")
-    beginTravel("ServerDecideFastTravel", true)
+    beginTravel("ServerDecideFastTravel")
 end, "ServerDecideFastTravel")
 
-safeRegisterHook("/Script/ROD.RODWorldGameState:CheckFastTravelTeleport", function()
-    -- 게임이 FT 중 ~0.1초마다 호출함 → 첫 1회만 +8s 재개 예약 (타이머 폭주 방지)
-    if not (mapLeaving and pendingFastTravel) then return end
-    if ftResumeScheduled then return end
-    ftResumeScheduled = true
-    local tok = ftEndToken
-    dbg("Hook/CheckFastTravelTeleport/schedule+8s", string.format("tok=%d", tok))
-    ExecuteWithDelay(8000, function()
-        if tok ~= ftEndToken then return end
-        if mapLeaving and pendingFastTravel then
-            dbg("Hook/CheckFastTravelTeleport/resume+8s")
-            onWorldReady("CheckFastTravelTeleport+8s", 2.0)
-        else
-            dbg("Hook/CheckFastTravelTeleport/+8sSkip")
-        end
-    end)
-end, "CheckFastTravelTeleport")
-
-safeRegisterHook("/Script/ROD.RODPlayerState:OnRep_FastTravelStatus", function()
-    dbg("Hook/OnRep_FastTravelStatus/enter", string.format("mapLeaving=%s pendingFT=%s",
-        tostring(mapLeaving), tostring(pendingFastTravel)))
-    if not (mapLeaving and pendingFastTravel) then
-        dbg("Hook/OnRep_FastTravelStatus/skip")
-        return
-    end
-    ExecuteWithDelay(600, function()
-        if not (mapLeaving and pendingFastTravel) then
-            dbg("Hook/OnRep_FastTravelStatus/delaySkip")
-            return
-        end
-        local st = readFastTravelStatus()
-        dbg("Hook/OnRep_FastTravelStatus/status", tostring(st))
-        if st == FT_DISABLE or st == FT_CANCEL then
-            onWorldReady("OnRep_FastTravelStatus", 1.0)
-        end
-    end)
-end, "OnRep_FastTravelStatus")
-
-safeRegisterHook("/Script/ROD.RODPlayerState:ServerNotifyQuestTeleportOut", function()
+requireLifecycleHook("/Script/ROD.RODPlayerState:ServerNotifyQuestTeleportOut", function()
     dbg("Hook/ServerNotifyQuestTeleportOut")
     beginQuietOnly("ServerNotifyQuestTeleportOut", 4.0)
 end, "ServerNotifyQuestTeleportOut")
 
-safeRegisterHook("/Script/ROD.RODPlayerState:ServerShowQuestResult", function()
+requireLifecycleHook("/Script/ROD.RODPlayerState:ServerShowQuestResult", function()
     dbg("Hook/ServerShowQuestResult")
-    beginTravel("ServerShowQuestResult", false)
+    beginTravel("ServerShowQuestResult")
 end, "ServerShowQuestResult")
 
-safeRegisterHook("/Script/ROD.RODHeroCharacter:ServerSleepDirection", function()
+requireLifecycleHook("/Script/ROD.RODHeroCharacter:ServerSleepDirection", function()
     dbg("Hook/ServerSleepDirection")
     onSleepBegin("ServerSleepDirection")
 end, "ServerSleepDirection")
 
-safeRegisterHook("/Script/ROD.RODGameState:StartSleepDirection", function()
+requireLifecycleHook("/Script/ROD.RODGameState:StartSleepDirection", function()
     dbg("Hook/StartSleepDirection")
     onSleepBegin("StartSleepDirection")
 end, "StartSleepDirection")
 
-safeRegisterHook("/Script/ROD.RODInGamePlayerController:ClientStartSleepFade", function()
+requireLifecycleHook("/Script/ROD.RODInGamePlayerController:ClientStartSleepFade", function()
     dbg("Hook/ClientStartSleepFade")
     onSleepBegin("ClientStartSleepFade")
 end, "ClientStartSleepFade")
 
-safeRegisterHook("/Script/ROD.RODInGamePlayerController:StartSleepFade", function()
+requireLifecycleHook("/Script/ROD.RODInGamePlayerController:StartSleepFade", function()
     dbg("Hook/StartSleepFade")
     onSleepBegin("StartSleepFade")
 end, "StartSleepFade")
@@ -1518,68 +1456,41 @@ local function onTownWarpMenuClose()
     dbg("onTownWarpMenuClose/done")
 end
 
-local function safeReadEnumParam(params, idx)
+local function readEnumParam(params, idx)
     if not params then return nil end
     local p = params[idx]
     if p == nil then return nil end
     local ok, v = pcall(function() return p:get() end)
     if ok and type(v) == "number" then return v end
-    ok, v = pcall(function() return tonumber(tostring(p)) end)
-    if ok and v then return v end
     return nil
 end
 
-safeRegisterHook("/Script/ROD.RODPlayerState:ClientPassiveUIOpen", function(self, params)
-    local kind = safeReadEnumParam(params, 1)
+requireLifecycleHook("/Script/ROD.RODPlayerState:ClientPassiveUIOpen", function(self, params)
+    local kind = readEnumParam(params, 1)
     if kind == TOWN_WARP_MENU_KIND then
         dbg("Hook/ClientPassiveUIOpen", string.format("kind=%s", tostring(kind)))
         onTownWarpMenuOpen()
     end
 end, "ClientPassiveUIOpen")
 
-safeRegisterHook("/Script/ROD.RODPlayerState:ClientPassiveUIClose", function()
+requireLifecycleHook("/Script/ROD.RODPlayerState:ClientPassiveUIClose", function()
     if townWarpMenuOpen then
         dbg("Hook/ClientPassiveUIClose")
     end
     onTownWarpMenuClose()
 end, "ClientPassiveUIClose")
 
-safeRegisterHook("/Script/ROD.RODPlayerState:OpenMenu", function(self, params)
-    local kind = safeReadEnumParam(params, 1)
+requireLifecycleHook("/Script/ROD.RODPlayerState:OpenMenu", function(self, params)
+    local kind = readEnumParam(params, 1)
     if kind == TOWN_WARP_MENU_KIND then
         dbg("Hook/OpenMenu/TownWarp", string.format("kind=%s", tostring(kind)))
         onTownWarpMenuOpen()
     end
 end, "OpenMenu(TownWarp)")
 
-pcall(function()
-    RegisterLoadMapPreHook(function()
-        dbg("Hook/LoadMapPre")
-        beginTravel("LoadMapPre", false)
-    end)
-end)
-
 ExecuteInGameThread(function()
     startPoll()
     scheduleIconRangePatch(1500, 3)
-end)
-
-pcall(function()
-    RegisterHook("/Script/ROD.RODGameInstance:LoadInGameGameModeCompleted", function()
-        dbg("Hook/LoadInGameGameModeCompleted/enter", string.format("mapLeaving=%s", tostring(mapLeaving)))
-        if mapLeaving then
-            onWorldReady("LoadInGameGameModeCompleted", 2.0)
-        else
-            scheduleIconRangePatch(300, 2)
-            ExecuteWithDelay(500, function()
-                if mapLeaving then return end
-                ExecuteInGameThread(function()
-                    dbg("Hook/LoadInGameGameModeCompleted/applyRange")
-                    applyHeroPickupRange(resolveHero())
-                end)
-            end)
-        end
-    end)
 end)
 
 local function consoleReply(ar, msg)
@@ -1590,130 +1501,21 @@ end
 
 local function runAutopickupCommand(params, ar)
     local sub = params[1]
-
-    local function reply(msg)
-        consoleReply(ar, msg)
-    end
-
-    if sub == "range" then
-        local v = tonumber(params[2])
-        if v == nil or v < 0 then
-            reply("usage: autopickup range <cm>  (0=game default, current: " .. formatRangeLabel(getHero()) .. ")")
-            return
-        end
-        CONFIG.PICKUP_RANGE = v
-        expandedGimmicks = {}
-        nearbyExpanded = {}
-        lastAppliedTakeItemDist = nil
-        lastIconDbgKey = nil
-        dbg("console/range", string.format("PICKUP_RANGE=%.0f", v))
-        scheduleIconRangePatch(100)
-        pcall(function()
-            ExecuteInGameThread(function() applyHeroPickupRange(resolveHero()) end)
-        end)
-        if v == 0 then
-            reply("pickup range = game default (TakeItemDistance)")
-        else
-            reply(string.format("pickup range = %.0f (%.1fm)", v, v / 100))
-        end
+    if sub ~= nil and sub ~= "show" and sub ~= "status" then
+        consoleReply(ar,
+            "Read-only command. Change persistent settings through config.lua or ModMenu.")
         return
     end
 
-    if sub == "icondist" then
-        local v = tonumber(params[2])
-        if v == nil or v < 0 then
-            reply("usage: autopickup icondist <cm>  (0=same as pickup, current: " .. formatIconDisplayLabel() .. ")")
-            return
-        end
-        CONFIG.ICON_DISPLAY_RANGE = v
-        scheduleIconRangePatch(50)
-        if v == 0 then
-            reply("icon display = same as pickup (" .. formatIconDisplayLabel() .. ")")
-        else
-            reply(string.format("icon display = %.0f (%.1fm)", v, v / 100))
-        end
-        return
-    end
-
-    if sub == "icon" then
-        local arg = params[2]
-        if arg == "on" then
-            iconPatchEnabled = true
-        elseif arg == "off" then
-            iconPatchEnabled = false
-        elseif arg == "dist" or arg == "range" then
-            local v = tonumber(params[3])
-            if v == nil or v < 0 then
-                reply("usage: autopickup icon dist <cm>  (0=same as pickup, current: " .. formatIconDisplayLabel() .. ")")
-                return
-            end
-            CONFIG.ICON_DISPLAY_RANGE = v
-            scheduleIconRangePatch(50)
-            if v == 0 then
-                reply("icon display = same as pickup (" .. formatIconDisplayLabel() .. ")")
-            else
-                reply(string.format("icon display = %.0f (%.1fm)", v, v / 100))
-            end
-            return
-        else
-            iconPatchEnabled = not iconPatchEnabled
-        end
-        scheduleIconRangePatch(50)
-        reply("icon range patch " .. (iconPatchEnabled and "ON" or "OFF"))
-        return
-    end
-
-    if sub == "interval" then
-        local v = tonumber(params[2])
-        if not v or v < 0 then
-            reply("usage: autopickup interval <sec>  (current: " .. pickupInterval .. ")")
-            return
-        end
-        pickupInterval = v
-        reply(string.format("pickup interval = %.2fs", v))
-        return
-    end
-
-    if sub == "expand" then
-        expandOperatable = not expandOperatable
-        reply("OperatableArea expand " .. (expandOperatable and "ON" or "OFF"))
-        return
-    end
-
-    if sub == "toggle" then
-        CONFIG.ENABLED = not CONFIG.ENABLED
-        reply(CONFIG.ENABLED and "ON" or "OFF")
-        return
-    end
-
-    if sub == "debug" then
-        local arg = params[2]
-        if arg == "on" then
-            DEBUG_HOOKS = true
-        elseif arg == "off" then
-            DEBUG_HOOKS = false
-        else
-            DEBUG_HOOKS = not DEBUG_HOOKS
-        end
-        reply("hook debug " .. (DEBUG_HOOKS and "ON" or "OFF"))
-        dbg("console/debugToggle", DEBUG_HOOKS and "ON" or "OFF")
-        return
-    end
-
-    if sub == "notify" then
-        CONFIG.SHOW_PICKUP_UI = not CONFIG.SHOW_PICKUP_UI
-        reply("pickup notification UI " .. (CONFIG.SHOW_PICKUP_UI and "ON" or "OFF"))
-        return
-    end
-
-    reply(string.format(
-        "%s %s | %s | pickup=%s | icon_dist=%s | icon_patch=%s | notify=%s | debug=%s\n" ..
-        "Commands: range <cm> | icondist <cm> | icon [on|off|dist <cm>] | interval <sec> | expand | toggle | notify | debug [on|off]",
+    consoleReply(ar, string.format(
+        "%s %s | %s | pickup=%s | icon_dist=%s | interval=%.2fs | icon_patch=%s | expand=%s | notify=%s | debug=%s",
         MOD_NAME, MOD_VERSION,
         CONFIG.ENABLED and "ON" or "OFF",
         formatRangeLabel(getHero()),
         formatIconDisplayLabel(),
+        pickupInterval,
         iconPatchEnabled and "ON" or "OFF",
+        expandOperatable and "ON" or "OFF",
         CONFIG.SHOW_PICKUP_UI and "ON" or "OFF",
         DEBUG_HOOKS and "ON" or "OFF"
     ))
@@ -1728,39 +1530,8 @@ end)
 -- locals, so the settings file uses stable public names and this loader maps
 -- them onto whatever each one is actually stored in.
 do
-    local function readNumber(value, current, minimum)
-        local number = tonumber(value)
-        if number == nil then return current end
-        if minimum ~= nil and number < minimum then return current end
-        return number
-    end
-
-    local function applyExternalConfig(external)
-        if type(external) ~= "table" then return end
-
-        if external.ENABLED ~= nil then CONFIG.ENABLED = external.ENABLED ~= false end
-        if external.SHOW_PICKUP_UI ~= nil then
-            CONFIG.SHOW_PICKUP_UI = external.SHOW_PICKUP_UI ~= false
-        end
-        if external.ICON_RANGE_PATCH ~= nil then
-            iconPatchEnabled = external.ICON_RANGE_PATCH ~= false
-        end
-        if external.EXPAND_OPERATABLE ~= nil then
-            expandOperatable = external.EXPAND_OPERATABLE ~= false
-        end
-        if external.DEBUG_HOOKS ~= nil then
-            DEBUG_HOOKS = external.DEBUG_HOOKS == true
-        end
-
-        CONFIG.PICKUP_RANGE = readNumber(external.PICKUP_RANGE, CONFIG.PICKUP_RANGE, 0)
-        CONFIG.ICON_DISPLAY_RANGE =
-            readNumber(external.ICON_DISPLAY_RANGE, CONFIG.ICON_DISPLAY_RANGE, 0)
-        pickupInterval = readNumber(external.PICKUP_INTERVAL, pickupInterval, 0)
-    end
-
-    -- Mirrors the `autopickup range` console path: every cache keyed off the old
-    -- radius has to be dropped or the new one only takes effect for items that
-    -- happen to be seen for the first time.
+    -- Every cache keyed off the old radius has to be dropped so the new value
+    -- applies to already discovered items.
     local function activateExternalConfig()
         expandedGimmicks = {}
         nearbyExpanded = {}
@@ -1770,35 +1541,25 @@ do
         pcall(function() applyHeroPickupRange(resolveHero()) end)
     end
 
-    local source = (debug.getinfo(1, "S") or {}).source or ""
-    if source:sub(1, 1) == "@" then source = source:sub(2) end
-    local scriptDirectory = source:match("^(.*[\\/])")
-
-    local function loadModMenuBridge()
-        local required, bridge = pcall(require, "ModMenuBridge")
-        if required and type(bridge) == "table" then return bridge end
-        for _, path in ipairs({
-            (scriptDirectory or "") .. "../../shared/ModMenuBridge.lua",
-            "Mods/shared/ModMenuBridge.lua",
-            "Mods\\shared\\ModMenuBridge.lua",
-        }) do
-            local ok, result = pcall(function() return dofile(path) end)
-            if ok and type(result) == "table" then return result end
-        end
-        return nil
-    end
-
-    local bridge = loadModMenuBridge()
-    if bridge ~= nil then
-        bridge.attach({
+    local attachment, attachmentError = MOD_MENU_BRIDGE.attach({
             modName = "AutoPickupMod",
-            scriptDir = scriptDirectory,
+            scriptDir = SCRIPT_DIRECTORY,
+            pollMs = 750,
             load = applyExternalConfig,
             apply = activateExternalConfig,
+            fail = function(message)
+                CONFIG.ENABLED = false
+                expandedGimmicks = {}
+                nearbyExpanded = {}
+                cachedHero = nil
+                print("[AutoPickupMod] FAIL-CLOSED | " ..
+                    tostring(message) .. "\n")
+            end,
             log = function(message) print("[AutoPickupMod] " .. tostring(message) .. "\n") end,
-        })
-    else
-        print("[AutoPickupMod] ModMenuBridge unavailable; settings apply on restart only\n")
+    })
+    if attachment == nil then
+        CONFIG.ENABLED = false
+        error("ModMenuBridge attach failed: " .. tostring(attachmentError))
     end
 end
 

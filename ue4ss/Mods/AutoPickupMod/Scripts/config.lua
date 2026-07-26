@@ -7,11 +7,9 @@ return {
     ENABLED = true,
 
     -- Pickup radius in centimeters. 100 = 1 meter.
-    -- 0 falls back to the game's own TakeItemDistance.
     PICKUP_RANGE = 1000,
 
     -- How far away the pickup icon is still drawn, in centimeters.
-    -- 0 means "same as PICKUP_RANGE".
     ICON_DISPLAY_RANGE = 1500,
 
     -- The small "obtained X" notification.

@@ -14,8 +14,8 @@
 -- pit/out-of-bounds teleports use separate thresholds and fade-event types —
 -- this mod never touches them.
 --
--- Perf: no per-tick polling. Event hooks (ClientRestart, LoadMap) do the
--- re-apply; a 5s safety net does ONE cached-object validity check and ONE
+-- Perf: no per-tick polling. ClientRestart invalidates map-owned references;
+-- a 5s safety net does ONE cached-object validity check and ONE
 -- cached float read per tick — object-table scans (FindFirstOf/FindAllOf)
 -- happen only when a cache is invalid (spawn, zone load, config rebuild).
 --
@@ -28,31 +28,64 @@ print("[norescue] loading…")
 local DEFAULTS = {
     ENABLED = true,
     SAFETY_NET_MS = 5000,
-    DEATH_LANDING_HEIGHT = 1000000000.0, -- 0 = leave the game's threshold alone
+    DEATH_LANDING_HEIGHT = 1000000000.0,
     DEBUG_LOGS = false,
 }
 
 local function scriptDir()
     local s = (debug.getinfo(1, "S") or {}).source or ""
     if s:sub(1, 1) == "@" then s = s:sub(2) end
-    return s:match("^(.*[\\/])") or "./"
+    local directory = s:match("^(.*[\\/])")
+    if directory == nil then
+        error("canonical norescue Scripts directory is unavailable")
+    end
+    return directory
 end
+local SCRIPT_DIR = scriptDir()
 local CONFIG = {}
 for k, v in pairs(DEFAULTS) do CONFIG[k] = v end
 
--- Unknown keys and type mismatches are dropped rather than trusted. This runs
--- again on every in-game change, so it is also the guard against a bad value
--- arriving from the Mods menu.
 local function applyExternalConfig(c)
-    if type(c) ~= "table" then return end
-    for k, v in pairs(c) do
-        if DEFAULTS[k] ~= nil and type(v) == type(DEFAULTS[k]) then CONFIG[k] = v end
+    if type(c) ~= "table" then error("settings must be a table") end
+    for key in pairs(c) do
+        if DEFAULTS[key] == nil then error("unknown setting: " .. tostring(key)) end
     end
+    if type(c.ENABLED) ~= "boolean" then error("ENABLED must be boolean") end
+    if type(c.SAFETY_NET_MS) ~= "number"
+        or c.SAFETY_NET_MS < 500 or c.SAFETY_NET_MS > 60000 then
+        error("SAFETY_NET_MS must be between 500 and 60000")
+    end
+    if type(c.DEATH_LANDING_HEIGHT) ~= "number"
+        or c.DEATH_LANDING_HEIGHT < 1000
+        or c.DEATH_LANDING_HEIGHT > 1000000000000 then
+        error("DEATH_LANDING_HEIGHT must be between 1000 and 1000000000000")
+    end
+    if type(c.DEBUG_LOGS) ~= "boolean" then error("DEBUG_LOGS must be boolean") end
+
+    CONFIG.ENABLED = c.ENABLED
+    CONFIG.SAFETY_NET_MS = c.SAFETY_NET_MS
+    CONFIG.DEATH_LANDING_HEIGHT = c.DEATH_LANDING_HEIGHT
+    CONFIG.DEBUG_LOGS = c.DEBUG_LOGS
 end
 
+local MOD_MENU_BRIDGE = (function()
+    local path = SCRIPT_DIR .. "../../shared/ModMenuBridge.lua"
+    local ok, bridge = pcall(function() return dofile(path) end)
+    if not ok then error("canonical ModMenuBridge load failed: " .. tostring(bridge)) end
+    if type(bridge) ~= "table" then
+        error("canonical ModMenuBridge did not return a table")
+    end
+    return bridge
+end)()
+
 do
-    local ok, c = pcall(function() return dofile(scriptDir() .. "config.lua") end)
-    if ok then applyExternalConfig(c) end
+    local external, _, info =
+        MOD_MENU_BRIDGE.readSettings("norescue", SCRIPT_DIR)
+    if external == nil then
+        error("canonical settings load failed: " ..
+            tostring(info and info.error or "unknown settings error"))
+    end
+    applyExternalConfig(external)
 end
 
 local function dbg(m) if CONFIG.DEBUG_LOGS then print("[norescue] " .. tostring(m)) end end
@@ -152,33 +185,51 @@ local gcCache
 local originalLandingHeight
 
 local function applyThreshold()
-    if CONFIG.DEATH_LANDING_HEIGHT <= 0 then return end
     -- cheap path: cached object still valid and still carrying our value
     if valid(gcCache) then
-        local cur
-        pcall(function() cur = tonumber(gcCache.DeathLandingHeight) end)
+        local readOk, cur = pcall(function()
+            return tonumber(gcCache.DeathLandingHeight)
+        end)
+        if not readOk or cur == nil then
+            error("cached RODGameConfig.DeathLandingHeight read failed: " ..
+                tostring(cur))
+        end
         if cur == CONFIG.DEATH_LANDING_HEIGHT then return end
     else
         gcCache = nil
     end
     -- repair path: (re)find every config object and set the threshold
     local ok, list = pcall(function() return FindAllOf("RODGameConfig") end)
-    if not (ok and type(list) == "table") then return end
+    if not ok then error("FindAllOf(RODGameConfig) failed: " .. tostring(list)) end
+    if type(list) ~= "table" then error("FindAllOf(RODGameConfig) returned no table") end
+    local applied = 0
     for _, gc in ipairs(list) do
         if valid(gc) then
-            local before
-            pcall(function() before = tonumber(gc.DeathLandingHeight) end)
+            local readOk, before = pcall(function()
+                return tonumber(gc.DeathLandingHeight)
+            end)
+            if not readOk or before == nil then
+                error("RODGameConfig.DeathLandingHeight read failed: " ..
+                    tostring(before))
+            end
             if originalLandingHeight == nil and before ~= nil
                 and before ~= CONFIG.DEATH_LANDING_HEIGHT then
                 originalLandingHeight = before
             end
-            if pcall(function() gc.DeathLandingHeight = CONFIG.DEATH_LANDING_HEIGHT end) then
-                gcCache = gc
-                print(string.format("[norescue] DeathLandingHeight %s -> %.0f",
-                    tostring(before), CONFIG.DEATH_LANDING_HEIGHT))
+            local writeOk, writeError = pcall(function()
+                gc.DeathLandingHeight = CONFIG.DEATH_LANDING_HEIGHT
+            end)
+            if not writeOk then
+                error("RODGameConfig.DeathLandingHeight write failed: " ..
+                    tostring(writeError))
             end
+            gcCache = gc
+            applied = applied + 1
+            print(string.format("[norescue] DeathLandingHeight %s -> %.0f",
+                tostring(before), CONFIG.DEATH_LANDING_HEIGHT))
         end
     end
+    if applied == 0 then error("no valid RODGameConfig object is available") end
 end
 
 -- Both levers are plain writes, so switching the mod off in-game just puts the
@@ -234,7 +285,7 @@ local function safetyNet()
 end
 
 local function onRespawnPath()
-    heroCache, switchedHeroKey = nil, nil
+    heroCache, switchedHeroKey, gcCache = nil, nil, nil
     heroWaitingReported = false
     heroReadyReported = false
     heroLookupErrorReported = false
@@ -243,49 +294,33 @@ local function onRespawnPath()
     ExecuteWithDelay(1000, function() ExecuteInGameThread(applyAll) end)
 end
 
-pcall(function()
-    RegisterLoadMapPreHook(function()
-        heroCache, switchedHeroKey, gcCache = nil, nil, nil
-        heroWaitingReported = false
-        heroReadyReported = false
-        heroLookupErrorReported = false
-        heroIdentityErrorReported = false
-        heroSwitchErrorReported = false
-    end)
-end)
-pcall(function() RegisterLoadMapPostHook(onRespawnPath) end)
-pcall(function() RegisterHook("/Script/Engine.PlayerController:ClientRestart", onRespawnPath) end)
+RegisterHook("/Script/Engine.PlayerController:ClientRestart", onRespawnPath)
 
 ------------------------------------------------------------ runtime settings
 -- Lets the in-game Mods menu flip ENABLED or retune the threshold without a
 -- restart. applyAll already handles both directions, so the bridge only has to
 -- reload the values and poke it.
 do
-    local function loadModMenuBridge()
-        local required, bridge = pcall(require, "ModMenuBridge")
-        if required and type(bridge) == "table" then return bridge end
-        for _, path in ipairs({
-            scriptDir() .. "../../shared/ModMenuBridge.lua",
-            "Mods/shared/ModMenuBridge.lua",
-            "Mods\\shared\\ModMenuBridge.lua",
-        }) do
-            local ok, result = pcall(function() return dofile(path) end)
-            if ok and type(result) == "table" then return result end
-        end
-        return nil
-    end
-
-    local bridge = loadModMenuBridge()
-    if bridge ~= nil then
-        bridge.attach({
-            modName = "norescue",
-            scriptDir = scriptDir(),
-            load = applyExternalConfig,
-            apply = applyAll,
-            log = function(message) print("[norescue] " .. tostring(message)) end,
-        })
-    else
-        print("[norescue] ModMenuBridge unavailable; settings apply on restart only")
+    local attachment, attachmentError = MOD_MENU_BRIDGE.attach({
+        modName = "norescue",
+        scriptDir = SCRIPT_DIR,
+        pollMs = 750,
+        load = applyExternalConfig,
+        apply = applyAll,
+        fail = function(reason)
+            CONFIG.ENABLED = false
+            local ok, revertError = xpcall(revertAll,
+                debug and debug.traceback or tostring)
+            if not ok then
+                error("fail-closed revert failed after " .. tostring(reason) ..
+                    ": " .. tostring(revertError))
+            end
+            modActive = false
+        end,
+        log = function(message) print("[norescue] " .. tostring(message)) end,
+    })
+    if attachment == nil then
+        error("ModMenuBridge attach failed: " .. tostring(attachmentError))
     end
 end
 

@@ -60,7 +60,7 @@ Nexus Mods page before distributing a modified package.
 | Component | Original archive | Original version evidence | Integrated state |
 |---|---|---|---|
 | UE4SS | `UE4SS_1012_EOA 7 1.2.1 2026-07-24T10-03Z V4y6UZcT5.zip` | Nexus package 1.2.1 | Loader binaries unchanged; settings configured |
-| Terrain Runner | `SpeedMod v8 Stablized 45 8 2026-07-20T00-09Z 3CxMATjay.zip` | Archive label v8; `main.lua` identifies v7.11 | `main.lua` identifies v7.14 |
+| Terrain Runner | `SpeedMod v8 Stablized 45 8 2026-07-20T00-09Z 3CxMATjay.zip` | Archive label v8; `main.lua` identifies v7.11 | `main.lua` identifies v7.16 |
 | Auto Pickup | `AutoPickupMod 19 1.4 2026-07-23T15-17Z cLQPyYq9t.zip` | Archive label 1.4; `main.lua` identifies v1.3 | `main.lua` identifies v1.4 |
 | No Rescue | `Norescue 0.5.0 35 1 2026-07-13T13-48Z 3CxMATjJt.zip` | README identifies 0.5.0 | 0.5.0 plus integration changes |
 | Aincrad Open World | `AincradOpenWorld V1.0 55 1 2026-07-18T12-32Z V4y6UZc0K.zip` | Archive identifies V1.0 | V1.0 plus runtime bridge |
@@ -116,7 +116,7 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/45)
 **Baseline:** `SpeedMod v8 Stablized 45 8
 2026-07-20T00-09Z 3CxMATjay.zip`  
 **Original script version:** v7.11  
-**Integrated script version:** v7.14
+**Integrated script version:** v7.16
 
 ### Added
 
@@ -162,6 +162,11 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/45)
   Unreal component and restoring it when disabled.
 - Fixed partial configuration mutation by validating every field before
   committing any live change.
+- Fixed mission transitions retaining a failed swept-offset state. The
+  canonical swept movement call now pauses and retries after the new world is
+  ready without changing to a secondary movement API.
+- Fixed jump baselines being captured from an already modified instance after
+  travel by reading the exact hero-class default movement component.
 
 ### Current integrated defaults
 
@@ -215,6 +220,8 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/19)
 - Made host validation fail closed when `IsHostHero()` cannot be confirmed.
 - When pickup distance changes, clears expanded-item caches and previously
   applied range state before applying the new value.
+- Made the `autopickup` console command read-only. Persistent configuration has
+  one path through `config.lua` or ModMenu.
 
 ### Fixed
 
@@ -222,12 +229,14 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/19)
   not spawned yet. The pickup poll now remains scheduled.
 - Removed repeated post-travel `no hero yet` messages.
 - Prevented stale range caches from delaying a live pickup-distance change.
+- Removed force-resume travel watchdogs and alternate arrival paths.
+  `ClientRestart` is now the sole mission-ready signal; if it is absent,
+  pickup remains paused and reports an explicit transition error.
 
 ### Unchanged
 
 The original pickup scanning, item operation, range expansion, notification,
-travel protection, cooldown, and console-command behavior was otherwise
-retained.
+travel protection, and cooldown behavior was otherwise retained.
 
 ### Known limitations
 
@@ -256,12 +265,12 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/35)
 
 ### Changed
 
-- Reused the original typed configuration filter for both startup and live
-  settings reload.
+- Replaced optional typed overrides with a complete, strictly validated
+  canonical configuration.
 - Restricted hero discovery to the canonical local host
   `RODWorldHeroCharacter`.
-- Reset hero identity and diagnostics on map load, respawn, and
-  `ClientRestart`.
+- Made `ClientRestart` the canonical transition signal and reset the hero and
+  game-configuration references without changing the persisted enabled state.
 
 ### Fixed
 
@@ -271,11 +280,13 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/35)
   and edge-rescue behavior.
 - Fixed repeated application caused by temporary wrapper identity by comparing
   the stable Unreal object name.
+- Fixed lobby-to-mission travel requiring an OFF/ON toggle; the safety timer
+  keeps reacquiring the new world until its exact hero and game configuration
+  are available.
 
 ### Unchanged
 
 - The original `README.txt` is byte-for-byte unchanged.
-- The original `Scripts\config.lua` is byte-for-byte unchanged.
 - Water, drowning, deep-water recovery, pit recovery, out-of-bounds recovery,
   and quest-area teleports remain outside the mod's scope.
 
@@ -289,7 +300,7 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/55)
 
 ### Added
 
-- A 41-line runtime integration block in `main.lua`.
+- Runtime integration in `main.lua`.
 - `ModMenuBridge.lua` support for `ENABLED`, `DEBUG_LOGS`, and `PROBE_MODE`.
 - `Scripts\runtime.lua` for ModMenu-written settings.
 
@@ -297,6 +308,11 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/55)
 
 - The existing `CONFIG` table is refreshed in place so closures registered by
   the original script observe new values.
+- Made the exact script directory, configuration schema, floor-data files, and
+  shared bridge mandatory. Invalid inputs now stop new quest mutation with an
+  explicit error.
+- Restored the canonical `enabled.txt` load marker so the script is registered
+  before the lobby-to-mission transition.
 - The ModMenu marks this component as affecting newly constructed manifests and
   requiring restart for a reliable clean application.
 
@@ -318,9 +334,6 @@ tables, barrier tables, and save-safe runtime design are unchanged.
 
 ### Known limitations
 
-- Fresh-launch activation is not yet reliable in every session.
-- If Open World is already loaded, toggling it OFF and ON makes new manifests
-  observe the current setting.
 - If it was disabled before game launch, turning it ON only creates the
   next-launch marker; the game must then be fully restarted.
 - A setting change cannot retract or rebuild a floor whose manifest is already
@@ -328,9 +341,10 @@ tables, barrier tables, and save-safe runtime design are unchanged.
 
 ### Local state note
 
-The original archive contains `enabled.txt`. At the time of comparison, this
-installation contained `enabled.txt.off` because Open World had been disabled
-through ModMenu. That is local state, not a source-code modification.
+The original archive and this enabled installation both contain `enabled.txt`.
+An earlier local `enabled.txt.off` marker prevented UE4SS from loading the mod
+despite `runtime.lua` saying `ENABLED=true`; that inconsistent marker was
+removed.
 
 ## Field Equipment Mod
 
@@ -420,6 +434,12 @@ menu restoration, and equipment workflow were retained.
 - Fixed Equipment-to-Mods and Mods-to-Equipment focus asymmetry.
 - Fixed mod-header toggles changing the wrong mod's enable marker.
 - Fixed custom rows writing invalid native list indexes.
+- Fixed lobby-to-mission transitions requiring manual OFF/ON cycles. Each
+  loaded mod now retains its persisted setting while map-owned references are
+  invalidated and reacquired.
+- Fixed a configuration read failure being replaced by registry defaults in the
+  panel. Missing, malformed, or invalid canonical settings now fail closed and
+  are reported explicitly.
 
 ## Generated and local-state files
 
@@ -434,8 +454,8 @@ The following files are not upstream source modifications:
 | `ue4ss\imgui.ini` | UE4SS GUI window state |
 
 The original Auto Pickup and Field Equipment archives store `1` in their
-`enabled.txt` files. ModMenu normalizes those markers to empty files. UE4SS uses
-the marker's presence, so this does not change enablement semantics.
+`enabled.txt` files. ModMenu writes the canonical `enabled` marker text. UE4SS
+uses the marker's presence, so its contents do not change enablement semantics.
 
 ## Maintenance rules for future changes
 

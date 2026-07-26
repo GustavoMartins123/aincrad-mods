@@ -20,7 +20,7 @@
 --   key       the name written to runtime.lua, exactly as the mod reads it.
 --   label     row label.
 --   type      "bool" | "number" | "choice"
---   default   documented config.lua value shown before an effective value exists.
+--   default   documented config.lua value, used only as registry documentation.
 --   min/max   inclusive bounds for "number". Chosen to match the safety clamps
 --             the mods already apply internally, so the menu can never ask for
 --             a value the mod will silently reject.
@@ -63,9 +63,9 @@ return {
         settings = {
             { key = "ENABLED", label = "Enabled", type = "bool", default = true },
             { key = "PICKUP_RANGE", label = "Pickup range", type = "number",
-              default = 1000, min = 0, max = 5000, step = 100, format = "%.0f cm" },
+              default = 1000, min = 100, max = 5000, step = 100, format = "%.0f cm" },
             { key = "ICON_DISPLAY_RANGE", label = "Icon range", type = "number",
-              default = 1500, min = 0, max = 5000, step = 100, format = "%.0f cm" },
+              default = 1500, min = 100, max = 5000, step = 100, format = "%.0f cm" },
             { key = "PICKUP_INTERVAL", label = "Scan interval", type = "number",
               default = 0.30, min = 0.05, max = 2.00, step = 0.05, format = "%.2fs" },
             { key = "SHOW_PICKUP_UI", label = "Pickup notification", type = "bool",
@@ -85,14 +85,6 @@ return {
         apply = "live",
         settings = {
             { key = "ENABLED", label = "Enabled", type = "bool", default = true },
-            -- The game buckets landings into tiers by height. Pushing the death
-            -- tier out of reach is the whole mechanic, so this is a two-state
-            -- switch rather than a slider over a meaningless range.
-            { key = "DEATH_LANDING_HEIGHT", label = "Fall damage death", type = "choice",
-              default = 1000000000.0, options = {
-                  { value = 1000000000.0, label = "Never" },
-                  { value = 0.0, label = "Game default" },
-              } },
             { key = "SAFETY_NET_MS", label = "Re-apply interval", type = "number",
               default = 5000, min = 1000, max = 30000, step = 1000, format = "%.0f ms" },
             { key = "DEBUG_LOGS", label = "Debug logging", type = "bool", default = false },

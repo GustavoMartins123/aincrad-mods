@@ -44,7 +44,11 @@ local HIDDEN = 2
 local SCRIPT_DIR = (function()
     local source = (debug.getinfo(1, "S") or {}).source or ""
     if source:sub(1, 1) == "@" then source = source:sub(2) end
-    return source:match("^(.*[\\/])") or "./"
+    local directory = source:match("^(.*[\\/])")
+    if directory == nil then
+        error("canonical ModMenu Scripts directory is unavailable")
+    end
+    return directory
 end)()
 
 local CONFIG = {
@@ -129,24 +133,20 @@ local function loadLocalModule(name)
 end
 
 local function loadModMenuBridge()
-    local required, bridge = pcall(require, "ModMenuBridge")
-    if required and type(bridge) == "table" then return bridge end
-    for _, path in ipairs({
-        SCRIPT_DIR .. "../../shared/ModMenuBridge.lua",
-        "Mods/shared/ModMenuBridge.lua",
-        "Mods\\shared\\ModMenuBridge.lua",
-    }) do
-        local ok, result = pcall(function() return dofile(path) end)
-        if ok and type(result) == "table" then return result end
+    local path = SCRIPT_DIR .. "../../shared/ModMenuBridge.lua"
+    local ok, result = pcall(function() return dofile(path) end)
+    if not ok then return nil, tostring(result) end
+    if type(result) ~= "table" then
+        return nil, "canonical bridge did not return a table"
     end
-    return nil
+    return result, nil
 end
 
 -- Printed before anything can fail, so an empty console proves the mod was never
 -- loaded at all rather than loaded and aborted.
 print(string.format("[%s] main.lua entered | script dir: %s\n", MOD_NAME, SCRIPT_DIR))
 
-local bridge = loadModMenuBridge()
+local bridge, bridgeError = loadModMenuBridge()
 local registry = loadLocalModule("registry")
 local store = loadLocalModule("store")
 local panel = loadLocalModule("panel")
@@ -155,6 +155,7 @@ if bridge == nil or registry == nil or store == nil or panel == nil then
     log(string.format("startup aborted | bridge=%s registry=%s store=%s panel=%s",
         tostring(bridge ~= nil), tostring(registry ~= nil),
         tostring(store ~= nil), tostring(panel ~= nil)))
+    if bridge == nil then log("bridge error: " .. tostring(bridgeError)) end
     return
 end
 
@@ -162,25 +163,48 @@ store.init(SCRIPT_DIR, bridge)
 
 do
     local ok, external = pcall(function() return dofile(SCRIPT_DIR .. "config.lua") end)
-    if ok and type(external) == "table" then
-        if external.ENABLED ~= nil then CONFIG.ENABLED = external.ENABLED ~= false end
-        if external.DEBUG_LOGS ~= nil then CONFIG.DEBUG_LOGS = external.DEBUG_LOGS == true end
-        if type(external.ICON_LETTER) == "string" then
-            CONFIG.ICON_LETTER = external.ICON_LETTER
-        end
-        if type(external.ICON_LETTER_OFFSET) == "table" then
-            for _, axis in ipairs({ "X", "Y" }) do
-                local value = tonumber(external.ICON_LETTER_OFFSET[axis])
-                if value ~= nil then CONFIG.ICON_LETTER_OFFSET[axis] = value end
-            end
-        end
-        if type(external.ICON_TINT) == "table" then
-            for _, channel in ipairs({ "R", "G", "B", "A" }) do
-                local value = tonumber(external.ICON_TINT[channel])
-                if value ~= nil then CONFIG.ICON_TINT[channel] = value end
-            end
+    if not ok then error("config.lua load failed: " .. tostring(external)) end
+    if type(external) ~= "table" then error("config.lua must return a table") end
+    local known = {
+        ENABLED = true,
+        DEBUG_LOGS = true,
+        ICON_LETTER = true,
+        ICON_LETTER_OFFSET = true,
+        ICON_TINT = true,
+    }
+    for key in pairs(external) do
+        if not known[key] then error("unknown setting: " .. tostring(key)) end
+    end
+    if type(external.ENABLED) ~= "boolean" then error("ENABLED must be boolean") end
+    if type(external.DEBUG_LOGS) ~= "boolean" then
+        error("DEBUG_LOGS must be boolean")
+    end
+    if type(external.ICON_LETTER) ~= "string"
+        or external.ICON_LETTER == "" or #external.ICON_LETTER > 3 then
+        error("ICON_LETTER must be a non-empty string of at most 3 bytes")
+    end
+    if type(external.ICON_LETTER_OFFSET) ~= "table" then
+        error("ICON_LETTER_OFFSET must be a table")
+    end
+    for _, axis in ipairs({ "X", "Y" }) do
+        if type(external.ICON_LETTER_OFFSET[axis]) ~= "number" then
+            error("ICON_LETTER_OFFSET." .. axis .. " must be numeric")
         end
     end
+    if type(external.ICON_TINT) ~= "table" then
+        error("ICON_TINT must be a table")
+    end
+    for _, channel in ipairs({ "R", "G", "B", "A" }) do
+        local value = external.ICON_TINT[channel]
+        if type(value) ~= "number" or value < 0 or value > 1 then
+            error("ICON_TINT." .. channel .. " must be between 0 and 1")
+        end
+    end
+    CONFIG.ENABLED = external.ENABLED
+    CONFIG.DEBUG_LOGS = external.DEBUG_LOGS
+    CONFIG.ICON_LETTER = external.ICON_LETTER
+    CONFIG.ICON_LETTER_OFFSET = external.ICON_LETTER_OFFSET
+    CONFIG.ICON_TINT = external.ICON_TINT
 end
 
 --========================================================--
@@ -1206,16 +1230,7 @@ local function runCommand(params, reply)
                 or (entry.apply == "menu" and "  (reopen menu)" or "")
             -- Same truth the panel shows: whether UE4SS will load the mod.
             local loaded = store.isModEnabled(entry.mod)
-            local enabled = "?"
-            if loaded ~= nil then
-                enabled = loaded and "ON" or "OFF"
-            else
-                for _, setting in ipairs(entry.settings or {}) do
-                    if setting.key == "ENABLED" then
-                        enabled = store.valueOf(effective, setting) and "ON" or "OFF"
-                    end
-                end
-            end
+            local enabled = loaded and "ON" or "OFF"
             reply(string.format("%-18s %-3s%s", entry.mod, enabled, marker))
             for _, setting in ipairs(entry.settings or {}) do
                 if setting.key ~= "ENABLED" then

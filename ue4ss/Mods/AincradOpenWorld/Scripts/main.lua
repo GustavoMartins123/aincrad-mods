@@ -15,14 +15,79 @@
 print("[OpenWorld] Loading...")
 
 local DIR = (function()
-    local s = debug.getinfo(1, "S").source
+    local s = (debug.getinfo(1, "S") or {}).source or ""
     if s:sub(1, 1) == "@" then s = s:sub(2) end
-    return s:match("^(.*[\\/])") or "./"
+    local directory = s:match("^(.*[\\/])")
+    if directory == nil then
+        error("canonical AincradOpenWorld Scripts directory is unavailable")
+    end
+    return directory
+end)()
+
+local CONFIG_KEYS = {
+    ENABLED = true,
+    EXCLUDE_QUEST_IDS = true,
+    FREE_ROAM_QUESTS = true,
+    FREE_ROAM_DESCRIPTION = true,
+    DEBUG_LOGS = true,
+    PROBE_MODE = true,
+}
+
+local function validateConfig(config)
+    if type(config) ~= "table" then error("settings must be a table") end
+    for key in pairs(config) do
+        if not CONFIG_KEYS[key] then error("unknown setting: " .. tostring(key)) end
+    end
+    if type(config.ENABLED) ~= "boolean" then error("ENABLED must be boolean") end
+    if type(config.DEBUG_LOGS) ~= "boolean" then error("DEBUG_LOGS must be boolean") end
+    if type(config.PROBE_MODE) ~= "boolean" then error("PROBE_MODE must be boolean") end
+    if type(config.EXCLUDE_QUEST_IDS) ~= "table" then
+        error("EXCLUDE_QUEST_IDS must be a table")
+    end
+    for index, questId in ipairs(config.EXCLUDE_QUEST_IDS) do
+        if type(questId) ~= "number" or questId < 1
+            or questId ~= math.floor(questId) then
+            error("EXCLUDE_QUEST_IDS[" .. tostring(index) ..
+                "] must be a positive integer")
+        end
+    end
+    if type(config.FREE_ROAM_QUESTS) ~= "table" then
+        error("FREE_ROAM_QUESTS must be a table")
+    end
+    for questId, label in pairs(config.FREE_ROAM_QUESTS) do
+        if type(questId) ~= "number" or questId < 1
+            or questId ~= math.floor(questId) then
+            error("FREE_ROAM_QUESTS keys must be positive integer QuestIds")
+        end
+        if type(label) ~= "string" or label == "" then
+            error("FREE_ROAM_QUESTS labels must be non-empty strings")
+        end
+    end
+    if type(config.FREE_ROAM_DESCRIPTION) ~= "string"
+        or config.FREE_ROAM_DESCRIPTION == "" then
+        error("FREE_ROAM_DESCRIPTION must be a non-empty string")
+    end
+end
+
+local MOD_MENU_BRIDGE = (function()
+    local path = DIR .. "../../shared/ModMenuBridge.lua"
+    local ok, bridge = pcall(function() return dofile(path) end)
+    if not ok then error("canonical ModMenuBridge load failed: " .. tostring(bridge)) end
+    if type(bridge) ~= "table" then
+        error("canonical ModMenuBridge did not return a table")
+    end
+    return bridge
 end)()
 
 local CONFIG = (function()
-    local ok, c = pcall(function() return dofile(DIR .. "config.lua") end)
-    return (ok and type(c) == "table") and c or {}
+    local settings, _, info =
+        MOD_MENU_BRIDGE.readSettings("AincradOpenWorld", DIR)
+    if settings == nil then
+        error("canonical settings load failed: " ..
+            tostring(info and info.error or "unknown settings error"))
+    end
+    validateConfig(settings)
+    return settings
 end)()
 
 local function log(m) if CONFIG.DEBUG_LOGS then print("[OpenWorld] " .. m) end end
@@ -50,16 +115,21 @@ local floorData = {}
 local function getFloorData(floorNum)
     if floorData[floorNum] ~= nil then return floorData[floorNum] end
     local files = FLOOR_FILES[floorNum]
-    if not files then floorData[floorNum] = false; return false end
+    if not files then
+        log("unsupported floor " .. tostring(floorNum) .. "; quest left unchanged")
+        return nil
+    end
     local regions, barriers = {}, {}
     local okP, pieces = pcall(function() return dofile(DIR .. files.pieces) end)
-    if okP and type(pieces) == "table" then
-        for key in pairs(pieces) do regions[#regions + 1] = key end
-        table.sort(regions)
-    end
+    if not okP then error("floor pieces load failed: " .. tostring(pieces)) end
+    if type(pieces) ~= "table" then error(files.pieces .. " must return a table") end
+    for key in pairs(pieces) do regions[#regions + 1] = key end
+    table.sort(regions)
     local okB, barr = pcall(function() return dofile(DIR .. files.barriers) end)
-    if okB and type(barr) == "table" then barriers = barr end
-    if #regions == 0 then floorData[floorNum] = false; return false end
+    if not okB then error("floor barriers load failed: " .. tostring(barr)) end
+    if type(barr) ~= "table" then error(files.barriers .. " must return a table") end
+    barriers = barr
+    if #regions == 0 then error(files.pieces .. " contains no regions") end
     floorData[floorNum] = { regions = regions, barriers = barriers, frame = files.frame }
     log("floor " .. floorNum .. " tables loaded: " .. #regions .. " regions, " .. #barriers .. " barriers")
     return floorData[floorNum]
@@ -78,7 +148,7 @@ local function questIdOf(fullname)
 end
 
 local excluded = {}
-for _, id in ipairs(CONFIG.EXCLUDE_QUEST_IDS or {}) do excluded[tonumber(id) or -1] = true end
+for _, id in ipairs(CONFIG.EXCLUDE_QUEST_IDS) do excluded[id] = true end
 
 
 -- Grow a TArray<FName> in place with case-insensitive dedupe. Index-assign one past the end
@@ -107,8 +177,10 @@ end
 local function openWorldify(obj)
     if not CONFIG.ENABLED or not isValid(obj) then return end
 
-    local fullname = "?"
-    pcall(function() fullname = obj:GetFullName() end)
+    local nameOk, fullname = pcall(function() return obj:GetFullName() end)
+    if not nameOk or type(fullname) ~= "string" or fullname == "" then
+        error("quest asset canonical name is unavailable: " .. tostring(fullname))
+    end
     local qid = questIdOf(fullname)
     if qid == nil then return end
     if excluded[qid] then log("skip (excluded): QuestId " .. qid); return end
@@ -122,11 +194,17 @@ local function openWorldify(obj)
     if isDungeon then log("skip (dungeon quest): QuestId " .. qid); return end
 
     -- ERODFloor: Dungeon=0, First=1, Second=2, Third=3. Enum reads back numeric.
-    local floorNum = 1
-    pcall(function()
+    local floorOk, floorNum = pcall(function()
         local f = qd.Floor
-        if type(f) == "number" then floorNum = f end
+        if type(f) ~= "number" then
+            error("QuestData.Floor is not numeric")
+        end
+        return f
     end)
+    if not floorOk then
+        error("QuestData.Floor read failed for QuestId " .. tostring(qid) ..
+            ": " .. tostring(floorNum))
+    end
     if floorNum == 0 then log("skip (dungeon floor): QuestId " .. qid); return end
 
     local data = getFloorData(floorNum)
@@ -158,11 +236,22 @@ local function openWorldify(obj)
     end
 end
 
-pcall(function()
+do
+    local registered, registerError = pcall(function()
     NotifyOnNewObject("/Script/ROD.RODQuestPrimaryDataAsset", function(obj)
-        pcall(openWorldify, obj)
+        local ok, openError = xpcall(function()
+            openWorldify(obj)
+        end, debug and debug.traceback or tostring)
+        if not ok then
+            print("[OpenWorld] QUEST ACTIVATION ERROR | " .. tostring(openError))
+        end
     end)
-end)
+    end)
+    if not registered then
+        error("RODQuestPrimaryDataAsset notification registration failed: " ..
+            tostring(registerError))
+    end
+end
 
 -- Dedicated free-roam entries: rewrite the terminal quest list's display names for designated quests.
 -- FQuestMenuData.Name/.Description are plain FStrings on QuestManager.QuestMenuData (already-resolved
@@ -229,7 +318,7 @@ local function baseQuestId(id)
     return id
 end
 local function nameForQuestId(id)
-    local names = CONFIG.FREE_ROAM_QUESTS or {}
+    local names = CONFIG.FREE_ROAM_QUESTS
     local base = baseQuestId(id)
     if base == nil then return nil end
     return names[id] or names[base]
@@ -257,7 +346,10 @@ local function inMenuWorld()
         if type(n) ~= "string" then n = n:ToString() end
         return n
     end)
-    if not ok or type(name) ~= "string" then return true end -- can't tell -> don't block
+    if not ok or type(name) ~= "string" then
+        print("[OpenWorld] MENU WORLD ERROR | canonical world name is unavailable")
+        return false
+    end
     if name == "PL_ROD" then return false end          -- boot/title
     if name:find("_WP") then return false end           -- floor fields (PL_WL01_WP, ...)
     if name:find("Darkness") or name:find("WLM") then return false end -- dungeons
@@ -265,7 +357,7 @@ local function inMenuWorld()
 end
 
 local function duplicateMenuEntries(src)
-    if next(CONFIG.FREE_ROAM_QUESTS or {}) == nil then return end
+    if next(CONFIG.FREE_ROAM_QUESTS) == nil then return end
     if not inMenuWorld() then return end
     local results = {}
     pcall(function()
@@ -308,7 +400,7 @@ local function duplicateMenuEntries(src)
 end
 
 local function renameQuestParams(src)
-    local names = CONFIG.FREE_ROAM_QUESTS or {}
+    local names = CONFIG.FREE_ROAM_QUESTS
     if next(names) == nil then return end
     if not inMenuWorld() then return end
     local nameFor = nameForQuestId
@@ -389,7 +481,7 @@ end
 -- selected. Sweep after selection changes: sentinel id -> stamp our label/description onto the
 -- QuestName/QuestInfo TextBlocks (single stamp per selection; no re-stamp race here).
 local function infoPanelSweep(src)
-    local names = CONFIG.FREE_ROAM_QUESTS or {}
+    local names = CONFIG.FREE_ROAM_QUESTS
     if next(names) == nil then return end
     pcall(function()
         local infos = FindAllOf("WBP_Console_QuestMenu_Info_C")
@@ -512,38 +604,30 @@ end)
 -- already open. DEBUG_LOGS takes effect immediately. The Mods menu labels this
 -- mod as restart-required for exactly this reason.
 do
-    local function loadModMenuBridge()
-        local required, bridge = pcall(require, "ModMenuBridge")
-        if required and type(bridge) == "table" then return bridge end
-        for _, path in ipairs({
-            DIR .. "../../shared/ModMenuBridge.lua",
-            "Mods/shared/ModMenuBridge.lua",
-            "Mods\\shared\\ModMenuBridge.lua",
-        }) do
-            local ok, result = pcall(function() return dofile(path) end)
-            if ok and type(result) == "table" then return result end
-        end
-        return nil
-    end
-
-    local bridge = loadModMenuBridge()
-    if bridge ~= nil then
-        bridge.attach({
-            modName = "AincradOpenWorld",
-            scriptDir = DIR,
-            load = function(external)
-                if type(external) ~= "table" then return end
-                -- CONFIG is captured by every closure in this file, so refresh it
-                -- in place rather than rebinding the local.
-                for key in pairs(CONFIG) do
-                    if external[key] == nil then CONFIG[key] = nil end
-                end
-                for key, value in pairs(external) do CONFIG[key] = value end
-            end,
-            log = function(message) print("[OpenWorld] " .. tostring(message)) end,
-        })
-    else
-        print("[OpenWorld] ModMenuBridge unavailable; settings apply on restart only")
+    local attachment, attachmentError = MOD_MENU_BRIDGE.attach({
+        modName = "AincradOpenWorld",
+        scriptDir = DIR,
+        pollMs = 750,
+        load = function(external)
+            validateConfig(external)
+            -- CONFIG is captured by every closure in this file, so refresh it
+            -- in place rather than rebinding the local.
+            for key in pairs(CONFIG) do CONFIG[key] = nil end
+            for key, value in pairs(external) do CONFIG[key] = value end
+            for key in pairs(excluded) do excluded[key] = nil end
+            for _, questId in ipairs(CONFIG.EXCLUDE_QUEST_IDS) do
+                excluded[questId] = true
+            end
+        end,
+        fail = function()
+            CONFIG.ENABLED = false
+            CONFIG.PROBE_MODE = false
+            CONFIG.FREE_ROAM_QUESTS = {}
+        end,
+        log = function(message) print("[OpenWorld] " .. tostring(message)) end,
+    })
+    if attachment == nil then
+        error("ModMenuBridge attach failed: " .. tostring(attachmentError))
     end
 end
 

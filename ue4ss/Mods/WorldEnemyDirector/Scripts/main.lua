@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.2.1"
+local MOD_VERSION = "1.3.0"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -215,6 +215,19 @@ local function isValid(object)
     return ok and valid == true
 end
 
+local function enemyOperational(enemy)
+    if not isValid(enemy) then return false, "enemy object is invalid" end
+    local ok, initialized, dead, healthZero = pcall(function()
+        return enemy.bInitialized, enemy:IsDead(), enemy:IsHealthZero()
+    end)
+    if not ok then
+        return false, "canonical enemy lifecycle state is unreadable"
+    end
+    if initialized ~= true then return false, "enemy is not initialized" end
+    if dead == true or healthZero == true then return false, "enemy is dead" end
+    return true, nil
+end
+
 local function objectKey(object)
     local ok, name = pcall(function() return object:GetFullName() end)
     if ok and type(name) == "string" and name ~= "" then return name end
@@ -261,6 +274,7 @@ local discoveryBatch = false
 local generation = 1
 local worldPaused = true
 local resumeAtMs = STARTUP_SETTLE_MS
+local restartResetPending = false
 local rescanRequested = false
 local worldFault = nil
 
@@ -284,6 +298,7 @@ local function beginTravel(reason)
     generation = generation + 1
     worldPaused = true
     resumeAtMs = nil
+    restartResetPending = false
     clearWorldReferences()
     log("TRAVEL START | " .. reason .. " | native object access paused")
 end
@@ -292,7 +307,9 @@ local function beginRestartSettle()
     generation = generation + 1
     worldPaused = true
     resumeAtMs = elapsedMs + RESTART_SETTLE_MS
-    clearWorldReferences()
+    restartResetPending = true
+    objectQueue = {}
+    spawnQueue = {}
     log("TRAVEL SETTLE | ClientRestart | waiting 5 seconds")
 end
 
@@ -671,6 +688,19 @@ end
 local function restoreState(state)
     if not state.applied then return true end
     if not isValid(state.object) then return false end
+    local operational, lifecycleError = enemyOperational(state.object)
+    if not operational then
+        if lifecycleError ~= "enemy is dead" then
+            log("RESTORE ERROR | " .. state.key .. " | " .. lifecycleError)
+            return false
+        end
+        -- Pooled/dead enemies are authoritatively rebuilt by EnemyReused.
+        -- Their inactive GAS state has MaxHealth=0 and must not be written.
+        state.applied = false
+        state.colorParameter = nil
+        state.appliedColor = nil
+        return true
+    end
     local previous
     local okSnapshot, snapshotError = pcall(function()
         previous = captureMutationState(state)
@@ -717,6 +747,14 @@ end
 
 local function applyMutation(state)
     if not isValid(state.object) then return false end
+    local operational, lifecycleError = enemyOperational(state.object)
+    if not operational then
+        if lifecycleError ~= "enemy is dead"
+            and lifecycleError ~= "enemy is not initialized" then
+            log("MUTATION ERROR | " .. state.key .. " | " .. lifecycleError)
+        end
+        return false
+    end
     if mutationIsIdentity() then return restoreState(state) end
     if state.baseline.isBoss and not CONFIG.INCLUDE_BOSSES then
         restoreState(state)
@@ -990,6 +1028,14 @@ local function registerEnemy(enemy, reused)
     if not isValid(enemy) then return end
     local key = objectKey(enemy)
     if key == nil or key:find("Default__", 1, true) ~= nil then return end
+    local operational, lifecycleError = enemyOperational(enemy)
+    if not operational then
+        if lifecycleError ~= "enemy is dead"
+            and lifecycleError ~= "enemy is not initialized" then
+            log("ENEMY ERROR | " .. key .. " | " .. lifecycleError)
+        end
+        return
+    end
 
     local request = takePendingSpawn(key)
     local previous = states[key]
@@ -1295,6 +1341,12 @@ local function tick(stepMs)
 
     if worldPaused then
         if resumeAtMs ~= nil and elapsedMs >= resumeAtMs then
+            if restartResetPending then
+                restartResetPending = false
+                cleanupInvalidStates()
+                disableWorld("ClientRestart world reset")
+                clearWorldReferences()
+            end
             worldPaused = false
             resumeAtMs = nil
             rescanRequested = true

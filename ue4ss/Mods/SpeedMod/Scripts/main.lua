@@ -1,9 +1,9 @@
-print("[SpeedMod] Loading TERRAIN RUNNER v7.15 - CDO-STABLE JUMP BASELINE...")
+print("[SpeedMod] Loading TERRAIN RUNNER v7.16 - PERSISTENT MISSION LIFECYCLE...")
 print("[SpeedMod] Startup is passive; lifecycle hooks arm only after the initial world settles.")
 print("[SpeedMod] Quest/map travel uses an extended post-load guard; ClientRestart uses tick-safe quarantine.")
 
 --========================================================--
---     TERRAIN RUNNER v7.14 - MOD STACK COMPATIBILITY   --
+--     TERRAIN RUNNER v7.16 - MOD STACK COMPATIBILITY   --
 --========================================================--
 -- Goals:
 --   * Preserve the transition/teleport crash protections.
@@ -35,7 +35,7 @@ local SLEEP_QUIET_SEC = 10.0
 local SLEEP_DEBOUNCE_SEC = 10.0
 local RESTART_SETTLE_SEC = 5.0
 local TRAVEL_RESTART_SETTLE_SEC = 10.0
-local TRAVEL_STUCK_MS = 30000
+local TRAVEL_TIMEOUT_MS = 30000
 local STARTUP_COMPAT_DELAY_MS = 8000
 local RESTART_QUARANTINE_SEC = 10.0
 
@@ -158,31 +158,43 @@ local function applyExternalConfig(external)
     return true
 end
 
+local SCRIPT_DIRECTORY = nil
+local MOD_MENU_BRIDGE = nil
+
 local function loadExternalConfig()
-    local scriptDirectory = getScriptDirectory()
-    if type(scriptDirectory) ~= "string" or scriptDirectory == "" then
+    SCRIPT_DIRECTORY = getScriptDirectory()
+    if type(SCRIPT_DIRECTORY) ~= "string" or SCRIPT_DIRECTORY == "" then
         CONFIG.ENABLED = false
-        print("[SpeedMod] CONFIG ERROR | script directory unavailable; mod disabled")
-        return false
+        return false, "canonical script directory is unavailable"
     end
 
-    local path = scriptDirectory .. "config.lua"
-    local loaded, external = pcall(function() return dofile(path) end)
+    local bridgePath = SCRIPT_DIRECTORY .. "../../shared/ModMenuBridge.lua"
+    local loaded, bridge = pcall(function() return dofile(bridgePath) end)
     if not loaded then
         CONFIG.ENABLED = false
-        print("[SpeedMod] CONFIG ERROR | " .. tostring(external) .. " | mod disabled")
-        return false
+        return false, "canonical ModMenuBridge load failed: " .. tostring(bridge)
+    end
+    if type(bridge) ~= "table" then
+        CONFIG.ENABLED = false
+        return false, "canonical ModMenuBridge did not return a table"
+    end
+    MOD_MENU_BRIDGE = bridge
+
+    local external, _, info =
+        MOD_MENU_BRIDGE.readSettings("SpeedMod", SCRIPT_DIRECTORY)
+    if external == nil then
+        CONFIG.ENABLED = false
+        return false, tostring(info and info.error or "canonical settings unavailable")
     end
 
     local applied, configError = applyExternalConfig(external)
     if not applied then
         CONFIG.ENABLED = false
-        print("[SpeedMod] CONFIG ERROR | " .. tostring(configError) .. " | mod disabled")
-        return false
+        return false, tostring(configError)
     end
 
-    print("[SpeedMod] CONFIG FILE | loaded " .. tostring(path))
-    return true
+    print("[SpeedMod] SETTINGS | canonical config.lua + runtime.lua loaded")
+    return true, nil
 end
 
 -- Derived internal values. Do not edit these.
@@ -198,13 +210,11 @@ local SPRINT_DROPOUT_GRACE_MS = 700
 local JOG_RELEASE_RATIO = 1.06
 local JOG_RELEASE_CONFIRM_MS = 180
 
--- Native sprint detection.
+-- Native sprint detection uses the authoritative MaxWalkSpeed transition.
 local SPRINT_CAP_ENTER_RATIO = 1.06
 local SPRINT_CAP_HOLD_RATIO = 1.015
-local SPRINT_VELOCITY_ENTER_RATIO = 1.07
-local SPRINT_VELOCITY_HOLD_RATIO = 1.015
 local MIN_MOVING_SPEED = 75.0
-local FALLBACK_CALIBRATION_MS = 1500
+local OFFSET_RETRY_SECONDS = 2.0
 
 -- Prevent a dash, launch, or bad velocity sample from becoming the held
 -- reference speed. This cap is relative to the learned native jog cap.
@@ -242,9 +252,7 @@ local heroWaitingReported = false
 local disabledStateReported = false
 local boostReadyReported = false
 local learnedJogCap = nil
-local learnedJogVelocity = nil
-local fallbackCalibrationMs = 0
-local fallbackCalibrationComplete = false
+local clockErrorReported = false
 
 local extraMultiplier = 0.0
 local wasSprinting = false
@@ -262,7 +270,6 @@ local combatExitMs = 0
 local combatLockReason = nil
 
 local mapLeaving = false
-local pendingFastTravel = false
 local quietUntil = 0.0
 local sleepDebounceUntil = 0.0
 local lifecycleGeneration = 1
@@ -275,14 +282,7 @@ local nextPollMs = IDLE_TICK_MS
 local postTransitionGraceMs = POST_TRANSITION_GRACE_MS
 local teleportGraceMs = 0
 
-local travelWatchdogId = 0
-local fastTravelWatchId = 0
-local fastTravelEndToken = 0
-
-local FT_DISABLE = 0
-local FT_CANCEL = 1
-local FT_DECIDE = 2
-local FT_ENABLE = 3
+local travelTimeoutId = 0
 
 local lastLocationX = nil
 local lastLocationY = nil
@@ -292,6 +292,8 @@ local lastPostOffsetY = nil
 local lastPostOffsetZ = nil
 local lastJustTeleportedFlag = false
 local offsetSupported = nil
+local offsetRetryClock = 0.0
+local offsetFailureReported = false
 local lastClockSeconds = nil
 
 local elapsedMs = 0
@@ -341,7 +343,10 @@ local function speedConfigSummary()
     )
 end
 
-loadExternalConfig()
+local configLoaded, configLoadError = loadExternalConfig()
+if not configLoaded then
+    error("[SpeedMod] CONFIG ERROR | " .. tostring(configLoadError))
+end
 applySpeedConfig()
 print("[SpeedMod] CONFIG | " .. speedConfigSummary())
 
@@ -817,44 +822,32 @@ local function getActorLocation(hero)
     return location.X or 0.0, location.Y or 0.0, location.Z or 0.0
 end
 
--- ExecuteWithDelay and ExecuteInGameThread do not guarantee that a 16 ms
--- request completes exactly 16 ms later. Using a fixed 16 ms movement step
--- can therefore make the mod slower whenever callbacks arrive late.
--- On the Windows build targeted by UE4SS, os.clock supplies a sufficiently
--- fine monotonic timer. The result is clamped so a hitch never creates one
--- enormous movement injection.
-local function getMeasuredDeltaSeconds(fallbackStepMs)
-    local fallback = fallbackStepMs / 1000.0
-    local now = nil
-
-    local okClock, clockValue = pcall(function()
-        return os.clock()
-    end)
-
-    if okClock and type(clockValue) == "number" then
-        now = clockValue
-    end
-
-    if now == nil then
-        return fallback
-    end
-
-    local dt = fallback
-
-    if lastClockSeconds ~= nil then
-        local measured = now - lastClockSeconds
-
-        if measured >= 0.005 and measured <= 0.050 then
-            dt = measured
-        elseif measured > 0.050 then
-            -- Catch up modestly after an ordinary hitch, but never convert a
-            -- long stall into a huge offset.
-            dt = 0.050
+-- ExecuteWithDelay does not guarantee an exact interval. os.clock is the
+-- canonical timer for movement integration. Missing or implausible samples
+-- skip that injection tick instead of substituting a synthetic delta.
+local function getMeasuredDeltaSeconds()
+    local okClock, now = pcall(os.clock)
+    if not okClock or type(now) ~= "number" then
+        if not clockErrorReported then
+            clockErrorReported = true
+            warn("CLOCK ERROR | os.clock unavailable; movement injection paused")
         end
+        lastClockSeconds = nil
+        return nil
+    end
+    clockErrorReported = false
+
+    if lastClockSeconds == nil then
+        lastClockSeconds = now
+        return nil
     end
 
+    local measured = now - lastClockSeconds
     lastClockSeconds = now
-    return dt
+    if measured < 0.005 or measured > 0.050 then
+        return nil
+    end
+    return measured
 end
 
 local function clearAcceleration()
@@ -880,9 +873,7 @@ local function resetState()
     heroWaitingReported = false
     boostReadyReported = false
     learnedJogCap = nil
-    learnedJogVelocity = nil
-    fallbackCalibrationMs = 0
-    fallbackCalibrationComplete = false
+    clockErrorReported = false
 
     extraMultiplier = 0.0
     wasSprinting = false
@@ -908,6 +899,8 @@ local function resetState()
     lastPostOffsetZ = nil
     lastJustTeleportedFlag = false
     offsetSupported = nil
+    offsetRetryClock = 0.0
+    offsetFailureReported = false
     lastClockSeconds = nil
 
     elapsedMs = 0
@@ -957,10 +950,7 @@ end
 
 local function endTravelState()
     mapLeaving = false
-    pendingFastTravel = false
-    travelWatchdogId = travelWatchdogId + 1
-    fastTravelWatchId = fastTravelWatchId + 1
-    fastTravelEndToken = fastTravelEndToken + 1
+    travelTimeoutId = travelTimeoutId + 1
 end
 
 local function onWorldReady(reason, quietSec)
@@ -985,117 +975,29 @@ local function onWorldReady(reason, quietSec)
     end
 end
 
-local function readFastTravelStatus()
-    local playerState = tryFindFirstOf("RODPlayerState")
-    if not isValidObj(playerState) then
-        playerState = tryFindFirstOf("PlayerState")
-    end
-    if not isValidObj(playerState) then
-        return nil
-    end
-
-    local ok, value = pcall(function()
-        return playerState.FastTravelStatus
-    end)
-    if not ok or value == nil then
-        return nil
-    end
-
-    if type(value) == "number" then
-        return value
-    end
-
-    if type(value) == "userdata" or type(value) == "table" then
-        local okGet, inner = pcall(function()
-            if value.get ~= nil then
-                return value:get()
-            end
-            return value
-        end)
-        if okGet and type(inner) == "number" then
-            return inner
-        end
-    end
-
-    local okNumber, converted = pcall(function()
-        return tonumber(tostring(value))
-    end)
-    if okNumber then
-        return converted
-    end
-
-    return nil
-end
-
-local function startFastTravelArrivalWatch()
-    fastTravelWatchId = fastTravelWatchId + 1
-    local watchId = fastTravelWatchId
-    local sawActive = false
-    local ticks = 0
-
-    local function watch()
-        if watchId ~= fastTravelWatchId or
-           not mapLeaving or
-           not pendingFastTravel then
-            return
-        end
-
-        ticks = ticks + 1
-        local status = readFastTravelStatus()
-
-        if status == FT_DECIDE or status == FT_ENABLE then
-            sawActive = true
-        elseif sawActive and
-               (status == FT_DISABLE or status == FT_CANCEL) then
-            onWorldReady("FastTravelStatus", 1.0)
-            return
-        end
-
-        if ticks < 60 then
-            ExecuteWithDelay(500, watch)
-        end
-    end
-
-    ExecuteWithDelay(500, watch)
-end
-
-local function beginTravel(reason, isFastTravel)
+local function beginTravel(reason)
     if mapLeaving then
-        if isFastTravel and not pendingFastTravel then
-            pendingFastTravel = true
-            startFastTravelArrivalWatch()
-        end
         return
     end
 
     mapLeaving = true
-    pendingFastTravel = isFastTravel == true
     quietUntil = 0.0
     invalidateMovementSession()
 
     print("[SpeedMod] TRAVEL BEGIN | " .. tostring(reason))
 
-    if pendingFastTravel then
-        startFastTravelArrivalWatch()
-    end
-
-    travelWatchdogId = travelWatchdogId + 1
-    local watchdogId = travelWatchdogId
-
-    ExecuteWithDelay(TRAVEL_STUCK_MS, function()
-        if not mapLeaving or watchdogId ~= travelWatchdogId then
+    travelTimeoutId = travelTimeoutId + 1
+    local timeoutId = travelTimeoutId
+    ExecuteWithDelay(TRAVEL_TIMEOUT_MS, function()
+        if not mapLeaving or timeoutId ~= travelTimeoutId then
             return
         end
-
-        print(
-            "[SpeedMod] TRAVEL WATCHDOG | force-safe resume after " ..
-            tostring(TRAVEL_STUCK_MS) .. "ms"
-        )
-        onWorldReady("watchdog", 2.0)
+        warn("TRAVEL ERROR | ClientRestart was not received after " ..
+            tostring(TRAVEL_TIMEOUT_MS) .. "ms; movement remains paused")
     end)
 end
 
-local function learnNativeJog(movement, horizontalSpeed, stepMs)
+local function learnNativeJog(movement)
     local currentCap = readNumber(movement, "MaxWalkSpeed")
 
     if currentCap and currentCap > 0 then
@@ -1103,31 +1005,6 @@ local function learnNativeJog(movement, horizontalSpeed, stepMs)
             learnedJogCap = currentCap
             log("Learned native jog cap: " .. tostring(learnedJogCap))
         end
-    end
-
-    if not fallbackCalibrationComplete and
-       horizontalSpeed >= MIN_MOVING_SPEED then
-        learnedJogVelocity = math.max(
-            learnedJogVelocity or 0,
-            horizontalSpeed
-        )
-
-        fallbackCalibrationMs = fallbackCalibrationMs + stepMs
-
-        if fallbackCalibrationMs >= FALLBACK_CALIBRATION_MS then
-            fallbackCalibrationComplete = true
-            log(
-                "Fallback jog calibration complete: " ..
-                tostring(learnedJogVelocity)
-            )
-        end
-    elseif fallbackCalibrationComplete and
-           not wasSprinting and
-           horizontalSpeed >= MIN_MOVING_SPEED and
-           learnedJogVelocity and
-           horizontalSpeed <= (learnedJogVelocity * 1.06) then
-        learnedJogVelocity =
-            (learnedJogVelocity * 0.98) + (horizontalSpeed * 0.02)
     end
 
     return currentCap
@@ -1138,24 +1015,16 @@ local function detectNativeSprint(currentCap, horizontalSpeed)
         return false, "not moving"
     end
 
-    if learnedJogCap and currentCap then
-        local ratio = wasSprinting and
-            SPRINT_CAP_HOLD_RATIO or SPRINT_CAP_ENTER_RATIO
-
-        if currentCap > (learnedJogCap * ratio) then
-            return true, wasSprinting and
-                "movement-cap hold" or "movement cap"
-        end
+    if learnedJogCap == nil or currentCap == nil then
+        return false, "movement cap unavailable"
     end
 
-    if fallbackCalibrationComplete and learnedJogVelocity then
-        local ratio = wasSprinting and
-            SPRINT_VELOCITY_HOLD_RATIO or SPRINT_VELOCITY_ENTER_RATIO
+    local ratio = wasSprinting and
+        SPRINT_CAP_HOLD_RATIO or SPRINT_CAP_ENTER_RATIO
 
-        if horizontalSpeed > (learnedJogVelocity * ratio) then
-            return true, wasSprinting and
-                "velocity hold" or "velocity"
-        end
+    if currentCap > (learnedJogCap * ratio) then
+        return true, wasSprinting and
+            "movement-cap hold" or "movement cap"
     end
 
     return false, "jog"
@@ -1186,7 +1055,8 @@ local function teleportDetected(movement, x, y, z)
 end
 
 local function addSweptOffset(hero, deltaX, deltaY, deltaZ)
-    if offsetSupported == false then
+    local now = os.clock()
+    if offsetSupported == false and now < offsetRetryClock then
         return false
     end
 
@@ -1214,17 +1084,24 @@ local function addSweptOffset(hero, deltaX, deltaY, deltaZ)
     end)
 
     if ok then
+        if offsetSupported == false then
+            warn("OFFSET READY | canonical swept movement recovered")
+        end
         offsetSupported = true
+        offsetRetryClock = 0.0
+        offsetFailureReported = false
         return true
     end
 
-    -- Never fall back to K2_SetActorLocation. Repeated SetActorLocation calls
-    -- are micro-teleports and can collide with real travel/teleport handling.
     offsetSupported = false
-    warn(
-        "K2_AddActorWorldOffset failed; acceleration disabled for this map " ..
-        "instead of using the unsafe SetActorLocation fallback."
-    )
+    offsetRetryClock = now + OFFSET_RETRY_SECONDS
+    if not offsetFailureReported then
+        offsetFailureReported = true
+        warn(string.format(
+            "OFFSET ERROR | K2_AddActorWorldOffset failed; injection paused, canonical retry in %.0fs",
+            OFFSET_RETRY_SECONDS
+        ))
+    end
     return false
 end
 
@@ -1248,10 +1125,6 @@ local function updateStableSprintSpeed(currentCap, horizontalSpeed)
 
     if currentCap and currentCap > candidate then
         candidate = currentCap
-    end
-
-    if learnedJogVelocity and learnedJogVelocity > candidate then
-        candidate = learnedJogVelocity
     end
 
     candidate = clampReferenceSpeed(candidate)
@@ -1337,12 +1210,16 @@ local function updateThreeDimensionalDirection(baseX, baseY, movementMode)
     lastDirectionZ = grade / length
 end
 
-local function rememberPostOffsetLocation(hero, fallbackX, fallbackY, fallbackZ)
+local function rememberPostOffsetLocation(hero)
     local x, y, z = getActorLocation(hero)
+    if x == nil then
+        return false
+    end
 
-    lastPostOffsetX = x or fallbackX
-    lastPostOffsetY = y or fallbackY
-    lastPostOffsetZ = z or fallbackZ
+    lastPostOffsetX = x
+    lastPostOffsetY = y
+    lastPostOffsetZ = z
+    return true
 end
 
 local function tick(stepMs)
@@ -1569,21 +1446,20 @@ local function tick(stepMs)
         baseDirectionY
     )
 
-    local measuredDt = getMeasuredDeltaSeconds(stepMs)
+    local measuredDt = getMeasuredDeltaSeconds()
+    if measuredDt == nil then
+        return
+    end
     local measuredStepMs = measuredDt * 1000.0
 
-    local currentCap = learnNativeJog(
-        movement,
-        horizontalSpeed,
-        measuredStepMs
-    )
+    local currentCap = learnNativeJog(movement)
 
     local sprintSignal, detector =
         detectNativeSprint(currentCap, horizontalSpeed)
 
     local sprinting = sprintSignal
     local hardJogRelease = false
-    local jogReference = learnedJogCap or learnedJogVelocity
+    local jogReference = learnedJogCap
 
     if wasSprinting and
        jogReference and jogReference > 0 and
@@ -1620,7 +1496,7 @@ local function tick(stepMs)
         sprintDropoutMs = 0
     end
 
-    if sprinting and offsetSupported ~= false then
+    if sprinting then
         nextPollMs = ACTIVE_TICK_MS
 
         if not wasSprinting then
@@ -1682,21 +1558,15 @@ local function tick(stepMs)
                 deltaZ
             ) then
                 clearAcceleration()
-                rememberPostOffsetLocation(
-                    hero,
-                    locationX,
-                    locationY,
-                    locationZ
-                )
+                if not rememberPostOffsetLocation(hero) then cachedHero = nil end
                 return
             end
 
-            rememberPostOffsetLocation(
-                hero,
-                locationX,
-                locationY,
-                locationZ
-            )
+            if not rememberPostOffsetLocation(hero) then
+                cachedHero = nil
+                clearAcceleration()
+                return
+            end
         else
             lastPostOffsetX = locationX
             lastPostOffsetY = locationY
@@ -1722,9 +1592,6 @@ local function tick(stepMs)
             "speed=" .. string.format("%.1f", horizontalSpeed) ..
             " cap=" .. tostring(currentCap) ..
             " jogCap=" .. tostring(learnedJogCap) ..
-            " jogVelocity=" ..
-                (learnedJogVelocity and
-                    string.format("%.1f", learnedJogVelocity) or "nil") ..
             " sprint=" .. tostring(sprinting) ..
             " detector=" .. detector ..
             " dropoutMs=" .. string.format("%.0f", sprintDropoutMs) ..
@@ -1781,68 +1648,71 @@ local function poll()
     ExecuteWithDelay(delayMs, poll)
 end
 
-local function safeRegisterHook(functionPath, callback, label)
+local function requireLifecycleHook(functionPath, callback, label)
+    if type(functionPath) ~= "string" or functionPath == ""
+        or type(callback) ~= "function"
+        or type(label) ~= "string" or label == "" then
+        CONFIG.ENABLED = false
+        error("[SpeedMod] HOOK ERROR | invalid canonical hook registration")
+    end
     local ok, err = pcall(function()
         RegisterHook(functionPath, callback)
     end)
 
-    if ok then
-        print("[SpeedMod] HOOKED | " .. tostring(label or functionPath))
-    else
-        warn(
-            "Hook unavailable for " .. tostring(label or functionPath) ..
-            ": " .. tostring(err)
-        )
+    if not ok then
+        CONFIG.ENABLED = false
+        error("[SpeedMod] HOOK ERROR | " .. label .. ": " .. tostring(err))
     end
+    print("[SpeedMod] HOOKED | " .. label)
 end
 
 local function registerLifecycleHooks()
 -- True world-travel events: stop all injected movement until a reliable
 -- world-ready signal arrives.
-safeRegisterHook(
+requireLifecycleHook(
     "/Script/Engine.PlayerController:ClientTravelInternal",
     function()
-        beginTravel("ClientTravelInternal", false)
+        beginTravel("ClientTravelInternal")
     end,
     "ClientTravelInternal"
 )
 
-safeRegisterHook(
+requireLifecycleHook(
     "/Script/Engine.PlayerController:ClientTravel",
     function()
-        beginTravel("ClientTravel", false)
+        beginTravel("ClientTravel")
     end,
     "ClientTravel"
 )
 
-safeRegisterHook(
+requireLifecycleHook(
     "/Script/Engine.PlayerController:ClientPrepareMapChange",
     function()
-        beginTravel("ClientPrepareMapChange", false)
+        beginTravel("ClientPrepareMapChange")
     end,
     "ClientPrepareMapChange"
 )
 
-safeRegisterHook(
+requireLifecycleHook(
     "/Script/ROD.RODPlayerState:ServerDecideTown",
     function()
-        beginTravel("ServerDecideTown", false)
+        beginTravel("ServerDecideTown")
     end,
     "ServerDecideTown"
 )
 
-safeRegisterHook(
+requireLifecycleHook(
     "/Script/ROD.RODPlayerState:ServerDecideFastTravel",
     function()
-        beginTravel("ServerDecideFastTravel", true)
+        beginTravel("ServerDecideFastTravel")
     end,
     "ServerDecideFastTravel"
 )
 
-safeRegisterHook(
+requireLifecycleHook(
     "/Script/ROD.RODPlayerState:ServerShowQuestResult",
     function()
-        beginTravel("ServerShowQuestResult", false)
+        beginTravel("ServerShowQuestResult")
     end,
     "ServerShowQuestResult"
 )
@@ -1850,7 +1720,7 @@ safeRegisterHook(
 -- Quest teleport-out is a VFX/transition cue in the proven companion mods.
 -- Pause briefly and clear references, but do not enter an indefinite
 -- map-leaving state unless a real travel hook also fires.
-safeRegisterHook(
+requireLifecycleHook(
     "/Script/ROD.RODPlayerState:ServerNotifyQuestTeleportOut",
     function()
         beginQuietOnly(
@@ -1884,7 +1754,7 @@ for _, sleepHook in ipairs({
     local hookPath = sleepHook[1]
     local hookLabel = sleepHook[2]
 
-    safeRegisterHook(
+    requireLifecycleHook(
         hookPath,
         function()
             beginSleepQuiet(hookLabel)
@@ -1897,7 +1767,7 @@ end
 -- world replacement. Keep this hook intentionally minimal: no object access, no
 -- state reset, and no ExecuteWithDelay callback. The normal tick loop performs
 -- the reset after a quarantine window, safely away from the native callback chain.
-safeRegisterHook(
+requireLifecycleHook(
     "/Script/Engine.PlayerController:ClientRestart",
     function()
         restartCompatToken = restartCompatToken + 1
@@ -1910,68 +1780,6 @@ safeRegisterHook(
     "ClientRestart(quarantine)"
 )
 
--- Additional fast-travel completion signals used by AutoPickup.
-safeRegisterHook(
-    "/Script/ROD.RODWorldGameState:CheckFastTravelTeleport",
-    function()
-        if not (mapLeaving and pendingFastTravel) then
-            return
-        end
-
-        fastTravelEndToken = fastTravelEndToken + 1
-        local token = fastTravelEndToken
-
-        ExecuteWithDelay(8000, function()
-            if token ~= fastTravelEndToken then
-                return
-            end
-            if mapLeaving and pendingFastTravel then
-                onWorldReady("CheckFastTravelTeleport+8s", 2.0)
-            end
-        end)
-    end,
-    "CheckFastTravelTeleport"
-)
-
-safeRegisterHook(
-    "/Script/ROD.RODPlayerState:OnRep_FastTravelStatus",
-    function()
-        if not (mapLeaving and pendingFastTravel) then
-            return
-        end
-
-        ExecuteWithDelay(600, function()
-            if not (mapLeaving and pendingFastTravel) then
-                return
-            end
-
-            local status = readFastTravelStatus()
-            if status == FT_DISABLE or status == FT_CANCEL then
-                onWorldReady("OnRep_FastTravelStatus", 1.0)
-            end
-        end)
-    end,
-    "OnRep_FastTravelStatus"
-)
-
--- This completion event is more reliable than LoadMapPost in this build.
-safeRegisterHook(
-    "/Script/ROD.RODGameInstance:LoadInGameGameModeCompleted",
-    function()
-        if mapLeaving then
-            onWorldReady("LoadInGameGameModeCompleted", 2.0)
-        end
-    end,
-    "LoadInGameGameModeCompleted"
-)
-
--- RegisterLoadMapPreHook is disabled in some UE4SS configurations, so this is
--- supplementary only. All game-specific travel hooks above remain primary.
-pcall(function()
-    RegisterLoadMapPreHook(function()
-        beginTravel("LoadMapPre", false)
-    end)
-end)
 end
 
 -- Compatibility startup:
@@ -2013,28 +1821,10 @@ end
 -- hands over the merged config.lua + runtime.lua table. The same strict
 -- validator is used for startup and live changes.
 do
-    local function loadModMenuBridge()
-        local directory = getScriptDirectory()
-        if type(directory) ~= "string" or directory == "" then
-            return nil, "script directory unavailable"
-        end
-
-        local path = directory .. "../../shared/ModMenuBridge.lua"
-        local loaded, result = pcall(function() return dofile(path) end)
-        if not loaded then
-            return nil, tostring(result)
-        end
-        if type(result) ~= "table" then
-            return nil, "canonical ModMenuBridge did not return a table"
-        end
-        return result, nil
-    end
-
-    local bridge, bridgeError = loadModMenuBridge()
-    if bridge ~= nil then
-        local attachment = bridge.attach({
+    local attachment, attachmentError = MOD_MENU_BRIDGE.attach({
             modName = "SpeedMod",
-            scriptDir = getScriptDirectory(),
+            scriptDir = SCRIPT_DIRECTORY,
+            pollMs = 750,
             load = function(external)
                 local applied, configError = applyExternalConfig(external)
                 if not applied then
@@ -2050,16 +1840,17 @@ do
                 warn("LIVE CONFIG | " .. speedConfigSummary())
                 applyLiveJumpSetting()
             end,
+            fail = function(message)
+                CONFIG.ENABLED = false
+                restoreJumpVelocity()
+                clearAcceleration()
+                warn("FAIL-CLOSED | " .. tostring(message))
+            end,
             log = function(message) print("[SpeedMod] " .. tostring(message) .. "\n") end,
-        })
-        if attachment == nil then
-            CONFIG.ENABLED = false
-            warn("ModMenuBridge attach failed; SpeedMod disabled")
-        end
-    else
+    })
+    if attachment == nil then
         CONFIG.ENABLED = false
-        warn("ModMenuBridge unavailable; SpeedMod disabled: " ..
-            tostring(bridgeError))
+        error("ModMenuBridge attach failed: " .. tostring(attachmentError))
     end
 end
 

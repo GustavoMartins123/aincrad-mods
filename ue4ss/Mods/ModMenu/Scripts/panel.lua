@@ -180,9 +180,7 @@ local function describeValue(row)
         -- state worth showing on the header; the mod's own ENABLED setting is
         -- just one of its settings and lives in the expanded list.
         local loaded = store.isModEnabled(row.entry.mod)
-        if loaded ~= nil then return loaded and "ON" or "OFF" end
-        if row.enabledSetting == nil then return "" end
-        return store.valueOf(row.effective, row.enabledSetting) and "ON" or "OFF"
+        return loaded and "ON" or "OFF"
     end
 
     local setting = row.setting

@@ -14,19 +14,28 @@ local modmenuScriptDir = nil
 -- `dir` is ModMenu's own Scripts/ directory; every other mod is resolved
 -- relative to it so nothing depends on UE4SS's working directory.
 function Store.init(dir, loadedBridge)
+    if type(dir) ~= "string" or dir == "" then
+        error("canonical ModMenu Scripts directory is unavailable")
+    end
+    if type(loadedBridge) ~= "table" then
+        error("canonical ModMenuBridge is unavailable")
+    end
     modmenuScriptDir = dir
     bridge = loadedBridge
 end
 
 function Store.scriptDirFor(modName)
-    if modmenuScriptDir == nil then return nil end
+    if type(modName) ~= "string" or modName == "" then
+        error("registered mod name is unavailable")
+    end
+    if modmenuScriptDir == nil then
+        error("store has not been initialized")
+    end
     return modmenuScriptDir .. "../../" .. modName .. "/Scripts/"
 end
 
 local function runtimePathFor(modName)
-    local dir = Store.scriptDirFor(modName)
-    if dir == nil then return nil end
-    return dir .. "runtime.lua"
+    return Store.scriptDirFor(modName) .. "runtime.lua"
 end
 
 Store.runtimePathFor = runtimePathFor
@@ -49,11 +58,19 @@ end
 Store.renderValue = renderValue
 
 function Store.serialize(values)
+    if type(values) ~= "table" then error("runtime values must be a table") end
     local keys = {}
     for key, value in pairs(values) do
-        if type(key) == "string" and renderValue(value) ~= nil then
-            keys[#keys + 1] = key
+        if type(key) ~= "string" or key == "" then
+            error("runtime keys must be non-empty strings")
         end
+        if not key:match("^[A-Z][A-Z0-9_]*$") then
+            error("invalid runtime key: " .. key)
+        end
+        if renderValue(value) == nil then
+            error("unsupported runtime value for " .. key)
+        end
+        keys[#keys + 1] = key
     end
     table.sort(keys)
 
@@ -71,42 +88,59 @@ function Store.serialize(values)
     return table.concat(lines, "\n") .. "\n"
 end
 
-local function readTable(path)
-    if bridge == nil or path == nil then return nil end
-    local contents = bridge.readFile(path)
-    if contents == nil then return nil end
-    local result = bridge.evaluateTable(contents, "@" .. path)
-    return result
+local function readOptionalTable(path)
+    local contents, readError = bridge.readFile(path)
+    if readError ~= nil then
+        return nil, "read failed: " .. tostring(readError)
+    end
+    if contents == nil then return {}, nil end
+    local result, evaluationError = bridge.evaluateTable(contents, "@" .. path)
+    if result == nil then
+        return nil, "settings rejected: " .. tostring(evaluationError)
+    end
+    return result, nil
 end
 
 -- Only the menu's own overrides, without config.lua underneath.
 function Store.readRuntime(modName)
-    return readTable(runtimePathFor(modName)) or {}
+    return readOptionalTable(runtimePathFor(modName))
 end
 
 -- What the mod is actually running with: config.lua overlaid with runtime.lua.
 function Store.readEffective(modName)
-    if bridge == nil then return {} end
-    local settings = bridge.readSettings(modName, Store.scriptDirFor(modName))
-    return settings or {}
+    local settings, _, info =
+        bridge.readSettings(modName, Store.scriptDirFor(modName))
+    if settings == nil then
+        error(tostring(modName) .. " settings unavailable: " ..
+            tostring(info and info.error or "unknown settings error"))
+    end
+    return settings
 end
 
--- Resolves the value a single setting should display: the override if one
--- exists, otherwise config.lua, otherwise the registry default.
+-- Resolves the exact effective value. Missing or invalid values are errors:
+-- the menu must not display or persist a substitute.
 function Store.valueOf(effective, setting)
-    -- Written out rather than folded into an `and`/`or` chain: a stored `false`
-    -- would collapse to nil there and read back as the default, which silently
-    -- pins every disabled setting to ON.
-    local value = nil
-    if effective ~= nil then value = effective[setting.key] end
-    if value == nil then return setting.default end
-    if setting.type == "bool" then return value ~= false end
-    if setting.type == "number" then
-        local number = tonumber(value)
-        if number == nil then return setting.default end
-        return number
+    if type(effective) ~= "table" then error("effective settings are unavailable") end
+    if type(setting) ~= "table" or type(setting.key) ~= "string" then
+        error("registry setting is invalid")
     end
-    return value
+    local value = effective[setting.key]
+    if value == nil then error("missing effective setting: " .. setting.key) end
+    if setting.type == "bool" then
+        if type(value) ~= "boolean" then error(setting.key .. " must be boolean") end
+        return value
+    end
+    if setting.type == "number" then
+        if type(value) ~= "number" then error(setting.key .. " must be numeric") end
+        return value
+    end
+    if setting.type == "choice" then
+        if type(value) ~= "string" and type(value) ~= "number" then
+            error(setting.key .. " has an invalid choice value")
+        end
+        return value
+    end
+    error("unsupported registry setting type: " .. tostring(setting.type))
 end
 
 local function writeFile(path, contents)
@@ -125,7 +159,11 @@ local function writeFile(path, contents)
 end
 
 function Store.writeRuntime(modName, values)
-    return writeFile(runtimePathFor(modName), Store.serialize(values))
+    local ok, serialized = pcall(function() return Store.serialize(values) end)
+    if not ok then
+        return false, "runtime serialization failed: " .. tostring(serialized)
+    end
+    return writeFile(runtimePathFor(modName), serialized)
 end
 
 --========================================================--
@@ -137,34 +175,41 @@ end
 -- it at all, which is exactly the sort of lie a settings menu must not tell.
 
 function Store.enabledPathFor(modName)
-    local dir = Store.scriptDirFor(modName)
-    if dir == nil then return nil end
     -- scriptDirFor points at Scripts/; enabled.txt sits beside it in the mod root.
-    return dir .. "../enabled.txt"
+    return Store.scriptDirFor(modName) .. "../enabled.txt"
 end
 
 function Store.isModEnabled(modName)
     local path = Store.enabledPathFor(modName)
-    if path == nil or bridge == nil then return nil end
-    return bridge.readFile(path) ~= nil
+    local contents, readError = bridge.readFile(path)
+    if readError ~= nil then
+        error("enabled.txt state read failed: " .. tostring(readError))
+    end
+    return contents ~= nil
 end
 
 function Store.setModEnabled(modName, enabled)
     local path = Store.enabledPathFor(modName)
-    if path == nil then return false, "no path" end
+    if type(enabled) ~= "boolean" then return false, "enabled state must be boolean" end
 
     if enabled then
-        if bridge ~= nil and bridge.readFile(path) ~= nil then return true, nil end
-        return writeFile(path, "")
+        local existing, readError = bridge.readFile(path)
+        if readError ~= nil then
+            return false, "enabled.txt state read failed: " .. tostring(readError)
+        end
+        if existing ~= nil then return true, nil end
+        return writeFile(path, "enabled\n")
     end
 
-    local removed = false
-    pcall(function() removed = os.remove(path) == true end)
-    if removed then return true, nil end
-    -- Report honestly rather than claim success: an enabled.txt that could not
-    -- be deleted means UE4SS will still load the mod next launch.
-    if bridge ~= nil and bridge.readFile(path) == nil then return true, nil end
-    return false, "could not remove enabled.txt"
+    local existing, readError = bridge.readFile(path)
+    if readError ~= nil then
+        return false, "enabled.txt state read failed: " .. tostring(readError)
+    end
+    if existing == nil then return true, nil end
+
+    local removed, removeError = os.remove(path)
+    if removed == true then return true, nil end
+    return false, "could not remove enabled.txt: " .. tostring(removeError)
 end
 
 -- Changes the launch marker and the live ENABLED override as one transaction.
@@ -179,7 +224,10 @@ function Store.setEnabledState(modName, runtimeKey, enabled)
         return false, "could not read current enabled.txt state"
     end
 
-    local previousRuntime = Store.readRuntime(modName)
+    local previousRuntime, runtimeReadError = Store.readRuntime(modName)
+    if previousRuntime == nil then
+        return false, "runtime read failed: " .. tostring(runtimeReadError)
+    end
     local nextRuntime = {}
     for key, value in pairs(previousRuntime) do
         nextRuntime[key] = value
@@ -212,23 +260,26 @@ end
 
 -- Persists one changed setting, leaving every other override in place.
 function Store.setValue(modName, key, value)
-    local values = Store.readRuntime(modName)
+    local values, runtimeReadError = Store.readRuntime(modName)
+    if values == nil then
+        return false, "runtime read failed: " .. tostring(runtimeReadError)
+    end
     values[key] = value
     return Store.writeRuntime(modName, values)
 end
 
--- Drops every override for a mod so config.lua is back in charge. The file is
--- emptied rather than deleted when os.remove is unavailable, which is equivalent
--- for the bridge and avoids depending on a sandboxed os library.
+-- Drops every override for a mod so config.lua is back in charge.
 function Store.resetMod(modName)
     local path = runtimePathFor(modName)
-    if path == nil then return false, "no path" end
-    if bridge ~= nil and bridge.readFile(path) == nil then return true, nil end
+    local existing, readError = bridge.readFile(path)
+    if readError ~= nil then
+        return false, "runtime read failed: " .. tostring(readError)
+    end
+    if existing == nil then return true, nil end
 
-    local removed = false
-    pcall(function() removed = os.remove(path) == true end)
-    if removed then return true, nil end
-    return Store.writeRuntime(modName, {})
+    local removed, removeError = os.remove(path)
+    if removed == true then return true, nil end
+    return false, "could not remove runtime.lua: " .. tostring(removeError)
 end
 
 return Store

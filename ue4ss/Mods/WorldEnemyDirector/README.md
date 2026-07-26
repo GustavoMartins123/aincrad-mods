@@ -62,6 +62,12 @@ are not recreated indefinitely. Travel immediately clears all Lua object
 references; processing resumes only after the game's `ClientRestart` signal and
 the fixed settlement period.
 
+The safe lobby and a mission are separate worlds. `ClientRestart` preserves the
+configured `ENABLED` state, discards the previous world's references, and
+requests a fresh enemy scan after settlement. An enabled director therefore
+starts in each mission automatically; an OFF/ON toggle is not part of the
+activation flow.
+
 ## Combat attributes
 
 The director waits for the enemy's native `OnFinishedInitialize` lifecycle

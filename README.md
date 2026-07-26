@@ -146,7 +146,10 @@ ue4ss\Mods\
 │   └── Scripts\main.lua
 ├── shared\
 │   └── ModMenuBridge.lua
-└── SpeedMod\
+├── SpeedMod\
+│   ├── enabled.txt
+│   └── Scripts\main.lua
+└── WorldEnemyDirector\
     ├── enabled.txt
     └── Scripts\main.lua
 ```
@@ -165,8 +168,8 @@ ue4ss\Mods\SpeedMod\Scripts\main.lua
 
 ### How Lua mods are enabled
 
-An empty `enabled.txt` in the mod's root folder tells UE4SS to load that mod on
-the next game launch:
+An `enabled.txt` marker in the mod's root folder tells UE4SS to load that mod
+on the next game launch. Its contents are irrelevant:
 
 ```text
 ue4ss\Mods\SpeedMod\enabled.txt
@@ -215,6 +218,13 @@ Most live values are saved to the target mod's `Scripts\runtime.lua` and are
 picked up in about one second. The documented base values remain in
 `Scripts\config.lua`. The runtime values shown in the Mods menu take precedence
 until they are changed or reset.
+
+The safe lobby and a selected mission are different Unreal worlds. The
+integrated mods keep their `ENABLED` setting across that transition, discard
+only objects owned by the old world, and reacquire the mission's current hero,
+movement component, pickups, game configuration, and enemies. Do not toggle a
+mod OFF and ON after entering a mission; a loaded and enabled mod is expected to
+activate automatically after its transition-settle interval.
 
 For restart-required changes, close the game normally and launch it again.
 Avoid **Restart All Mods** with this stack: reconstructing every hook and
@@ -368,23 +378,17 @@ The underlying quest remains active during Free Roam. Complete its objective to
 finish normally or use **Give Up** to return to town. The mod changes runtime
 quest data and does not write open-world state to the save file.
 
-#### Current Open World activation limitation
+#### Mission lifecycle
 
-Open World does not yet initialize reliably on every fresh game launch. The
-current workaround is:
+Open World is loaded at game startup from its canonical `enabled.txt` marker.
+Its quest-asset notification remains registered while the game moves from the
+safe lobby into a mission, so newly constructed mission manifests are expanded
+without an OFF/ON toggle.
 
-1. Load your save and reach town or a normal playable field.
-2. Open **Start Menu → Mods**.
-3. If **Open World** shows ON, toggle it OFF and then ON.
-4. If it shows OFF because the UE4SS marker was disabled before launch, turn it
-   ON and fully restart the game once so its Lua script can be loaded.
-5. Perform the toggle before selecting or entering the quest you want to open.
-6. Reopen the quest terminal or leave and re-enter the quest if its manifest
-   had already been constructed.
-
-The mod can expand a quest manifest when that manifest is created, but it cannot
-retroactively rebuild a floor that is already active. It also cannot retract an
-already expanded floor when switched off.
+The mod can expand a quest manifest only when that manifest is created. It
+cannot retroactively rebuild a floor that is already active, and it cannot
+retract an already expanded floor when switched off. After changing Open World
+enablement, fully restart the game and start a new quest session.
 
 ### Integrated ModMenu
 
@@ -403,8 +407,6 @@ fails, the previous state is restored and an explicit error is logged.
 
 ## Known limitations
 
-- **Open World fresh-start activation:** it currently may require the OFF/ON
-  procedure documented above.
 - **A disabled mod cannot be loaded live:** creating `enabled.txt` prepares the
   next launch; UE4SS still needs a full game restart to execute a script that
   was absent at startup.
@@ -464,9 +466,10 @@ per-frame ready messages indicate an outdated script.
 
 ### Open World is enabled but the floor remains vanilla
 
-Use the OFF/ON workaround under **Current Open World activation limitation**,
-then start a newly constructed quest session. If Open World was OFF when the
-game launched, turn it ON and restart the game first.
+Confirm that `ue4ss\Mods\AincradOpenWorld\enabled.txt` exists and that
+`enabled.txt.off` does not. Fully restart the game, then start a newly
+constructed quest session. Do not use an OFF/ON toggle inside the mission:
+Open World must already be loaded when the quest manifest is constructed.
 
 ### The game crashes at startup
 

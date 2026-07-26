@@ -56,7 +56,11 @@ local beginEquipmentReturnToMain
 local SCRIPT_DIR = (function()
     local source = (debug.getinfo(1, "S") or {}).source or ""
     if source:sub(1, 1) == "@" then source = source:sub(2) end
-    return source:match("^(.*[\\/])") or "./"
+    local directory = source:match("^(.*[\\/])")
+    if directory == nil then
+        error("canonical FieldEquipmentMod Scripts directory is unavailable")
+    end
+    return directory
 end)()
 
 local CONFIG = { ENABLED = true, DEBUG_LOGS = true }
@@ -67,14 +71,38 @@ local function log(message)
 end
 
 local function applyExternalConfig(external)
-    if type(external) ~= "table" then return end
-    if external.ENABLED ~= nil then CONFIG.ENABLED = external.ENABLED ~= false end
-    if external.DEBUG_LOGS ~= nil then CONFIG.DEBUG_LOGS = external.DEBUG_LOGS ~= false end
+    if type(external) ~= "table" then error("settings must be a table") end
+    for key in pairs(external) do
+        if key ~= "ENABLED" and key ~= "DEBUG_LOGS" then
+            error("unknown setting: " .. tostring(key))
+        end
+    end
+    if type(external.ENABLED) ~= "boolean" then error("ENABLED must be boolean") end
+    if type(external.DEBUG_LOGS) ~= "boolean" then
+        error("DEBUG_LOGS must be boolean")
+    end
+    CONFIG.ENABLED = external.ENABLED
+    CONFIG.DEBUG_LOGS = external.DEBUG_LOGS
 end
 
+local MOD_MENU_BRIDGE = (function()
+    local path = SCRIPT_DIR .. "../../shared/ModMenuBridge.lua"
+    local ok, bridge = pcall(function() return dofile(path) end)
+    if not ok then error("canonical ModMenuBridge load failed: " .. tostring(bridge)) end
+    if type(bridge) ~= "table" then
+        error("canonical ModMenuBridge did not return a table")
+    end
+    return bridge
+end)()
+
 do
-    local ok, external = pcall(function() return dofile(SCRIPT_DIR .. "config.lua") end)
-    if ok then applyExternalConfig(external) end
+    local external, _, info =
+        MOD_MENU_BRIDGE.readSettings("FieldEquipmentMod", SCRIPT_DIR)
+    if external == nil then
+        error("canonical settings load failed: " ..
+            tostring(info and info.error or "unknown settings error"))
+    end
+    applyExternalConfig(external)
 end
 
 local function unwrap(parameter)
@@ -2003,30 +2031,29 @@ end)
 -- Runtime settings. Injection happens as the start menu is constructed, so an
 -- ENABLED change lands the next time the menu is opened rather than instantly.
 do
-    local function loadModMenuBridge()
-        local required, bridge = pcall(require, "ModMenuBridge")
-        if required and type(bridge) == "table" then return bridge end
-        for _, path in ipairs({
-            SCRIPT_DIR .. "../../shared/ModMenuBridge.lua",
-            "Mods/shared/ModMenuBridge.lua",
-            "Mods\\shared\\ModMenuBridge.lua",
-        }) do
-            local ok, result = pcall(function() return dofile(path) end)
-            if ok and type(result) == "table" then return result end
-        end
-        return nil
-    end
-
-    local bridge = loadModMenuBridge()
-    if bridge ~= nil then
-        bridge.attach({
-            modName = "FieldEquipmentMod",
-            scriptDir = SCRIPT_DIR,
-            load = applyExternalConfig,
-            log = function(message)
-                print(string.format("[%s] %s\n", MOD_NAME, tostring(message)))
-            end,
-        })
+    local attachment, attachmentError = MOD_MENU_BRIDGE.attach({
+        modName = "FieldEquipmentMod",
+        scriptDir = SCRIPT_DIR,
+        pollMs = 750,
+        load = applyExternalConfig,
+        apply = function()
+            if activeEquipmentContext ~= nil then
+                setEquipmentEntryVisibility(activeEquipmentContext,
+                    CONFIG.ENABLED and VISIBLE or COLLAPSED)
+            end
+        end,
+        fail = function()
+            CONFIG.ENABLED = false
+            if activeEquipmentContext ~= nil then
+                setEquipmentEntryVisibility(activeEquipmentContext, COLLAPSED)
+            end
+        end,
+        log = function(message)
+            print(string.format("[%s] %s\n", MOD_NAME, tostring(message)))
+        end,
+    })
+    if attachment == nil then
+        error("ModMenuBridge attach failed: " .. tostring(attachmentError))
     end
 end
 

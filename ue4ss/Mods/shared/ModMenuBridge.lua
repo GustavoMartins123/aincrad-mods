@@ -1,279 +1,267 @@
--- ModMenuBridge v1.0
--- Shared runtime-settings bridge for the Echoes of Aincrad mod stack.
+-- ModMenuBridge v2.0
+-- Strict runtime-settings bridge for the Echoes of Aincrad mod stack.
 --
--- UE4SS runs every Lua mod in its own isolated state, so ModMenu cannot call
--- into SpeedMod (or any other mod) directly. Instead each mod attaches to this
--- bridge, which watches that mod's own settings files and re-applies them while
--- the game is running.
+-- Each UE4SS Lua mod has an isolated Lua state. This bridge watches exactly:
+--   <mod Scripts directory>/config.lua   (required)
+--   <mod Scripts directory>/runtime.lua  (optional)
 --
--- Two files per mod, both optional:
---   Scripts/config.lua   hand-written by the player. Never rewritten by ModMenu.
---   Scripts/runtime.lua  written by ModMenu when a value is changed in-game.
---                        Applied on top of config.lua, so it always wins.
---
--- Change detection is content-based: the bridge re-reads both files on a slow
--- poll and only reloads when the bytes actually differ. That means editing
--- config.lua by hand in a text editor also hot-reloads, with no game restart.
---
--- Usage from a mod's main.lua:
---
---   local Bridge = ... -- see loadBridge() pattern in the mods that use this
---   Bridge.attach({
---       modName = "SpeedMod",
---       scriptDir = getScriptDirectory(),
---       load = function(external) applyExternalConfig(external) end,
---       apply = function() applySpeedConfig() end,
---   })
---
--- `load` receives the merged table (config.lua overlaid with runtime.lua) and is
--- responsible for validating it, exactly as the mod already does at startup.
--- `apply` runs afterwards on the game thread, for mods that need to push the new
--- values into live engine state.
+-- There are no working-directory aliases or retained substitute settings.
+-- A read, parse, validation, scheduling, or activation failure invokes the
+-- mod's required fail handler. A later valid file change may activate it again.
 
 local Bridge = {}
 
-local DEFAULT_POLL_MS = 750
+local function readExactFile(path, required)
+    if type(path) ~= "string" or path == "" then
+        return nil, "canonical file path is unavailable"
+    end
 
--- Reading a file that does not exist is the normal case for runtime.lua, so a
--- miss must be silent rather than an error.
-local function readFile(path)
-    if type(path) ~= "string" then return nil end
+    local handle, openError, errorCode = io.open(path, "rb")
+    if handle == nil then
+        if not required and errorCode == 2 then return nil, nil end
+        return nil, tostring(openError)
+    end
+
     local ok, contents = pcall(function()
-        local handle = io.open(path, "rb")
-        if handle == nil then return nil end
         local data = handle:read("*a")
         handle:close()
         return data
     end)
-    if ok then return contents end
-    return nil
+    if not ok then
+        pcall(function() handle:close() end)
+        return nil, tostring(contents)
+    end
+    if type(contents) ~= "string" then
+        return nil, "file read returned no text"
+    end
+    return contents, nil
 end
 
-Bridge.readFile = readFile
-
--- Every mod in this stack resolves its own script directory the same way, but
--- UE4SS's working directory is not guaranteed, so keep the relative fallbacks.
-local function candidatePaths(modName, scriptDir, fileName)
-    local candidates = {}
-    local seen = {}
-
-    local function add(path)
-        if type(path) == "string" and not seen[path] then
-            seen[path] = true
-            candidates[#candidates + 1] = path
-        end
-    end
-
-    if type(scriptDir) == "string" and scriptDir ~= "" then
-        add(scriptDir .. fileName)
-    end
-    if type(modName) == "string" and modName ~= "" then
-        add("Mods/" .. modName .. "/Scripts/" .. fileName)
-        add("Mods\\" .. modName .. "\\Scripts\\" .. fileName)
-    end
-    add(fileName)
-
-    return candidates
+-- Kept as a public exact-path primitive for ModMenu's store.
+function Bridge.readFile(path)
+    return readExactFile(path, false)
 end
 
-Bridge.candidatePaths = candidatePaths
-
--- Returns the raw text and the path it came from, so callers can report which
--- file actually won when the working directory is ambiguous.
-local function readFirstExisting(modName, scriptDir, fileName)
-    for _, path in ipairs(candidatePaths(modName, scriptDir, fileName)) do
-        local contents = readFile(path)
-        if contents ~= nil then return contents, path end
-    end
-    return nil, nil
-end
-
-Bridge.readFirstExisting = readFirstExisting
-
--- A settings file is player-editable, so a syntax error is expected sooner or
--- later. Never let it escape: the caller keeps running with its previous values.
 local function evaluateTable(contents, chunkName)
-    if type(contents) ~= "string" or contents == "" then return nil, nil end
+    if type(contents) ~= "string" then
+        return nil, "settings text is unavailable"
+    end
+    if type(load) ~= "function" then
+        return nil, "Lua chunk loader is unavailable"
+    end
 
-    local loader = load or loadstring
-    if loader == nil then return nil, "no Lua chunk loader available" end
-
-    local chunk, compileError = loader(contents, chunkName)
+    local chunk, compileError = load(contents, chunkName, "t", {})
     if chunk == nil then return nil, tostring(compileError) end
-
     local ok, result = pcall(chunk)
     if not ok then return nil, tostring(result) end
     if type(result) ~= "table" then
-        return nil, "settings file did not return a table"
+        return nil, "settings file must return a table"
     end
     return result, nil
 end
 
 Bridge.evaluateTable = evaluateTable
 
--- Shallow merge is deliberate. Every tunable in this stack is a scalar or a
--- whole table the mod replaces wholesale (EXCLUDE_QUEST_IDS, FREE_ROAM_QUESTS),
--- so a deep merge would only make partial overrides harder to reason about.
-local function overlay(base, override)
+local function overlay(base, runtime)
     local merged = {}
-    if type(base) == "table" then
-        for key, value in pairs(base) do merged[key] = value end
-    end
-    if type(override) == "table" then
-        for key, value in pairs(override) do merged[key] = value end
+    for key, value in pairs(base) do merged[key] = value end
+    if runtime ~= nil then
+        for key, value in pairs(runtime) do merged[key] = value end
     end
     return merged
 end
 
 Bridge.overlay = overlay
 
--- Reads config.lua + runtime.lua and returns the merged table plus the combined
--- raw text used as the change-detection fingerprint.
-function Bridge.readSettings(modName, scriptDir)
-    local configText, configPath = readFirstExisting(modName, scriptDir, "config.lua")
-    local runtimeText, runtimePath = readFirstExisting(modName, scriptDir, "runtime.lua")
+function Bridge.readSettings(_modName, scriptDir)
+    if type(scriptDir) ~= "string" or scriptDir == "" then
+        return nil, nil, {
+            error = "canonical Scripts directory is unavailable",
+        }
+    end
 
-    local fingerprint = tostring(configText or "") .. "\0" .. tostring(runtimeText or "")
+    local configPath = scriptDir .. "config.lua"
+    local runtimePath = scriptDir .. "runtime.lua"
+    local configText, configReadError = readExactFile(configPath, true)
+    local runtimeText, runtimeReadError = readExactFile(runtimePath, false)
+    local fingerprint =
+        tostring(configText or "") .. "\0" ..
+        tostring(runtimeText or "") .. "\0" ..
+        tostring(configReadError or "") .. "\0" ..
+        tostring(runtimeReadError or "")
 
-    local config, configError = evaluateTable(configText, "@" .. tostring(configPath or "config.lua"))
-    local runtime, runtimeError = evaluateTable(runtimeText, "@" .. tostring(runtimePath or "runtime.lua"))
+    if configText == nil then
+        return nil, fingerprint, {
+            error = "config.lua read failed: " .. tostring(configReadError),
+            configPath = configPath,
+            runtimePath = runtimePath,
+        }
+    end
+    if runtimeReadError ~= nil then
+        return nil, fingerprint, {
+            error = "runtime.lua read failed: " .. tostring(runtimeReadError),
+            configPath = configPath,
+            runtimePath = runtimePath,
+        }
+    end
+
+    local config, configError = evaluateTable(configText, "@" .. configPath)
+    if config == nil then
+        return nil, fingerprint, {
+            error = "config.lua rejected: " .. tostring(configError),
+            configPath = configPath,
+            runtimePath = runtimePath,
+        }
+    end
+
+    local runtime = nil
+    if runtimeText ~= nil then
+        local runtimeError
+        runtime, runtimeError = evaluateTable(runtimeText, "@" .. runtimePath)
+        if runtime == nil then
+            return nil, fingerprint, {
+                error = "runtime.lua rejected: " .. tostring(runtimeError),
+                configPath = configPath,
+                runtimePath = runtimePath,
+            }
+        end
+    end
 
     return overlay(config, runtime), fingerprint, {
+        error = nil,
         configPath = configPath,
         runtimePath = runtimePath,
-        configError = configError,
-        runtimeError = runtimeError,
-        hasConfig = config ~= nil,
-        hasRuntime = runtime ~= nil,
-        -- The unmerged halves, so a caller can recompose them differently. attach
-        -- uses this to keep the last good overrides when runtime.lua is caught
-        -- mid-write.
         config = config,
         runtime = runtime,
         runtimeMissing = runtimeText == nil,
     }
 end
 
--- Attaches a mod to the bridge.
---
--- options.modName   string   folder name under Mods/, used for path fallbacks
--- options.scriptDir string   optional absolute directory of the mod's Scripts/
--- options.load      function receives the merged settings table
--- options.apply     function optional; runs on the game thread after load
--- options.pollMs    number   optional poll interval, defaults to 750ms
--- options.log       function optional logger, receives a single string
---
--- Returns a table with a `reload()` method for callers that want to force a
--- refresh (for example from their own console command).
-function Bridge.attach(options)
-    if type(options) ~= "table" then return nil end
+local function requireOption(options, key, expected)
+    local value = options[key]
+    if type(value) ~= expected then
+        return nil, key .. " must be " .. expected
+    end
+    if expected == "string" and value == "" then
+        return nil, key .. " must not be empty"
+    end
+    return value, nil
+end
 
-    local modName = options.modName
-    local scriptDir = options.scriptDir
-    local pollMs = tonumber(options.pollMs) or DEFAULT_POLL_MS
-    local logger = type(options.log) == "function" and options.log or function(message)
-        print(string.format("[%s/ModMenu] %s\n", tostring(modName), tostring(message)))
+function Bridge.attach(options)
+    if type(options) ~= "table" then
+        return nil, "options must be a table"
+    end
+
+    local modName, optionError = requireOption(options, "modName", "string")
+    if modName == nil then return nil, optionError end
+    local scriptDir
+    scriptDir, optionError = requireOption(options, "scriptDir", "string")
+    if scriptDir == nil then return nil, optionError end
+    local loadSettings
+    loadSettings, optionError = requireOption(options, "load", "function")
+    if loadSettings == nil then return nil, optionError end
+    local fail
+    fail, optionError = requireOption(options, "fail", "function")
+    if fail == nil then return nil, optionError end
+    local logger
+    logger, optionError = requireOption(options, "log", "function")
+    if logger == nil then return nil, optionError end
+
+    local pollMs = options.pollMs
+    if type(pollMs) ~= "number" or pollMs < 100 or pollMs > 10000 then
+        return nil, "pollMs must be between 100 and 10000"
+    end
+    local activate = options.apply
+    if activate ~= nil and type(activate) ~= "function" then
+        return nil, "apply must be a function when provided"
     end
 
     local lastFingerprint = nil
-    local reportedConfigError = nil
-    local reportedRuntimeError = nil
-    local lastGoodRuntime = nil
+    local lastFailure = nil
 
-    local function refresh(isInitial)
-        local settings, fingerprint, info = Bridge.readSettings(modName, scriptDir)
+    local function dispatchFailure(message)
+        local failure = tostring(message)
+        if failure ~= lastFailure then
+            lastFailure = failure
+            logger("CONFIG ERROR | " .. failure .. " | mod disabled")
+        end
+        local scheduled, scheduleError = pcall(function()
+            ExecuteInGameThread(function()
+                local ok, failError = pcall(fail, failure)
+                if not ok then
+                    logger("FAIL-CLOSED ERROR | " .. tostring(failError))
+                end
+            end)
+        end)
+        if not scheduled then
+            logger("SCHEDULING ERROR | " .. tostring(scheduleError))
+        end
+    end
 
-        if not isInitial and fingerprint == lastFingerprint then return false end
+    local function refresh(force, isInitial)
+        local settings, fingerprint, info =
+            Bridge.readSettings(modName, scriptDir)
+        if not force and fingerprint == lastFingerprint then return false end
         lastFingerprint = fingerprint
 
-        -- ModMenu rewrites runtime.lua on every keypress, so this poll can catch
-        -- the file half-written. Dropping to config.lua for one cycle would show
-        -- up as a visible lurch in whatever the mod controls, so a file that is
-        -- present but unparseable keeps the last overrides that did parse. A file
-        -- that is genuinely gone is a reset and must clear them.
-        if info.runtimeError ~= nil then
-            if lastGoodRuntime ~= nil then
-                settings = Bridge.overlay(info.config, lastGoodRuntime)
-            end
-        elseif info.runtimeMissing then
-            lastGoodRuntime = nil
-        else
-            lastGoodRuntime = info.runtime
+        if settings == nil then
+            dispatchFailure(info and info.error or "settings rejected")
+            return false
         end
 
-        -- Only report a broken settings file once per distinct error, otherwise a
-        -- typo left in the file would spam the log on every poll.
-        if info.configError ~= nil and info.configError ~= reportedConfigError then
-            reportedConfigError = info.configError
-            logger("config.lua ignored: " .. info.configError)
-        elseif info.configError == nil then
-            reportedConfigError = nil
-        end
-        if info.runtimeError ~= nil and info.runtimeError ~= reportedRuntimeError then
-            reportedRuntimeError = info.runtimeError
-            logger("runtime.lua ignored: " .. info.runtimeError)
-        elseif info.runtimeError == nil then
-            reportedRuntimeError = nil
-        end
-
-        if not info.hasConfig and not info.hasRuntime then return false end
-
-        if type(options.load) == "function" then
-            local ok, err = pcall(options.load, settings, info)
-            if not ok then
-                logger("failed to apply settings: " .. tostring(err))
-                return false
-            end
-        end
-
-        -- Engine state must only be touched from the game thread. The file poll
-        -- itself runs async, so hop threads before the mod pushes values into
-        -- live objects.
-        if type(options.apply) == "function" then
-            local scheduled = pcall(function()
-                ExecuteInGameThread(function()
-                    local ok, err = pcall(options.apply, settings, info)
-                    if not ok then logger("failed to activate settings: " .. tostring(err)) end
-                end)
+        local scheduled, scheduleError = pcall(function()
+            ExecuteInGameThread(function()
+                local okLoad, loadError = pcall(loadSettings, settings, info)
+                if not okLoad then
+                    dispatchFailure("settings validation failed: " ..
+                        tostring(loadError))
+                    return
+                end
+                if activate ~= nil then
+                    local okApply, applyError = pcall(activate, settings, info)
+                    if not okApply then
+                        dispatchFailure("settings activation failed: " ..
+                            tostring(applyError))
+                        return
+                    end
+                end
+                lastFailure = nil
+                if not isInitial then logger("settings reloaded in-game") end
             end)
-            if not scheduled then
-                local ok, err = pcall(options.apply, settings, info)
-                if not ok then logger("failed to activate settings: " .. tostring(err)) end
-            end
-        end
-
-        if not isInitial then
-            logger("settings reloaded in-game")
+        end)
+        if not scheduled then
+            dispatchFailure("game-thread scheduling failed: " ..
+                tostring(scheduleError))
+            return false
         end
         return true
     end
 
-    -- The initial pass records the fingerprint without claiming a reload, so the
-    -- mod's own startup log stays the single source of truth for load-time values.
-    pcall(refresh, true)
+    refresh(true, true)
 
-    -- Deliberately ExecuteWithDelay recursion rather than LoopAsync. Every other
-    -- mod in this stack polls this way, and UE4SS has been seen to tear down the
-    -- shared EngineTick hook with "Ref was not function" — which silently kills
-    -- ExecuteInGameThread for every mod at once. Sticking to the callback
-    -- pattern the rest of the stack already proves out removes this library as a
-    -- suspect for that.
+    local polling = true
     local function schedulePoll()
-        ExecuteWithDelay(pollMs, function()
-            pcall(refresh, false)
-            schedulePoll()
+        if not polling then return end
+        local scheduled, scheduleError = pcall(function()
+            ExecuteWithDelay(pollMs, function()
+                refresh(false, false)
+                schedulePoll()
+            end)
         end)
+        if not scheduled then
+            polling = false
+            dispatchFailure("settings poll scheduling failed: " ..
+                tostring(scheduleError))
+        end
     end
-
-    local looping = pcall(schedulePoll)
-    if not looping then
-        logger("runtime settings watch unavailable; values apply on restart only")
-    end
+    schedulePoll()
 
     return {
-        reload = function() return refresh(true) end,
+        reload = function() return refresh(true, false) end,
+        stop = function() polling = false end,
         modName = modName,
-    }
+    }, nil
 end
 
 return Bridge
