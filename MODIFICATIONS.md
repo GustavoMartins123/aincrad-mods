@@ -64,7 +64,7 @@ Nexus Mods page before distributing a modified package.
 | Auto Pickup | `AutoPickupMod 19 1.4 2026-07-23T15-17Z cLQPyYq9t.zip` | Archive label 1.4; `main.lua` identifies v1.3 | `main.lua` identifies v1.4.1 |
 | No Rescue | `Norescue 0.5.0 35 1 2026-07-13T13-48Z 3CxMATjJt.zip` | README identifies 0.5.0 | 0.5.0 plus integration changes |
 | Aincrad Open World | `AincradOpenWorld V1.0 55 1 2026-07-18T12-32Z V4y6UZc0K.zip` | Archive identifies V1.0 | V1.0 plus runtime bridge |
-| Field Equipment | `FieldEquipmentMod 64 1 2026-07-21T11-45Z 8WdQj6lM4.7z` | `main.lua` identifies v1.14.3-release | `main.lua` identifies v1.14.6 |
+| Field Equipment | `FieldEquipmentMod 64 1 2026-07-21T11-45Z 8WdQj6lM4.7z` | `main.lua` identifies v1.14.3-release | `main.lua` identifies v1.14.7 |
 
 ## UE4SS 1.2.1
 
@@ -368,7 +368,7 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/64)
 **Baseline:** `FieldEquipmentMod 64 1
 2026-07-21T11-45Z 8WdQj6lM4.7z`  
 **Original script version:** v1.14.3-release  
-**Integrated script version:** v1.14.6
+**Integrated script version:** v1.14.7
 
 ### Added
 
@@ -392,10 +392,13 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/64)
 - Reasserts Equipment's label, texture, and selected presentation without
   moving focus a second time.
 - Preserves the standalone wrap behavior when no other injected row exists.
-- Replaced delayed construction-callback captures with one canonical
-  game-thread acquisition cycle for the exact component-owned Start Menu.
+- Replaced delayed construction-callback captures with a construction
+  notification that resolves the exact component-owned Start Menu once on the
+  game thread.
 - Stores only the current Equipment context instead of retaining widget
   references from every historical menu.
+- Removed continuous `FindAllOf(WBP_Console_MainMenu_C)` polling during
+  gameplay.
 
 ### Fixed
 
@@ -406,8 +409,7 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/64)
 - Fixed Field Equipment stealing focus back from another injected rail row.
 - Fixed custom injected indexes being written into the native list's
   `CurrentIndex`.
-- Fixed Equipment disappearing when a checkpoint rebuilt the Start Menu or the
-  mod was reloaded while a menu instance already existed.
+- Fixed Equipment disappearing when a checkpoint rebuilt the Start Menu.
 
 ### Unchanged
 
@@ -420,7 +422,7 @@ menu restoration, and equipment workflow were retained.
 **Original archive:** None of the six Nexus baselines contains ModMenu or
 `ModMenuBridge.lua`
 
-**Current script version:** v1.4
+**Current script version:** v1.5
 
 ### Added
 
@@ -450,10 +452,11 @@ menu restoration, and equipment workflow were retained.
   quest manifests and may require a restart.
 - UE4SS's built-in `mods.txt` and `mods.json` remain unchanged; gameplay Lua
   mods continue to use only their `enabled.txt` markers.
-- Uses the same canonical component-owned Start Menu acquisition cycle as Field
-  Equipment, with its later 400 ms slot preserving deterministic row order.
+- Uses the same construction-notification acquisition path as Field Equipment,
+  with its later 400 ms slot preserving deterministic row order.
 - Retains only primitive menu identity while waiting to inject and only the
   current live context afterward.
+- Removed continuous global widget scans while the Start Menu does not exist.
 
 ### Fixed
 
@@ -468,8 +471,7 @@ menu restoration, and equipment workflow were retained.
   invalidated and reacquired.
 - Fixed live numeric edits exposing a partially written `runtime.lua`, which
   could make SpeedMod reject a temporarily missing `START_SPEED`.
-- Fixed the Mods row disappearing after checkpoint reconstruction and failing
-  to return after a mod reload while the live Start Menu already existed.
+- Fixed the Mods row disappearing after checkpoint reconstruction.
 - Fixed World Enemy Director retaining outgoing-mission enemy references until
   `ClientRestart`; quest-end events now release references before world
   collection and leave asynchronous actor teardown to Unreal.
@@ -495,7 +497,7 @@ menu restoration, and equipment workflow were retained.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v1.4.3
+**Current script version:** v1.4.4
 
 ### Added
 
@@ -513,14 +515,15 @@ menu restoration, and equipment workflow were retained.
   `K2_GetRandomReachablePointInRadius` with complete
   `UNavigationPath` validation through
   `FindPathToLocationSynchronously`.
-- Tests up to 36 golden-angle candidates over multiple director cycles,
+- Tests up to 12 golden-angle candidates over multiple director cycles,
   retaining the request while the NavMesh is building or candidates remain.
-- Uses the complete `UNavigationPath` state and positive native path length as
-  the reachability contract instead of requiring Lua access to its internal
-  `TArray<FVector>`.
-- Supplies the natural source enemy as the exact native owner and instigator;
-  this prevents the current UE4SS argument bridge from dropping nullable
-  object arguments and shifting collision mode into `InInstigator`.
+  Only one synchronous path query is allowed per cycle.
+- Uses valid, non-partial `UNavigationPath` state as the reachability contract;
+  the unreliable zero path-length value exposed by this UE4SS build is not
+  treated as a second contract.
+- Resolves the natural source enemy by exact object identity for native owner
+  and instigator, and reflects the live `RODSpawnActor` parameter order before
+  issuing the call.
 - Requires 50-150 cm separation from natural, pending, and owned enemies and
   uses `AdjustIfPossibleButDontSpawnIfColliding`.
 - Supplies `FRODSpawnActorOption` with server spawn, source level, `Prowl`
@@ -540,6 +543,9 @@ menu restoration, and equipment workflow were retained.
 Missing navigation, population, result, weak-pointer, mesh, or lifecycle
 contracts stop that operation with an explicit error. There is no raw-spawn or
 actor-root-scale compatibility path.
+
+A population-call contract failure rolls back the director, clears queued
+work, and emits one concise world fault. It is not retried every poll cycle.
 
 ## New Experience Notifications component
 

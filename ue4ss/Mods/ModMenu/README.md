@@ -93,11 +93,13 @@ cannot be grown safely from UE4SS Lua, so each row is a `MenuIcon` clone in a
 donor wrapper outside those native arrays. Only the navigation boundaries are
 bridged.
 
-Both mods acquire only the component-owned live Start Menu on the game thread.
-Field Equipment injects after a 100 ms readiness delay; ModMenu waits 400 ms,
-then counts all rows already present and places itself below them. Field
-Equipment hands downward focus to the next modded row; ModMenu owns both of its
-boundaries and returns upward focus to the row directly above it.
+Both mods acquire the component-owned live Start Menu only from its construction
+notification. They retain its primitive identity during the readiness delay
+and resolve that exact object once on the game thread; neither mod continuously
+scans the global UObject array. Field Equipment injects after 100 ms; ModMenu
+waits 400 ms, then counts all rows already present and places itself below them.
+Field Equipment hands downward focus to the next modded row; ModMenu owns both
+of its boundaries and returns upward focus to the row directly above it.
 
 While the settings panel is open, ModMenu consumes its directional, confirm,
 and back inputs. The outer Start Menu does not receive those events.

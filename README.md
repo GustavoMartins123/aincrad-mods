@@ -342,10 +342,11 @@ restart the game after turning it on.
 
 World Enemy Director preserves the game's natural enemy actors and can create
 up to seven additional enemies per natural spawn through
-`RODGameState.RODSpawnActor`. Each candidate must first produce a complete
-`UNavigationPath` on the active NavMesh and remain separated from other
-enemies. A request tests up to 36 spiral-distributed candidates over multiple
-director cycles. The spawn option starts the native Behavior Tree, leaves
+`RODGameState.RODSpawnActor`. Each candidate must first produce a valid,
+non-partial `UNavigationPath` on the active NavMesh and remain separated from
+other enemies. A request tests up to 12 spiral-distributed candidates over
+multiple director cycles, with one synchronous path query per cycle. The spawn
+option starts the native Behavior Tree, leaves
 perception enabled, and rejects unresolved collisions. Additional species can
 be randomised from classes that the current world has already loaded. Every
 extra is owned by the exact server actor returned by the game's population

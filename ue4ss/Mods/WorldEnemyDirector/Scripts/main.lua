@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.4.3"
+local MOD_VERSION = "1.4.4"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -26,11 +26,11 @@ local QUEST_TELEPORT_SETTLE_MS = 8000
 local DISCOVERY_STABILIZE_MS = 2000
 local SETTINGS_POLL_MS = 1000
 local SPAWN_INITIALIZE_MS = 8000
-local NAV_ATTEMPTS_PER_PASS = 4
-local NAV_MAX_ATTEMPTS = 36
+local NAV_ATTEMPTS_PER_PASS = 1
+local NAV_MAX_ATTEMPTS = 12
 local NAV_MIN_SEPARATION_CM = 150.0
 local NAV_GOLDEN_ANGLE_RADIANS = 2.399963229728653
-local MAX_DISCOVERY_PER_TICK = 8
+local MAX_DISCOVERY_PER_TICK = 2
 local GAMEPLAY_MOD_ADDITIVE = 0
 local SPAWN_ON_SERVER = 0
 local INITIAL_STATE_PROWL = 0
@@ -255,6 +255,37 @@ local function objectKey(object)
     return nil
 end
 
+local function firstErrorLine(value)
+    local message = tostring(value):gsub("\r", "")
+    message = message:match("([^\n]+)") or "unknown error"
+    if #message > 320 then
+        message = message:sub(1, 320) .. "..."
+    end
+    return message
+end
+
+local function resolveExactObject(fullName)
+    if type(fullName) ~= "string" or fullName == "" then
+        return nil, "canonical object name is missing"
+    end
+    local path = fullName:match("^%S+%s+(.+)$")
+    if path == nil or path == "" then
+        return nil, "canonical object path is malformed: " .. fullName
+    end
+    local ok, object = pcall(StaticFindObject, path)
+    if not ok then
+        return nil, "StaticFindObject failed for " .. path .. ": " ..
+            firstErrorLine(object)
+    end
+    if type(object) ~= "userdata" or not isValid(object) then
+        return nil, "StaticFindObject did not return a live UObject for " .. path
+    end
+    if objectKey(object) ~= fullName then
+        return nil, "StaticFindObject identity mismatch for " .. path
+    end
+    return object, nil
+end
+
 local function classData(enemy)
     local ok, classObject, className = pcall(function()
         local class = enemy:GetClass()
@@ -305,6 +336,8 @@ local materialLibrary = nil
 local materialInterface = nil
 local rodGameState = nil
 local navigationSystem = nil
+local rodSpawnActorFunction = nil
+local rodSpawnActorParameterOrder = nil
 local disableWorld
 local releaseWorldForTravel
 local gcScheduled = false
@@ -448,6 +481,65 @@ local function resolveSpawnApi()
             return false, "canonical NavigationSystemV1 object is unavailable"
         end
         navigationSystem = nav
+    end
+
+    if not isValid(rodSpawnActorFunction)
+        or rodSpawnActorParameterOrder == nil then
+        rodSpawnActorFunction = nil
+        rodSpawnActorParameterOrder = nil
+
+        local functionOk, functionObject = pcall(
+            StaticFindObject,
+            "/Script/ROD.RODGameState:RODSpawnActor"
+        )
+        if not functionOk then
+            return false, "RODSpawnActor UFunction lookup failed: " ..
+                tostring(functionObject)
+        end
+        if not isValid(functionObject) then
+            return false, "canonical RODSpawnActor UFunction is unavailable"
+        end
+
+        local required = {
+            Class = true,
+            Transform = true,
+            Option = true,
+            inOwner = true,
+            InInstigator = true,
+            CollisionHandlingOverride = true,
+        }
+        local found = {}
+        local order = {}
+        local reflectOk, reflectError = pcall(function()
+            functionObject:ForEachProperty(function(property)
+                local name = property:GetFName():ToString()
+                if required[name] == true then
+                    if found[name] == true then
+                        error("duplicate reflected parameter " .. name)
+                    end
+                    found[name] = true
+                    order[#order + 1] = name
+                end
+                return false
+            end)
+        end)
+        if not reflectOk then
+            return false, "RODSpawnActor reflection failed: " ..
+                tostring(reflectError)
+        end
+        for name, _ in pairs(required) do
+            if found[name] ~= true then
+                return false, "RODSpawnActor is missing reflected parameter " ..
+                    name
+            end
+        end
+        if #order ~= 6 then
+            return false, "RODSpawnActor reflected parameter count is " ..
+                tostring(#order) .. ", expected 6"
+        end
+        rodSpawnActorFunction = functionObject
+        rodSpawnActorParameterOrder = order
+        log("SPAWN CONTRACT | reflected order=" .. table.concat(order, ","))
     end
     return true, nil
 end
@@ -1136,8 +1228,8 @@ local function spawnPositionIsSeparated(position)
 end
 
 local function pathIsComplete(path)
-    local stateOk, pathValid, pathPartial, pathLength = pcall(function()
-        return path:IsValid(), path:IsPartial(), tonumber(path:GetPathLength())
+    local stateOk, pathValid, pathPartial = pcall(function()
+        return path:IsValid(), path:IsPartial()
     end)
     if not stateOk then
         return false, "UNavigationPath state is unreadable: " ..
@@ -1145,9 +1237,6 @@ local function pathIsComplete(path)
     end
     if pathValid ~= true then return false, "UNavigationPath is invalid" end
     if pathPartial == true then return false, "UNavigationPath is partial" end
-    if not finiteNumber(pathLength) or pathLength <= 0.0 then
-        return false, "UNavigationPath has no positive path length"
-    end
     return true, nil
 end
 
@@ -1532,6 +1621,12 @@ local function expirePendingSpawns()
     end
 end
 
+local function pauseForSpawnContractFailure(reason)
+    disableWorld("spawn contract failure")
+    worldFault = reason
+    log("WORLD ERROR | " .. worldFault .. " | director paused")
+end
+
 local function processSpawnRequest()
     local request = table.remove(spawnQueue, 1)
     if request == nil or request.generation ~= generation then return end
@@ -1558,12 +1653,42 @@ local function processSpawnRequest()
     end
     local apiReady, apiError = resolveSpawnApi()
     if not apiReady then
-        log("SPAWN ERROR | " .. apiError)
+        pauseForSpawnContractFailure(
+            "canonical spawn API is unavailable: " .. firstErrorLine(apiError)
+        )
+        return
+    end
+
+    local spawnClass, classResolveError =
+        resolveExactObject(request.classKey)
+    if spawnClass == nil then
+        pauseForSpawnContractFailure(
+            "spawn class resolution failed: " ..
+                firstErrorLine(classResolveError)
+        )
+        return
+    end
+    local owner, ownerResolveError =
+        resolveExactObject(request.originKey)
+    if owner == nil then
+        pauseForSpawnContractFailure(
+            "spawn owner resolution failed: " ..
+                firstErrorLine(ownerResolveError)
+        )
+        return
+    end
+    local instigator, instigatorResolveError =
+        resolveExactObject(request.originKey)
+    if instigator == nil then
+        pauseForSpawnContractFailure(
+            "spawn instigator resolution failed: " ..
+                firstErrorLine(instigatorResolveError)
+        )
         return
     end
 
     local position, navigationError, navigationRetryable =
-        resolveNavigableSpawnPosition(request, originState.object)
+        resolveNavigableSpawnPosition(request, owner)
     if position == nil then
         if navigationRetryable then
             spawnQueue[#spawnQueue + 1] = request
@@ -1614,13 +1739,22 @@ local function processSpawnRequest()
     local spawned = nil
     local insertedPending = false
     local okSpawn, spawnError = pcall(function()
-        local result = rodGameState:RODSpawnActor(
-            request.classObject,
-            transform,
-            option,
-            originState.object,
-            originState.object,
-            SPAWN_COLLISION_ADJUST_OR_REJECT
+        local values = {
+            Class = spawnClass,
+            Transform = transform,
+            Option = option,
+            inOwner = owner,
+            InInstigator = instigator,
+            CollisionHandlingOverride =
+                SPAWN_COLLISION_ADJUST_OR_REJECT,
+        }
+        local arguments = {}
+        for index, name in ipairs(rodSpawnActorParameterOrder) do
+            arguments[index] = values[name]
+        end
+        local result = rodSpawnActorFunction(
+            rodGameState,
+            table.unpack(arguments, 1, #rodSpawnActorParameterOrder)
         )
         if result == nil then error("RODSpawnActor returned no result") end
         local resultSpawnOn = tonumber(result.SpawnOn)
@@ -1655,7 +1789,10 @@ local function processSpawnRequest()
         if isValid(spawned) then
             pcall(function() spawned:K2_DestroyActor() end)
         end
-        log("SPAWN ERROR | RODSpawnActor failed: " .. tostring(spawnError))
+        pauseForSpawnContractFailure(
+            "RODSpawnActor canonical call failed: " ..
+                firstErrorLine(spawnError)
+        )
         return
     end
     dbg(string.format(

@@ -51,16 +51,18 @@ through the game's own `RODGameState.RODSpawnActor` population path. The exact
 the source enemy's level, selects the ordinary `Prowl` initial state, and uses
 the chosen NavMesh point as `InitialStateLoc`.
 
-Before that call, the director tests up to 36 points distributed in a
+Before that call, the director tests up to 12 points distributed in a
 golden-angle spiral through
-`NavigationSystemV1.FindPathToLocationSynchronously`. Four candidates are
-tested per director cycle so a difficult area does not stall one game frame.
-Only a candidate with a complete, non-partial `UNavigationPath` and positive
-path length is accepted. The point must also remain at least 50-150 cm from
+`NavigationSystemV1.FindPathToLocationSynchronously`. Exactly one candidate is
+tested per director cycle, bounding synchronous NavMesh work even when the
+multiplier and active-extra cap are high. Only a valid, non-partial
+`UNavigationPath` is accepted; the UE4SS bridge's zero path-length value is not
+used as a second reachability contract. The point must also remain at least 50-150 cm from
 natural and already issued enemies, depending on the configured radius. A
 request returns to the queue while untested candidates remain. The source
-enemy is supplied as both the native owner and instigator, avoiding nullable
-`UObject` argument loss in this UE4SS build. Creation uses
+enemy is resolved by exact object identity and supplied as both the native
+owner and instigator. The director reflects the live UFunction parameter order
+before calling it instead of assuming header order. Creation uses
 `AdjustIfPossibleButDontSpawnIfColliding`, so an occupied point is rejected
 instead of stacking actors. The returned
 `FRODSpawnActorResult.ServerSpawnActor` weak pointer is the sole ownership
@@ -156,11 +158,14 @@ logging.
   begins collection. Unreal remains the authoritative owner of actor teardown.
 - A material that lacks the exact configured colour parameter will keep its
   original appearance and produce an explicit error.
-- A spawn is skipped with an explicit error only after all 36 NavMesh path
+- A spawn is skipped with an explicit error only after all 12 NavMesh path
   candidates fail. A NavMesh that is still building or locked keeps the
   request queued without consuming its candidate budget.
-- Actor creation or initialization failures are reported and are not retried
-  silently.
+- An actor-creation contract failure rolls back current director changes,
+  clears queued work, and pauses the director after one concise `WORLD ERROR`.
+  The same invalid native call is not retried or expanded into repeated Lua
+  stack dumps.
+- Actor initialization failures are reported and are not retried silently.
 
 ## Reverse-engineering references
 

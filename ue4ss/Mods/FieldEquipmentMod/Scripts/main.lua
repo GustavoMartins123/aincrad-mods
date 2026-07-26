@@ -1,8 +1,8 @@
--- FieldEquipmentMenu v1.14.6
+-- FieldEquipmentMenu v1.14.7
 -- Add a native-styled Equipment entry to Echoes of Aincrad's start menu.
 
 local MOD_NAME = "FieldEquipmentMenu"
-local MOD_VERSION = "v1.14.6"
+local MOD_VERSION = "v1.14.7"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -41,13 +41,10 @@ local equipmentReturnBusy = false
 local equipmentIconTexture = nil
 local nativeBackRecoveryBusy = false
 local pendingMenuInjections = {}
-local menuInjectionWorkQueued = false
-local nextMenuBootstrapScan = 0.0
-local menuAcquisitionErrorReported = false
+local menuInjectionTimerScheduled = false
+local scheduleMenuInjection
 
 local MENU_INJECTION_DELAY_SEC = 0.10
-local MENU_INJECTION_POLL_MS = 100
-local MENU_BOOTSTRAP_SCAN_SEC = 0.25
 
 local VISIBLE = 0
 local COLLAPSED = 1
@@ -1789,6 +1786,7 @@ local function queueMenuInjection(menuKey)
     if pending == nil or readyAt < pending then
         pendingMenuInjections[menuKey] = readyAt
     end
+    scheduleMenuInjection()
 end
 
 local function activeEquipmentContextIsAttached()
@@ -1808,27 +1806,6 @@ local function activeEquipmentContextIsAttached()
     return isValidObject(attachedParent)
         and objectName(attachedParent)
             == objectName(context.equipmentWrapperParent)
-end
-
-local function scanCurrentMainMenus()
-    local ok, widgets = pcall(function()
-        return FindAllOf("WBP_Console_MainMenu_C")
-    end)
-    if not ok or type(widgets) ~= "table" then
-        if not menuAcquisitionErrorReported then
-            menuAcquisitionErrorReported = true
-            log("menu acquisition error: "
-                .. "FindAllOf(WBP_Console_MainMenu_C) returned no table")
-        end
-        return
-    end
-    menuAcquisitionErrorReported = false
-
-    for _, widget in ipairs(widgets) do
-        if isCanonicalMainMenuCandidate(widget) then
-            queueMenuInjection(objectName(widget))
-        end
-    end
 end
 
 local function processMenuInjectionCycle()
@@ -1854,28 +1831,39 @@ local function processMenuInjectionCycle()
             end
         end
     end
-
-    if activeEquipmentContext == nil and now >= nextMenuBootstrapScan then
-        nextMenuBootstrapScan = now + MENU_BOOTSTRAP_SCAN_SEC
-        scanCurrentMainMenus()
-    end
 end
 
-local function pollMenuInjections()
-    if not menuInjectionWorkQueued then
-        menuInjectionWorkQueued = true
+scheduleMenuInjection = function()
+    if menuInjectionTimerScheduled
+        or next(pendingMenuInjections) == nil then
+        return
+    end
+
+    local now = os.clock()
+    local earliest = nil
+    for _, readyAt in pairs(pendingMenuInjections) do
+        if earliest == nil or readyAt < earliest then earliest = readyAt end
+    end
+    local delayMs = math.max(
+        1,
+        math.ceil(math.max(0.0, earliest - now) * 1000)
+    )
+    menuInjectionTimerScheduled = true
+    ExecuteWithDelay(delayMs, function()
+        menuInjectionTimerScheduled = false
         ExecuteInGameThread(function()
-            menuInjectionWorkQueued = false
             local handler = debug and debug.traceback or tostring
             local ok, cycleError =
                 xpcall(processMenuInjectionCycle, handler)
             if not ok then
+                pendingMenuInjections = {}
                 log("menu acquisition cycle failed closed: "
                     .. tostring(cycleError))
+                return
             end
+            scheduleMenuInjection()
         end)
-    end
-    ExecuteWithDelay(MENU_INJECTION_POLL_MS, pollMenuInjections)
+    end)
 end
 
 safeHook("/Script/ROD.RODWidgetBPFunctionLibrary:EndMenu",
@@ -1902,10 +1890,34 @@ safeHook("/Script/ROD.RODConsoleMainMenuWidgetBase:EndSubMenu",
         finishMainMenuReturn(returnState)
     end)
 
--- One canonical acquisition path handles cold construction, checkpoint
--- reconstruction, and a mod reload while the menu already exists. It retains
--- only the exact object name until the game-thread injection resolves it.
-pollMenuInjections()
+local notifyOk, notifyError = pcall(function()
+    NotifyOnNewObject(
+        "/Script/ROD.RODConsoleMainMenuWidgetBase",
+        function(object)
+            if creatingStatOverlay then return end
+            local mainMenu = unwrap(object)
+            if not string.find(
+                objectName(mainMenu),
+                "WBP_Console_MainMenu_C",
+                1,
+                true
+            ) then
+                return
+            end
+            -- Do not capture the UObject in delayed work. Only its primitive
+            -- identity crosses the readiness delay.
+            queueMenuInjection(objectName(mainMenu))
+        end
+    )
+end)
+if not notifyOk then
+    error("[" .. MOD_NAME .. "] canonical main-menu notification failed: "
+        .. tostring(notifyError))
+end
+
+-- Construction notification is the only acquisition trigger. A hot reload
+-- against an already-existing widget is intentionally fail-closed; reopen the
+-- menu or relaunch the game instead of scanning the global object array.
 
 safeHook("/Script/ROD.RODConsoleMainMenuWidgetBase:OnButtonDownMenuItemDelegate",
     function(_, widgetParameter, buttonParameter)
