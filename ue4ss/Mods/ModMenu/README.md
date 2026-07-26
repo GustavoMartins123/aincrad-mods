@@ -17,6 +17,7 @@ MODS
   + No Rescue                      ON
   + Field Equipment +              ON
   + Enemy Director                 ON
+  + XP Notifications               ON
   + Open World *                   ON
 
   * restart required    + reopen menu

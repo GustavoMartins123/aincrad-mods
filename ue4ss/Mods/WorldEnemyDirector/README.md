@@ -26,10 +26,10 @@ ModMenu is installed, open the game's Start Menu, choose **Mods**, and expand
 |---|---:|---|
 | Spawn multiplier | 1x-8x | Total population per natural enemy; 1x adds nothing |
 | Maximum extras | 0-200 | Global cap covering live, queued, and pending extras |
-| Spawn radius | 100-1500 cm | Random horizontal distance from the natural spawn |
+| Spawn radius | 100-1500 cm | Radius for reachable NavMesh candidates around the natural spawn |
 | Random extra species | On/Off | Chooses among enemy classes already loaded by the current world |
 | Mutate bosses | On/Off | Allows mutations on natural bosses; bosses are never multiplied or randomised |
-| Minimum/maximum scale | 0.25x-4x | Stable random scale range per actor |
+| Minimum/maximum scale | 0.25x-4x | Stable visual scale applied to the skeletal mesh only |
 | Colour mode | Off/Fixed/Random | Uses the game's material-parameter interface |
 | Colour preset | Seven presets | Colour used by Fixed, or palette used by Random |
 | Health/attack/defence | 0.10x-10x | Applies verified additive deltas through the enemy's Gameplay Ability System |
@@ -46,11 +46,19 @@ extras are destroyed when a live configuration is rejected.
 
 The director listens for `RODEnemyCharacter` construction and pool reuse. For
 each eligible natural enemy, it creates up to `SPAWN_MULTIPLIER - 1` actors
-through `GameplayStatics.BeginDeferredActorSpawnFromClass` and
-`FinishSpawningActor`, then applies the source enemy's level through
-`SetEnemyLevel`. Ownership is tied to the exact returned actor object; proximity
-is never used to claim an actor. Natural actors remain unowned and are never
-destroyed by this mod.
+through the game's own `RODGameState.RODSpawnActor` population path. The exact
+`FRODSpawnActorOption` enables the Behavior Tree, keeps perception active, sets
+the source enemy's level, selects the ordinary `Prowl` initial state, and uses
+the chosen NavMesh point as `InitialStateLoc`.
+
+Before that call, `NavigationSystemV1.K2_GetRandomReachablePointInRadius` must
+return a reachable point. The point must also remain at least 50-150 cm from
+natural and already issued enemies, depending on the configured radius.
+Creation uses `AdjustIfPossibleButDontSpawnIfColliding`, so an occupied point
+is rejected instead of stacking actors. The returned
+`FRODSpawnActorResult.ServerSpawnActor` weak pointer is the sole ownership
+contract; proximity is never used to claim an actor. Natural actors remain
+unowned and are never destroyed by this mod.
 
 Random species are selected only from natural enemy classes already loaded in
 the active world. The mod does not synchronously load arbitrary Blueprint
@@ -95,6 +103,12 @@ changes preserve the current HP percentage. Disabling the director applies the
 inverse deltas, restores the source fields, and does not silently heal damaged
 enemies.
 
+Visible size is applied to the enemy's skeletal-mesh `RelativeScale3D`, not to
+the character actor root. The capsule, Character Movement component, NavMesh
+agent, controller, perception origin, and Behavior Tree therefore retain their
+native scale. This prevents giant visual variants from changing the movement
+and detection geometry that their AI was authored for.
+
 ## Colour requirement
 
 Colour uses one exact material parameter named by `COLOR_PARAMETER_NAME`
@@ -133,6 +147,8 @@ logging.
   begins collection. Unreal remains the authoritative owner of actor teardown.
 - A material that lacks the exact configured colour parameter will keep its
   original appearance and produce an explicit error.
+- A spawn is skipped with an explicit error when the active world has no
+  reachable, separated NavMesh point within the configured radius.
 - Actor creation or initialization failures are reported and are not retried
   silently.
 
@@ -140,9 +156,10 @@ logging.
 
 Implementation contracts were checked against the public
 [`toeofcharmander/mod_template`](https://github.com/toeofcharmander/mod_template)
-headers, enemy curve tables, and schemas for Echoes of Aincrad. The UE4SS
-out-parameter contract used to enumerate `FGameplayAttribute` values was also
-checked against the official
+headers, enemy curve tables, navigation declarations, and
+`FRODSpawnActorOption` schema for Echoes of Aincrad. The UE4SS out-parameter
+contract used for both NavMesh output and `FGameplayAttribute` enumeration was
+also checked against the official
 [`UE4SS-RE/RE-UE4SS`](https://github.com/UE4SS-RE/RE-UE4SS) Lua binding source
 and documentation. Every returned struct element is read once through its
 canonical parameter wrapper's `get()`.

@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.3.2"
+local MOD_VERSION = "1.4.0"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -26,11 +26,13 @@ local QUEST_TELEPORT_SETTLE_MS = 8000
 local DISCOVERY_STABILIZE_MS = 2000
 local SETTINGS_POLL_MS = 1000
 local SPAWN_INITIALIZE_MS = 8000
-local SPAWN_Z_OFFSET_CM = 40.0
+local NAV_QUERY_ATTEMPTS = 12
+local NAV_MIN_SEPARATION_CM = 150.0
 local MAX_DISCOVERY_PER_TICK = 8
 local GAMEPLAY_MOD_ADDITIVE = 0
-local SPAWN_COLLISION_ALWAYS = 1
-local SPAWN_SCALE_MULTIPLY_ROOT = 1
+local SPAWN_ON_SERVER = 0
+local INITIAL_STATE_PROWL = 0
+local SPAWN_COLLISION_ADJUST_OR_REJECT = 3
 local GAS_VALUE_EPSILON = 0.01
 local ENEMY_ROLE_NONE = 0
 local ENEMY_ROLE_BOSS = 3
@@ -299,7 +301,8 @@ local awaitingTravelRestart = false
 
 local materialLibrary = nil
 local materialInterface = nil
-local gameplayStatics = nil
+local rodGameState = nil
+local navigationSystem = nil
 local disableWorld
 local releaseWorldForTravel
 local gcScheduled = false
@@ -325,6 +328,8 @@ local function clearWorldReferences()
     discoveryBatch = false
     discoveryReadyAtMs = nil
     worldFault = nil
+    rodGameState = nil
+    navigationSystem = nil
 end
 
 local function beginTravel(reason)
@@ -411,15 +416,32 @@ local function resolveMaterialApi()
 end
 
 local function resolveSpawnApi()
-    if isValid(gameplayStatics) then return true, nil end
-    local ok, library = pcall(
-        StaticFindObject,
-        "/Script/Engine.Default__GameplayStatics"
-    )
-    if not ok or not isValid(library) then
-        return false, "canonical GameplayStatics spawn API is unavailable"
+    if not isValid(rodGameState) then
+        rodGameState = nil
+        local stateOk, state = pcall(FindFirstOf, "RODGameState")
+        if not stateOk then
+            return false, "FindFirstOf(RODGameState) failed: " .. tostring(state)
+        end
+        if not isValid(state) then
+            return false, "current RODGameState is unavailable"
+        end
+        rodGameState = state
     end
-    gameplayStatics = library
+
+    if not isValid(navigationSystem) then
+        navigationSystem = nil
+        local navOk, nav = pcall(
+            StaticFindObject,
+            "/Script/NavigationSystem.Default__NavigationSystemV1"
+        )
+        if not navOk then
+            return false, "NavigationSystemV1 lookup failed: " .. tostring(nav)
+        end
+        if not isValid(nav) then
+            return false, "canonical NavigationSystemV1 object is unavailable"
+        end
+        navigationSystem = nav
+    end
     return true, nil
 end
 
@@ -518,10 +540,12 @@ local function snapshotGas(enemy)
 end
 
 local function snapshotEnemy(enemy)
-    local ok, scale, maxHealth, attack, defence, experience, movingSpeed,
-        goldenGateBoss, enemyRole =
+    local ok, mesh, meshScale, maxHealth, attack, defence, experience,
+        movingSpeed, goldenGateBoss, enemyRole =
         pcall(function()
-            return enemy:GetActorScale3D(),
+            local enemyMesh = enemy.Mesh
+            return enemyMesh,
+                enemyMesh.RelativeScale3D,
                 enemy.MaxHelth,
                 enemy.AttackPower,
                 enemy.DefencePower,
@@ -531,8 +555,11 @@ local function snapshotEnemy(enemy)
                 enemy.EnemyRole
         end)
     if not ok then return nil, "required enemy fields are unreadable" end
-    local parsedScale = vector(scale)
-    if parsedScale == nil then return nil, "GetActorScale3D returned an invalid vector" end
+    if not isValid(mesh) then return nil, "required skeletal mesh is unavailable" end
+    local parsedMeshScale = vector(meshScale)
+    if parsedMeshScale == nil then
+        return nil, "skeletal mesh RelativeScale3D is invalid"
+    end
     for key, value in pairs({
         MaxHelth = maxHealth,
         AttackPower = attack,
@@ -555,7 +582,8 @@ local function snapshotEnemy(enemy)
     if gas == nil then return nil, gasError end
     local isBoss = goldenGateBoss or enemyRole == ENEMY_ROLE_BOSS
     return {
-        scale = parsedScale,
+        mesh = mesh,
+        meshScale = parsedMeshScale,
         MaxHelth = maxHealth,
         AttackPower = attack,
         DefencePower = defence,
@@ -713,7 +741,10 @@ end
 
 local function captureMutationState(state)
     local object = state.object
+    local mesh = object.Mesh
+    if not isValid(mesh) then error("live skeletal mesh is unavailable") end
     local snapshot = {
+        mesh = mesh,
         gasValues = gasValues(state.baseline.gas),
         gasApplied = {
             maxHealth = state.baseline.gas.applied.maxHealth,
@@ -724,8 +755,10 @@ local function captureMutationState(state)
         colorParameter = state.colorParameter,
         appliedColor = copyColor(state.appliedColor),
     }
-    snapshot.scale = vector(object:GetActorScale3D())
-    if snapshot.scale == nil then error("live actor scale is invalid") end
+    snapshot.meshScale = vector(mesh.RelativeScale3D)
+    if snapshot.meshScale == nil then
+        error("live skeletal mesh RelativeScale3D is invalid")
+    end
     snapshot.MaxHelth = object.MaxHelth
     snapshot.AttackPower = object.AttackPower
     snapshot.DefencePower = object.DefencePower
@@ -750,7 +783,10 @@ local function rollbackMutation(state, previous)
         setGasValue(state, "health", previous.gasValues.health)
         setGasValue(state, "baseAttack", previous.gasValues.baseAttack)
         setGasValue(state, "baseDefence", previous.gasValues.baseDefence)
-        object:SetActorScale3D(previous.scale)
+        if not isValid(previous.mesh) then
+            error("rollback skeletal mesh is unavailable")
+        end
+        previous.mesh:SetRelativeScale3D(previous.meshScale)
         object.MaxHelth = previous.MaxHelth
         object.AttackPower = previous.AttackPower
         object.DefencePower = previous.DefencePower
@@ -808,7 +844,10 @@ local function restoreState(state)
     local base = state.baseline
     local ok, restoreError = pcall(function()
         retargetGas(state, 1.0, 1.0, 1.0)
-        state.object:SetActorScale3D(base.scale)
+        if not isValid(base.mesh) then
+            error("baseline skeletal mesh is unavailable")
+        end
+        base.mesh:SetRelativeScale3D(base.meshScale)
         state.object.MaxHelth = base.MaxHelth
         state.object.AttackPower = base.AttackPower
         state.object.DefencePower = base.DefencePower
@@ -887,9 +926,9 @@ local function applyMutation(state)
         + (CONFIG.SCALE_MAX - CONFIG.SCALE_MIN) * state.scaleRoll
     local base = state.baseline
     local newScale = {
-        X = base.scale.X * scaleFactor,
-        Y = base.scale.Y * scaleFactor,
-        Z = base.scale.Z * scaleFactor,
+        X = base.meshScale.X * scaleFactor,
+        Y = base.meshScale.Y * scaleFactor,
+        Z = base.meshScale.Z * scaleFactor,
     }
     local movingSpeed = base.MovingSpeed * CONFIG.MOVE_SPEED_MULTIPLIER
     local actualGas
@@ -901,7 +940,10 @@ local function applyMutation(state)
             CONFIG.ATTACK_MULTIPLIER,
             CONFIG.DEFENCE_MULTIPLIER
         )
-        state.object:SetActorScale3D(newScale)
+        if not isValid(base.mesh) then
+            error("baseline skeletal mesh is unavailable")
+        end
+        base.mesh:SetRelativeScale3D(newScale)
         state.object.MaxHelth = roundedProduct(base.MaxHelth, CONFIG.HEALTH_MULTIPLIER)
         state.object.AttackPower = roundedProduct(base.AttackPower, CONFIG.ATTACK_MULTIPLIER)
         state.object.DefencePower = roundedProduct(base.DefencePower, CONFIG.DEFENCE_MULTIPLIER)
@@ -1048,6 +1090,77 @@ local function selectSpawnClass(origin)
     return entry.classObject, entry.classKey
 end
 
+local function planarDistanceSquared(a, b)
+    local dx = a.X - b.X
+    local dy = a.Y - b.Y
+    return dx * dx + dy * dy
+end
+
+local function spawnPositionIsSeparated(position)
+    local requiredSeparation = math.min(
+        NAV_MIN_SEPARATION_CM,
+        math.max(50.0, CONFIG.SPAWN_RADIUS * 0.35)
+    )
+    local requiredSquared = requiredSeparation * requiredSeparation
+
+    for _, origin in pairs(origins) do
+        if origin.location ~= nil
+            and planarDistanceSquared(position, origin.location) < requiredSquared then
+            return false
+        end
+    end
+    for _, request in ipairs(pendingSpawns) do
+        if request.position ~= nil
+            and planarDistanceSquared(position, request.position) < requiredSquared then
+            return false
+        end
+    end
+    for _, state in pairs(states) do
+        if state.owned and state.spawnPosition ~= nil
+            and planarDistanceSquared(position, state.spawnPosition) < requiredSquared then
+            return false
+        end
+    end
+    return true
+end
+
+local function resolveNavigableSpawnPosition(request, worldContext)
+    local lastFailure = "navigation query rejected every candidate"
+    for _ = 1, NAV_QUERY_ATTEMPTS do
+        local outLocation = {}
+        local queryOk, reachable = pcall(function()
+            return navigationSystem:K2_GetRandomReachablePointInRadius(
+                worldContext,
+                request.originLocation,
+                outLocation,
+                CONFIG.SPAWN_RADIUS,
+                nil,
+                nil
+            )
+        end)
+        if not queryOk then
+            return nil, "K2_GetRandomReachablePointInRadius failed: " ..
+                tostring(reachable)
+        end
+        if reachable == true then
+            local position = vector(outLocation.RandomLocation)
+            if position == nil then
+                return nil,
+                    "K2_GetRandomReachablePointInRadius returned an invalid RandomLocation out parameter"
+            end
+            if spawnPositionIsSeparated(position) then return position, nil end
+            lastFailure = string.format(
+                "no candidate respected %.0f cm minimum separation",
+                math.min(
+                    NAV_MIN_SEPARATION_CM,
+                    math.max(50.0, CONFIG.SPAWN_RADIUS * 0.35)
+                )
+            )
+        end
+    end
+    return nil, lastFailure .. " after " .. NAV_QUERY_ATTEMPTS .. " attempts"
+end
+
 local function queueExtra(origin, slot)
     if origin.spawnEligible ~= true then
         worldFault = "boss-protection invariant rejected spawn origin " ..
@@ -1072,13 +1185,6 @@ local function queueExtra(origin, slot)
         log("SPAWN ERROR | loaded enemy class catalog is empty")
         return true
     end
-    local angle = math.random() * math.pi * 2.0
-    local radius = math.sqrt(math.random()) * CONFIG.SPAWN_RADIUS
-    local position = {
-        X = origin.location.X + math.cos(angle) * radius,
-        Y = origin.location.Y + math.sin(angle) * radius,
-        Z = origin.location.Z + SPAWN_Z_OFFSET_CM,
-    }
     spawnQueue[#spawnQueue + 1] = {
         generation = generation,
         originKey = origin.key,
@@ -1086,7 +1192,11 @@ local function queueExtra(origin, slot)
         classObject = classObject,
         classKey = classKey,
         level = origin.level,
-        position = position,
+        originLocation = {
+            X = origin.location.X,
+            Y = origin.location.Y,
+            Z = origin.location.Z,
+        },
         spawnEligible = true,
     }
     origin.issued = slot
@@ -1281,6 +1391,7 @@ local function registerEnemy(enemy, reused)
         owned = request ~= nil,
         originKey = request and request.originKey or nil,
         slot = request and request.slot or nil,
+        spawnPosition = request and request.position or nil,
         applied = false,
     }
     states[key] = state
@@ -1376,24 +1487,68 @@ local function processSpawnRequest()
         return
     end
 
+    local position, navigationError =
+        resolveNavigableSpawnPosition(request, originState.object)
+    if position == nil then
+        log(string.format(
+            "SPAWN ERROR | no navigable position origin=%s slot=%d class=%s | %s",
+            request.originKey,
+            request.slot,
+            request.classKey,
+            tostring(navigationError)
+        ))
+        return
+    end
+    request.position = position
+
     local transform = {
         Rotation = { X = 0.0, Y = 0.0, Z = 0.0, W = 1.0 },
         Translation = request.position,
         Scale3D = { X = 1.0, Y = 1.0, Z = 1.0 },
     }
+    local option = {
+        ActorTags = {},
+        FlowGameplayTags = {},
+        DefaultSpawnOn = SPAWN_ON_SERVER,
+        ItemLotKey = FName("None"),
+        Items = {},
+        IsDropItems = false,
+        HeroNumber = 0,
+        IsPermanentableItem = false,
+        ReplaceNameID = 0,
+        Level = request.level,
+        InitialState = INITIAL_STATE_PROWL,
+        InitialStateLoc = request.position,
+        IsNodetect = false,
+        IsStartBehaviorTree = true,
+        IsBossWave = false,
+        IsDangerousTreasureChests = false,
+        IsForcePlaySpawnFX = false,
+    }
     local spawned = nil
     local insertedPending = false
     local okSpawn, spawnError = pcall(function()
-        spawned = gameplayStatics:BeginDeferredActorSpawnFromClass(
-            originState.object,
+        local result = rodGameState:RODSpawnActor(
             request.classObject,
             transform,
-            SPAWN_COLLISION_ALWAYS,
+            option,
             nil,
-            SPAWN_SCALE_MULTIPLY_ROOT
+            nil,
+            SPAWN_COLLISION_ADJUST_OR_REJECT
         )
+        if result == nil then error("RODSpawnActor returned no result") end
+        local resultSpawnOn = tonumber(result.SpawnOn)
+        if resultSpawnOn ~= SPAWN_ON_SERVER then
+            error("RODSpawnActor returned non-server SpawnOn=" ..
+                tostring(resultSpawnOn))
+        end
+        local weakActor = result.ServerSpawnActor
+        if weakActor == nil then
+            error("RODSpawnActor result has no ServerSpawnActor")
+        end
+        spawned = weakActor:Get()
         if not isValid(spawned) then
-            error("BeginDeferredActorSpawnFromClass returned no actor")
+            error("RODSpawnActor returned no valid server actor")
         end
         request.actorKey = objectKey(spawned)
         if request.actorKey == nil then error("created actor has no canonical object key") end
@@ -1401,19 +1556,6 @@ local function processSpawnRequest()
         request.expiresAtMs = elapsedMs + SPAWN_INITIALIZE_MS
         pendingSpawns[#pendingSpawns + 1] = request
         insertedPending = true
-
-        local finished = gameplayStatics:FinishSpawningActor(
-            spawned,
-            transform,
-            SPAWN_SCALE_MULTIPLY_ROOT
-        )
-        if not isValid(finished) then error("FinishSpawningActor returned no actor") end
-        local finishedKey = objectKey(finished)
-        if finishedKey ~= request.actorKey then
-            error("FinishSpawningActor returned a different actor")
-        end
-        request.object = finished
-        finished:SetEnemyLevel(request.level, false)
     end)
     if not okSpawn then
         if insertedPending then
@@ -1427,7 +1569,7 @@ local function processSpawnRequest()
         if isValid(spawned) then
             pcall(function() spawned:K2_DestroyActor() end)
         end
-        log("SPAWN ERROR | canonical actor creation failed: " .. tostring(spawnError))
+        log("SPAWN ERROR | RODSpawnActor failed: " .. tostring(spawnError))
         return
     end
     dbg(string.format(

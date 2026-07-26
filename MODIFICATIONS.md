@@ -283,6 +283,10 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/35)
 - Fixed lobby-to-mission travel requiring an OFF/ON toggle; the safety timer
   keeps reacquiring the new world until its exact hero and game configuration
   are available.
+- Fixed the expected lobby interval without `RODGameConfig` being reported as
+  an exception with a full traceback. The safety timer now reports one
+  `WAITING FOR GAME CONFIG` transition and applies only after the canonical
+  object exists; malformed objects and failed property access remain errors.
 
 ### Unchanged
 
@@ -459,6 +463,69 @@ menu restoration, and equipment workflow were retained.
 - Fixed a configuration read failure being replaced by registry defaults in the
   panel. Missing, malformed, or invalid canonical settings now fail closed and
   are reported explicitly.
+
+## New World Enemy Director component
+
+**Origin:** New local implementation based on public reflected game contracts
+
+**Original archive:** None of the six Nexus baselines contains this component
+
+**Current script version:** v1.4.0
+
+### Added
+
+- Extra-enemy multiplication, loaded-species randomisation, boss quarantine,
+  colour presets, visual scale, Gameplay Ability System combat multipliers,
+  movement speed, experience multipliers, world-transition quarantine, and
+  exact owned-actor accounting.
+- A ModMenu registry entry and strict transactional configuration.
+
+### Changed
+
+- Replaced raw deferred `GameplayStatics` actor construction with the game's
+  reflected `RODGameState.RODSpawnActor` population contract.
+- Requires a reachable point from
+  `NavigationSystemV1.K2_GetRandomReachablePointInRadius`.
+- Requires 50-150 cm separation from natural, pending, and owned enemies and
+  uses `AdjustIfPossibleButDontSpawnIfColliding`.
+- Supplies `FRODSpawnActorOption` with server spawn, source level, `Prowl`
+  initial state, initial state location, active perception, and Behavior Tree
+  startup.
+- Reads ownership only from
+  `FRODSpawnActorResult.ServerSpawnActor`.
+- Applies random visual size to skeletal-mesh `RelativeScale3D` instead of the
+  character actor root, preserving capsule, NavMesh-agent, perception,
+  controller, and movement geometry.
+
+### Failure behavior
+
+Missing navigation, population, result, weak-pointer, mesh, or lifecycle
+contracts stop that operation with an explicit error. There is no raw-spawn or
+actor-root-scale compatibility path.
+
+## New Experience Notifications component
+
+**Origin:** New local quality-of-life implementation
+
+**Original archive:** None of the six Nexus baselines contains this component
+
+**Current script version:** v1.0.0
+
+### Added
+
+- A live ModMenu toggle for native EXP notifications.
+- Exact correlation between `NotifyEnemyConfirmedDeath` and the host player's
+  next `CalcHeroLevelUp(AddExp)` call.
+- An `EXP +N` entry built with the game's `URODEventMessageWidget`, inserted in
+  the active `URODInfoMessageLogWidget.Information` stack.
+- Native timer ownership through `SetMessageTimer`, avoiding Lua references to
+  enemy, player, widget, or world objects across travel.
+
+The game's `DT_InfoMessageDataTable` contains no EXP row; `1014` and `1015` are
+explicitly stealing/collection messages. The component therefore does not
+misuse a localization row or substitute an unrelated message key. If the
+confirmed-death, reward, or active message-stack contract is unavailable, it
+reports an explicit error and does not create another overlay.
 
 ## Generated and local-state files
 

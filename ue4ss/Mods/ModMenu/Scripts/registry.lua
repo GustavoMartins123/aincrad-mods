@@ -103,6 +103,18 @@ return {
     },
 
     {
+        mod = "ExperienceNotifications",
+        label = "XP Notifications",
+        summary = "Show EXP earned from each enemy",
+        apply = "live",
+        settings = {
+            { key = "ENABLED", label = "Enabled", type = "bool", default = true },
+            { key = "DEBUG_LOGS", label = "Debug logging",
+              type = "bool", default = false },
+        },
+    },
+
+    {
         mod = "WorldEnemyDirector",
         label = "Enemy Director",
         summary = "Multiply and mutate world enemies",

@@ -183,6 +183,8 @@ local gcCache
 -- Captured the first time the threshold is overwritten, so switching the mod off
 -- in-game can hand the shipped value (780) back instead of guessing at it.
 local originalLandingHeight
+local gameConfigWaitingReported = false
+local gameConfigReadyReported = false
 
 local function applyThreshold()
     -- cheap path: cached object still valid and still carrying our value
@@ -194,14 +196,24 @@ local function applyThreshold()
             error("cached RODGameConfig.DeathLandingHeight read failed: " ..
                 tostring(cur))
         end
-        if cur == CONFIG.DEATH_LANDING_HEIGHT then return end
+        if cur == CONFIG.DEATH_LANDING_HEIGHT then return true end
     else
         gcCache = nil
     end
     -- repair path: (re)find every config object and set the threshold
     local ok, list = pcall(function() return FindAllOf("RODGameConfig") end)
     if not ok then error("FindAllOf(RODGameConfig) failed: " .. tostring(list)) end
-    if type(list) ~= "table" then error("FindAllOf(RODGameConfig) returned no table") end
+    if list == nil then
+        if not gameConfigWaitingReported then
+            gameConfigWaitingReported = true
+            print("[norescue] WAITING FOR GAME CONFIG | safety net remains active")
+        end
+        return false
+    end
+    if type(list) ~= "table" then
+        error("FindAllOf(RODGameConfig) returned " .. type(list) ..
+            " instead of a table")
+    end
     local applied = 0
     for _, gc in ipairs(list) do
         if valid(gc) then
@@ -229,22 +241,55 @@ local function applyThreshold()
                 tostring(before), CONFIG.DEATH_LANDING_HEIGHT))
         end
     end
-    if applied == 0 then error("no valid RODGameConfig object is available") end
+    if applied == 0 then
+        if not gameConfigWaitingReported then
+            gameConfigWaitingReported = true
+            print("[norescue] WAITING FOR GAME CONFIG | safety net remains active")
+        end
+        return false
+    end
+    if gameConfigWaitingReported or not gameConfigReadyReported then
+        print("[norescue] GAME CONFIG READY | fall threshold acquired")
+    end
+    gameConfigWaitingReported = false
+    gameConfigReadyReported = true
+    return true
 end
 
 -- Both levers are plain writes, so switching the mod off in-game just puts the
 -- game's own values back. Anything we never touched is left alone.
 local function revertAll()
-    local hero = resolveHero()
-    if valid(hero) and pcall(function() hero:SetEnablePreventFalling(true) end) then
+    local hero, heroError = resolveHero()
+    if heroError ~= nil then error(heroError) end
+    if valid(hero) then
+        local switched, switchError = pcall(function()
+            hero:SetEnablePreventFalling(true)
+        end)
+        if not switched then
+            error("SetEnablePreventFalling(true) failed: " .. tostring(switchError))
+        end
         switchedHeroKey = nil
     end
     if originalLandingHeight ~= nil then
         local ok, list = pcall(function() return FindAllOf("RODGameConfig") end)
-        if ok and type(list) == "table" then
+        if not ok then
+            error("FindAllOf(RODGameConfig) failed while reverting: " ..
+                tostring(list))
+        end
+        if list ~= nil and type(list) ~= "table" then
+            error("FindAllOf(RODGameConfig) returned " .. type(list) ..
+                " while reverting")
+        end
+        if type(list) == "table" then
             for _, gc in ipairs(list) do
                 if valid(gc) then
-                    pcall(function() gc.DeathLandingHeight = originalLandingHeight end)
+                    local writeOk, writeError = pcall(function()
+                        gc.DeathLandingHeight = originalLandingHeight
+                    end)
+                    if not writeOk then
+                        error("DeathLandingHeight revert failed: " ..
+                            tostring(writeError))
+                    end
                 end
             end
         end
@@ -268,13 +313,16 @@ local function applyAll()
     end
 
     local ok, err = xpcall(function()
-        applyHeroSwitch()
-        applyThreshold()
+        local heroReady = applyHeroSwitch()
+        local configReady = applyThreshold()
+        if not heroReady or not configReady then return false end
+        return true
     end, debug and debug.traceback or tostring)
     if not ok then
         print("[norescue] apply error: " .. tostring(err))
         return
     end
+    if err ~= true then return end
     if modActive == false then print("[norescue] switched back on in-game") end
     modActive = true
 end
@@ -291,6 +339,8 @@ local function onRespawnPath()
     heroLookupErrorReported = false
     heroIdentityErrorReported = false
     heroSwitchErrorReported = false
+    gameConfigWaitingReported = false
+    gameConfigReadyReported = false
     ExecuteWithDelay(1000, function() ExecuteInGameThread(applyAll) end)
 end
 

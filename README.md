@@ -38,6 +38,7 @@ download, credits, permissions, changelog, and support information.
 | No Rescue | Removes ledge steering and the hard-fall teleport | Live |
 | Field Equipment Mod | Opens the native Equipment screen while in the field | Reopen Start Menu |
 | World Enemy Director | Multiplies and mutates world enemies | Live |
+| Experience Notifications | Shows the exact EXP awarded by each enemy death | Live |
 | Aincrad Open World | Opens complete floors and adds Free Roam quest entries | New quest manifests/restart |
 
 ## 1. Find the correct Win64 folder
@@ -136,6 +137,9 @@ ue4ss\Mods\
 │   ├── enabled.txt
 │   └── Scripts\main.lua
 ├── FieldEquipmentMod\
+│   ├── enabled.txt
+│   └── Scripts\main.lua
+├── ExperienceNotifications\
 │   ├── enabled.txt
 │   └── Scripts\main.lua
 ├── ModMenu\
@@ -337,10 +341,13 @@ restart the game after turning it on.
 ### World Enemy Director
 
 World Enemy Director preserves the game's natural enemy actors and can create
-up to seven additional enemies per natural spawn through Unreal's deferred
-actor-spawn API. Additional species can be randomised from classes that the
-current world has already loaded. Every extra is owned by its exact returned
-actor object.
+up to seven additional enemies per natural spawn through
+`RODGameState.RODSpawnActor`. Each candidate must first be reachable on the
+active NavMesh and separated from other enemies. The spawn option starts the
+native Behavior Tree, leaves perception enabled, and rejects unresolved
+collisions. Additional species can be randomised from classes that the current
+world has already loaded. Every extra is owned by the exact server actor
+returned by the game's population API.
 
 The Mods panel exposes the spawn multiplier and cap, spawn radius, natural-boss
 mutation, scale range, fixed or random colour, health, attack, defence,
@@ -368,10 +375,28 @@ mission. A standalone `ClientRestart` or quest teleport within the same world
 preserves ownership and temporarily quarantines processing, preventing the
 director from rediscovering and multiplying its own extras.
 
+Visual size changes target only the enemy skeletal mesh. Character capsules,
+NavMesh agents, controllers, perception, and movement remain at native scale,
+so large variants do not lose navigation or detection because of actor-root
+scaling.
+
 See
 [`ue4ss\Mods\WorldEnemyDirector\README.md`](ue4ss/Mods/WorldEnemyDirector/README.md)
 for its exact configuration contract, colour requirement, diagnostics, and
 known limitations.
+
+### Experience Notifications
+
+Experience Notifications shows `EXP +N` in the game's native side-message
+stack after a confirmed enemy death. It correlates
+`NotifyEnemyConfirmedDeath` with the host player's exact
+`CalcHeroLevelUp(AddExp)` call, so the displayed number is the reward actually
+applied after the game's own calculations.
+
+The feature creates the game's `URODEventMessageWidget` inside the active
+`URODInfoMessageLogWidget.Information` panel and hands its lifetime to the
+native message timer. It does not retain enemy, player, widget, or world
+objects across travel. Quest and unrelated EXP grants are not displayed.
 
 ### Aincrad Open World
 
@@ -437,6 +462,8 @@ fails, the previous state is restored and an explicit error is logged.
 - **Enemy Director native verification:** its reflected spawn, material, and
   enemy-stat contracts were validated against public dumped headers and still
   require an in-game test after each game update.
+- **EXP notification native verification:** reward correlation and the native
+  message widget require an in-game test after each game update.
 - **Runtime UI rebuilding:** Field Equipment changes need the Start Menu to be
   reopened. Open World changes affect only manifests created after the change.
 - **Game updates:** engine classes, widgets, hooks, or signatures can change
