@@ -107,3 +107,27 @@ collapses back to the original behavior, so Field Equipment still works alone.
 
 ModMenu injects on a 400ms delay against Field Equipment's 100ms, so the rows it
 counts are already in place.
+
+## Three rules learned the crash way
+
+**Never construct a widget of a watched class.** The panel originally created its
+own `WBP_Console_MainMenu_C` to use as a blank canvas. That is the exact class
+both mods watch with `NotifyOnNewObject`, so creating one made *both* of them try
+to inject a rail row into a widget that had never been constructed or added to
+the viewport. Reading its null `Slot` crashed the game outright
+(`EXCEPTION_ACCESS_VIOLATION` on a tiny address). The panel now draws into the
+menu that is already on screen and creates nothing but `TextBlock`s and an
+`Image`. Field Equipment survives making its own clone only because it sets an
+internal flag to skip its own notification — a flag ModMenu cannot reach from a
+separate Lua state.
+
+**Never write an out-of-range `CurrentIndex`.** That field is the native list's
+cursor into `Item_0..Item_6`. The Mods row sits past the end of that array, so
+writing its index points the game's own Blueprint at a row that does not exist.
+`focusIcon` only writes values the array can hold; the row's highlight comes from
+the widget calls, not the cursor.
+
+**Do engine work on the game thread.** Input arrives through `ExecuteWithDelay`,
+which runs on the async thread. Constructing UObjects or editing the widget tree
+from there is the other reliable way to crash. Everything that touches the engine
+goes through `ExecuteInGameThread` first.

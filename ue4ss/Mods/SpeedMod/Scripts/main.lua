@@ -357,6 +357,15 @@ local function isValidObj(obj)
         return false
     end
 
+    -- When a name resolves to a UFunction instead of a property, UE4SS hands
+    -- back a bound function rather than an object. Calling ':IsValid()' on that
+    -- is a hard Lua error ("attempt to index a function value"), so reject
+    -- anything that is not object-like before touching it.
+    local kind = type(obj)
+    if kind ~= "userdata" and kind ~= "table" then
+        return false
+    end
+
     local ok, valid = pcall(function()
         return obj:IsValid()
     end)
@@ -1230,11 +1239,24 @@ local function tick(stepMs)
         combatExitMs = 0
     end
 
-    local movementOk, movement = pcall(function()
-        return hero.CharacterMovement
-    end)
+    -- `hero.CharacterMovement` resolves to a UFunction rather than the component
+    -- on this game build, so the accessors are tried in turn and the first one
+    -- that yields a real object wins.
+    local movement = nil
+    for _, accessor in ipairs({
+        function() return hero:GetCharacterMovement() end,
+        function() return hero.CharacterMovement end,
+        function() return hero:GetMovementComponent() end,
+        function() return hero.MovementComponent end,
+    }) do
+        local ok, candidate = pcall(accessor)
+        if ok and isValidObj(candidate) then
+            movement = candidate
+            break
+        end
+    end
 
-    if not movementOk or not isValidObj(movement) then
+    if not isValidObj(movement) then
         cachedHero = nil
         clearAcceleration()
         lastClockSeconds = nil

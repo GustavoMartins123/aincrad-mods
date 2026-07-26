@@ -50,6 +50,9 @@ local canvas = nil
 local rowWidgets = {}
 local titleWidgets = nil
 local styleSource = nil
+-- Every widget this panel put into the host, so closing can take out exactly
+-- what it added and nothing else.
+local addedWidgets = {}
 
 local expandedMod = nil
 local selectionIndex = 1
@@ -74,8 +77,26 @@ function Panel.init(dependencies)
     log = dependencies.log or log
     resolveController = dependencies.resolveController or resolveController
     resolveUmgLibrary = dependencies.resolveUmgLibrary or resolveUmgLibrary
-    Panel.hostClassPath = dependencies.hostClassPath
-    Panel.styleClassPath = dependencies.styleClassPath
+end
+
+-- The panel draws into the start menu that is already on screen.
+--
+-- It used to create its own clone of WBP_Console_MainMenu_C to use as a blank
+-- canvas. That class is the one both this mod and FieldEquipmentMenu watch with
+-- NotifyOnNewObject, so creating it made both mods try to inject a rail row into
+-- a widget that had never been constructed or added to the viewport — reading a
+-- null Slot, which crashed the game outright. Never construct a widget of a
+-- watched class; borrow the live one instead.
+--
+-- `icon` is this mod's own rail icon, used purely as a source of font and colour
+-- so no styling widget has to be created either.
+function Panel.attachTo(liveMenu, icon)
+    host = liveMenu
+    if isValid(icon) then
+        local label = nil
+        pcall(function() label = icon.MenuName end)
+        if isValid(label) then styleSource = label end
+    end
 end
 
 --========================================================--
@@ -181,25 +202,6 @@ local function constructWidget(classPath, outer)
     return nil
 end
 
--- FSlateFontInfo cannot be built from Lua, so the panel borrows a fully
--- configured one from a native menu label instead.
-local function resolveStyleSource(controller, umgLibrary)
-    if isValid(styleSource) then return styleSource end
-    local class = StaticFindObject(Panel.styleClassPath or "")
-    if not isValid(class) or not isValid(umgLibrary) then return nil end
-
-    local donor = nil
-    pcall(function() donor = umgLibrary:Create(controller, class, controller) end)
-    if not isValid(donor) then return nil end
-
-    local label = nil
-    pcall(function() label = donor.MenuName end)
-    if not isValid(label) then return nil end
-
-    styleSource = label
-    return styleSource
-end
-
 local function styleText(widget, color)
     if not isValid(widget) then return end
     if isValid(styleSource) then
@@ -221,6 +223,7 @@ local function placeInCanvas(widget, x, y, width)
         log("canvas rejected a panel widget")
         return false
     end
+    addedWidgets[#addedWidgets + 1] = widget
     pcall(function() slot:SetAutoSize(width == nil) end)
     pcall(function() slot:SetPosition({ X = x, Y = y }) end)
     if width ~= nil then
@@ -230,52 +233,72 @@ local function placeInCanvas(widget, x, y, width)
     return true
 end
 
--- The clone is only wanted for its canvas, so everything the class authored is
--- collapsed before the panel's own widgets go in.
-local function collapseAuthoredChildren(panelCanvas)
-    local count = nil
-    pcall(function() count = panelCanvas:GetChildrenCount() end)
-    if type(count) ~= "number" then return end
-    for index = 0, count - 1 do
-        local child = nil
-        pcall(function() child = panelCanvas:GetChildAt(index) end)
-        if isValid(child) then
-            pcall(function() child:SetVisibility(COLLAPSED) end)
+-- The start menu's root is a RetainerBox (it renders the whole menu through a
+-- material), and a RetainerBox has no AddChildToCanvas. Having children is
+-- therefore not enough to be a canvas — the tree has to be walked until a real
+-- CanvasPanel turns up.
+local CANVAS_FRAGMENT = "CanvasPanel"
+local MAX_TREE_DEPTH = 8
+
+local function collectCanvasPanels(widget)
+    local found = {}
+    local seen = {}
+
+    local function walk(current, depth)
+        if not isValid(current) or depth > MAX_TREE_DEPTH then return end
+        local key = objectName(current)
+        if seen[key] then return end
+        seen[key] = true
+
+        if string.find(key, CANVAS_FRAGMENT, 1, true) ~= nil then
+            found[#found + 1] = current
+        end
+
+        local count = nil
+        pcall(function() count = current:GetChildrenCount() end)
+        if type(count) ~= "number" then return end
+        for index = 0, count - 1 do
+            local child = nil
+            pcall(function() child = current:GetChildAt(index) end)
+            walk(child, depth + 1)
         end
     end
-end
-
--- Tries the widget's own root first, then falls back to hunting the tree for
--- anything that behaves like a canvas.
-local function resolveCanvas(widget)
-    local candidates = {}
 
     local root = nil
     pcall(function() root = widget.WidgetTree.RootWidget end)
-    if isValid(root) then candidates[#candidates + 1] = root end
+    if not isValid(root) then
+        pcall(function() root = widget:GetRootWidget() end)
+    end
+    walk(root, 0)
+    return found
+end
 
-    local named = nil
-    pcall(function() named = widget:GetRootWidget() end)
-    if isValid(named) then candidates[#candidates + 1] = named end
+-- Attaching is the only honest test that a widget really is a usable canvas, so
+-- each candidate is tried for real and the first one that accepts a child wins.
+local function resolveCanvas(widget, probe)
+    local candidates = collectCanvasPanels(widget)
+    log(string.format("found %d candidate canvas panel(s)", #candidates))
 
     for _, candidate in ipairs(candidates) do
-        local accepted = false
-        pcall(function() accepted = candidate.GetChildrenCount ~= nil end)
-        if accepted then
+        local slot = nil
+        pcall(function() slot = candidate:AddChildToCanvas(probe) end)
+        if isValid(slot) then
             log("panel canvas resolved: " .. objectName(candidate))
-            return candidate
+            return candidate, slot
         end
     end
 
-    log("panel canvas could not be resolved; run 'modmenu probe' and share the output")
-    return nil
+    log("no canvas accepted a child; run 'modmenu probe' and share the output")
+    return nil, nil
 end
 
+-- Takes out only what the panel put in. The host belongs to the game, so
+-- detaching it would tear the start menu down with it.
 local function destroyPanel()
-    if isValid(host) then
-        pcall(function() host:RemoveFromParent() end)
+    for _, widget in ipairs(addedWidgets) do
+        if isValid(widget) then pcall(function() widget:RemoveFromParent() end) end
     end
-    host = nil
+    addedWidgets = {}
     canvas = nil
     rowWidgets = {}
     titleWidgets = nil
@@ -284,45 +307,34 @@ end
 local function buildPanel()
     destroyPanel()
 
-    local controller = resolveController()
-    local umgLibrary = resolveUmgLibrary()
-    local hostClass = StaticFindObject(Panel.hostClassPath or "")
-    if not isValid(controller) or not isValid(umgLibrary) or not isValid(hostClass) then
-        log("cannot build panel: UI context is unavailable")
-        return false
-    end
-
-    pcall(function() host = umgLibrary:Create(controller, hostClass, controller) end)
     if not isValid(host) then
-        log("cannot build panel: host widget creation returned null")
+        log("cannot build panel: the start menu is not on screen")
         return false
     end
 
-    canvas = resolveCanvas(host)
+    -- The backing panel doubles as the probe that identifies a usable canvas,
+    -- so the very first attachment is also the test.
+    local background = constructWidget(IMAGE_CLASS, host)
+    if not isValid(background) then
+        log("cannot build panel: could not construct the backing image")
+        return false
+    end
+
+    local backgroundSlot = nil
+    canvas, backgroundSlot = resolveCanvas(host, background)
     if not isValid(canvas) then
         destroyPanel()
         return false
     end
-    collapseAuthoredChildren(canvas)
 
-    resolveStyleSource(controller, umgLibrary)
-
-    local background = constructWidget(IMAGE_CLASS, host)
-    if isValid(background) then
-        pcall(function()
-            background:SetColorAndOpacity({ R = 0.02, G = 0.03, B = 0.06, A = 0.88 })
-        end)
-        if isValid(canvas) then
-            local slot = nil
-            pcall(function() slot = canvas:AddChildToCanvas(background) end)
-            if isValid(slot) then
-                pcall(function() slot:SetAutoSize(false) end)
-                pcall(function() slot:SetPosition({ X = PANEL_LEFT, Y = PANEL_TOP }) end)
-                pcall(function() slot:SetSize({ X = PANEL_WIDTH, Y = PANEL_HEIGHT }) end)
-                pcall(function() slot:SetZOrder(40) end)
-            end
-        end
-    end
+    addedWidgets[#addedWidgets + 1] = background
+    pcall(function()
+        background:SetColorAndOpacity({ R = 0.02, G = 0.03, B = 0.06, A = 0.88 })
+    end)
+    pcall(function() backgroundSlot:SetAutoSize(false) end)
+    pcall(function() backgroundSlot:SetPosition({ X = PANEL_LEFT, Y = PANEL_TOP }) end)
+    pcall(function() backgroundSlot:SetSize({ X = PANEL_WIDTH, Y = PANEL_HEIGHT }) end)
+    pcall(function() backgroundSlot:SetZOrder(40) end)
 
     local title = constructWidget(TEXTBLOCK_CLASS, host)
     if isValid(title) then
@@ -368,7 +380,8 @@ local function buildPanel()
         rowWidgets[index] = { label = label, value = value, y = y }
     end
 
-    pcall(function() host:AddToViewport(500) end)
+    -- No AddToViewport: the host is the start menu, already on screen. The
+    -- panel's widgets sit above it on Z order alone.
     log("panel built with " .. tostring(maxRows) .. " row slots")
     return true
 end
@@ -562,32 +575,26 @@ end
 
 -- Dumps the host widget tree so the exact canvas/child names can be confirmed
 -- against a live game rather than guessed at.
+-- Inspects the live start menu. It must never create a widget of its own: doing
+-- that is what crashed the game, because both mods watch the main-menu class for
+-- construction and would inject into the throwaway instance.
 function Panel.probe(emit)
     emit = emit or log
-    local controller = resolveController()
-    local umgLibrary = resolveUmgLibrary()
-    local hostClass = StaticFindObject(Panel.hostClassPath or "")
 
-    emit("controller: " .. objectName(controller))
-    emit("umg library: " .. objectName(umgLibrary))
-    emit("host class: " .. objectName(hostClass))
+    emit("controller: " .. objectName(resolveController()))
+    emit("live host: " .. objectName(host))
 
-    if not isValid(controller) or not isValid(umgLibrary) or not isValid(hostClass) then
-        emit("probe stopped: UI context is unavailable (open the game first)")
+    if not isValid(host) then
+        emit("probe stopped: open the start menu first, then run this again")
         return
     end
 
-    local probeHost = nil
-    pcall(function() probeHost = umgLibrary:Create(controller, hostClass, controller) end)
-    emit("host instance: " .. objectName(probeHost))
-    if not isValid(probeHost) then return end
-
     local root = nil
-    pcall(function() root = probeHost.WidgetTree.RootWidget end)
+    pcall(function() root = host.WidgetTree.RootWidget end)
     emit("WidgetTree.RootWidget: " .. objectName(root))
 
     local viaGetter = nil
-    pcall(function() viaGetter = probeHost:GetRootWidget() end)
+    pcall(function() viaGetter = host:GetRootWidget() end)
     emit("GetRootWidget(): " .. objectName(viaGetter))
 
     local target = isValid(root) and root or viaGetter

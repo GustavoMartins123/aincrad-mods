@@ -20,9 +20,11 @@ local MAIN_MENU_WIDGET_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu.WBP_Console_MainMenu_C"
 local MAIN_MENU_LIST_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_List.WBP_Console_MainMenu_List_C"
-local MENU_ICON_ASSET =
+-- Overridable from config.lua. `modmenu icons <text>` lists the textures the
+-- game actually has loaded, so a replacement can be picked from real data rather
+-- than guessed at.
+local DEFAULT_ICON_ASSET =
     "/Game/ROD/Widget/Common/IconImage/ItemCategoryIconImage/T_ItemCategoryIcon_Unknown"
-local MENU_ICON_TEXTURE = MENU_ICON_ASSET .. ".T_ItemCategoryIcon_Unknown"
 
 local MAX_NATIVE_MENU_ITEMS = 7
 local MENU_ICON_FRAGMENT = "WBP_Console_MainMenu_MenuIcon_C"
@@ -52,12 +54,29 @@ local SCRIPT_DIR = (function()
     return source:match("^(.*[\\/])") or "./"
 end)()
 
-local CONFIG = { ENABLED = true, DEBUG_LOGS = false }
+local CONFIG = {
+    ENABLED = true,
+    DEBUG_LOGS = false,
+    ICON_ASSET = DEFAULT_ICON_ASSET,
+    ICON_TINT = { R = 1.00, G = 1.00, B = 1.00, A = 1.00 },
+}
 local logButtons = false
 
 local injectedMenus = {}
 local activeContext = nil
 local menuIconTexture = nil
+
+-- Assigned further down, called the first time a Mods row is actually injected.
+-- Nothing this mod hooks is useful before a start menu exists, so the input
+-- hooks stay unregistered until then and the mod is inert during loading.
+local ensureInputHooks
+
+-- Direction input does not reach this mod's button hooks: the native list moves
+-- its own focus internally and only reports the result through FocusEvent. These
+-- track that reported focus so the list's wrap off the last row can be turned
+-- into "enter the Mods row" instead.
+local listFocusIndexes = {}
+local pendingFocusRedirects = {}
 
 local function log(message)
     print(string.format("[%s] %s\n", MOD_NAME, tostring(message)))
@@ -139,6 +158,15 @@ do
     if ok and type(external) == "table" then
         if external.ENABLED ~= nil then CONFIG.ENABLED = external.ENABLED ~= false end
         if external.DEBUG_LOGS ~= nil then CONFIG.DEBUG_LOGS = external.DEBUG_LOGS == true end
+        if type(external.ICON_ASSET) == "string" and external.ICON_ASSET ~= "" then
+            CONFIG.ICON_ASSET = external.ICON_ASSET
+        end
+        if type(external.ICON_TINT) == "table" then
+            for _, channel in ipairs({ "R", "G", "B", "A" }) do
+                local value = tonumber(external.ICON_TINT[channel])
+                if value ~= nil then CONFIG.ICON_TINT[channel] = value end
+            end
+        end
     end
 end
 
@@ -168,30 +196,40 @@ panel.init({
     log = function(message) log("panel: " .. tostring(message)) end,
     resolveController = resolveLocalController,
     resolveUmgLibrary = resolveUmgLibrary,
-    hostClassPath = MAIN_MENU_WIDGET_CLASS,
-    styleClassPath = MAIN_MENU_ICON_CLASS,
 })
 
 --========================================================--
 --                    RAIL INJECTION                      --
 --========================================================--
 
+-- "/Game/.../T_Foo" also lives at "/Game/.../T_Foo.T_Foo"; accept either form so
+-- config.lua can hold whichever path the player copied out of `modmenu icons`.
+local function texturePathsFor(asset)
+    local leaf = string.match(asset, "([^/]+)$") or asset
+    if string.find(leaf, ".", 1, true) then return { asset } end
+    return { asset .. "." .. leaf, asset .. ".0", asset }
+end
+
 local function applyMenuIconTexture(icon)
     if not isValid(icon) or not isValid(icon.IconImage) then return false end
 
+    local asset = CONFIG.ICON_ASSET or DEFAULT_ICON_ASSET
     local texture = menuIconTexture
     if not isValid(texture) then
-        for _, path in ipairs({ MENU_ICON_TEXTURE, MENU_ICON_ASSET .. ".0" }) do
+        for _, path in ipairs(texturePathsFor(asset)) do
             pcall(function() texture = StaticFindObject(path) end)
             if isValid(texture) then break end
         end
     end
     if not isValid(texture) then
-        -- The category texture is not guaranteed to be resident when the start
-        -- menu is first constructed, so load its package on demand.
-        pcall(function() texture = LoadAsset(MENU_ICON_ASSET) end)
+        -- The texture is not guaranteed to be resident when the start menu is
+        -- first constructed, so load its package on demand.
+        pcall(function() texture = LoadAsset(asset) end)
     end
-    if not isValid(texture) then return false end
+    if not isValid(texture) then
+        log("icon texture unavailable: " .. tostring(asset))
+        return false
+    end
     menuIconTexture = texture
 
     return pcall(function() icon.IconImage:SetBrushFromTexture(texture, false) end)
@@ -254,7 +292,13 @@ end
 -- entry lands underneath them with a matching item index.
 local function countForeignInjectedRows(parent, mainList, nativeCount)
     local authored = {}
-    for index = 0, nativeCount - 1 do
+    -- The full authored range, not just the active rows. Progression hides the
+    -- final entry (Logout) without removing its wrapper, so stopping at
+    -- nativeCount leaves that wrapper unaccounted for and it gets miscounted as
+    -- another mod's row — which pushes the Mods entry one index too far and makes
+    -- it unreachable, because the navigation boundary then looks for a row that
+    -- is not the last visible one.
+    for index = 0, MAX_NATIVE_MENU_ITEMS - 1 do
         local _, wrapper = menuItemAndPanel(mainList, index)
         if isValid(wrapper) then authored[objectName(wrapper)] = true end
     end
@@ -320,6 +364,22 @@ local function injectModsEntry(mainMenu)
     end
     local menuKey = objectName(mainMenu)
     if injectedMenus[menuKey] ~= nil then return end
+
+    -- FieldEquipmentMenu builds a display-only clone of the main-menu widget when
+    -- Equipment opens, and that construction fires this mod's notification too.
+    -- Injecting a second Mods row into that clone is what makes the real row
+    -- appear to vanish behind Equipment. Refuse while a live menu already owns
+    -- the row.
+    if activeContext ~= nil and isValid(activeContext.mainMenu)
+        and objectName(activeContext.mainMenu) ~= menuKey then
+        local inViewport = false
+        pcall(function() inViewport = activeContext.mainMenu:IsInViewport() end)
+        if inViewport then
+            log("ignoring a second main-menu instance while one is live: " .. menuKey)
+            return
+        end
+    end
+
     log("injecting into " .. menuKey)
 
     local controller = resolveLocalController()
@@ -378,6 +438,10 @@ local function injectModsEntry(mainMenu)
         icon:BP_SetInputInteractionEnable(true)
         icon:SetDefaultAnimation()
         applyMenuIconTexture(icon)
+        -- Equipment uses this same placeholder texture, so the two injected rows
+        -- are otherwise indistinguishable. Tinting is safer than guessing at
+        -- another asset path that may not exist in this build.
+        pcall(function() icon.IconImage:SetColorAndOpacity(CONFIG.ICON_TINT) end)
 
         local text = textLibrary:Conv_StringToText("Mods")
         icon:SetMenuName(text)
@@ -405,8 +469,18 @@ local function injectModsEntry(mainMenu)
         wrapperParent = parent,
     }
     injectedMenus[menuKey] = icon
-    log(string.format("added Mods entry at index %d (%d native rows, %d row(s) from other mods)",
-        modsIndex, nativeCount, foreignRows))
+    -- Seed the focus tracker with wherever the list already is. Without this the
+    -- first wrap after opening the menu has no previous index to compare against
+    -- and cannot be recognised, so the first attempt to reach Mods silently
+    -- falls through to the native wrap.
+    local startingIndex = nil
+    pcall(function() startingIndex = tonumber(mainList.CurrentIndex) end)
+    listFocusIndexes[objectName(mainList)] = startingIndex
+    log(string.format("added Mods entry at index %d (%d native rows, %d row(s) from other mods, list at %s)",
+        modsIndex, nativeCount, foreignRows, tostring(startingIndex)))
+
+    -- Only now is there anything for the input hooks to act on.
+    if ensureInputHooks ~= nil then pcall(ensureInputHooks) end
 
     -- The native open animation can repaint the final authored row, so reapply
     -- the Mods brush once it settles.
@@ -426,7 +500,14 @@ end
 
 local function focusIcon(context, icon, index)
     if context == nil or not isValid(icon) then return end
-    pcall(function() context.mainList.CurrentIndex = index end)
+    -- CurrentIndex is the native list's own cursor into Item_0..Item_6. The Mods
+    -- row sits past the end of that array, so writing its index there points the
+    -- game's own code at a row that does not exist. Only ever write a value the
+    -- native array can actually hold; the row's highlight comes from the widget
+    -- calls below, not from this cursor.
+    if type(index) == "number" and index >= 0 and index < MAX_NATIVE_MENU_ITEMS then
+        pcall(function() context.mainList.CurrentIndex = index end)
+    end
     pcall(function() icon["Set Current Animation"](icon) end)
     pcall(function() icon:BP_SetInputWidgetFocus() end)
     pcall(function() icon:SetFocus() end)
@@ -495,8 +576,30 @@ end
 --                        PANEL                           --
 --========================================================--
 
-local function openPanel()
+-- Building the panel constructs UObjects and edits the widget tree, so it has to
+-- happen on the game thread. The callers reach here from ExecuteWithDelay, which
+-- runs on the async thread — doing engine work from there is the other classic
+-- way to earn an access violation.
+local function onGameThread(action)
+    local scheduled = pcall(function() ExecuteInGameThread(action) end)
+    if not scheduled then action() end
+end
+
+local function buildPanelNow()
     if panel.isOpen() then return end
+
+    local context = activeContext
+    if context == nil or not isValid(context.mainMenu) then
+        log("cannot open the panel: the start menu is not on screen")
+        return
+    end
+
+    -- The panel draws into the menu that is already up. It must never build its
+    -- own copy of the main-menu widget: that class is watched for construction
+    -- by this mod and by FieldEquipmentMenu, and both would try to inject a rail
+    -- row into the uninitialised copy, which crashes the game.
+    panel.attachTo(context.mainMenu, context.icon)
+
     if not panel.open() then
         log("panel could not be opened; use the 'modmenu' console command instead")
         return
@@ -504,11 +607,23 @@ local function openPanel()
     dbg("panel opened")
 end
 
+local function openPanel()
+    onGameThread(function()
+        local ok, err = pcall(buildPanelNow)
+        if not ok then
+            log("panel failed to open: " .. tostring(err))
+            pcall(panel.close)
+        end
+    end)
+end
+
 local function closePanel()
     if not panel.isOpen() then return end
-    panel.close()
-    if activeContext ~= nil then focusMods(activeContext) end
-    dbg("panel closed")
+    onGameThread(function()
+        pcall(panel.close)
+        if activeContext ~= nil then pcall(focusMods, activeContext) end
+        dbg("panel closed")
+    end)
 end
 
 -- One physical press reaches this mod several times over: the button hooks are
@@ -642,43 +757,108 @@ if not notifyOk then
     log("main-menu object notification unavailable: " .. tostring(notifyError))
 end
 
-safeHook("/Script/ROD.RODConsoleMainMenuWidgetBase:OnButtonDownMenuItemDelegate",
-    function(_, widgetParameter, buttonParameter)
-        handleButton(widgetParameter, buttonParameter)
+-- Every hook below only has anything to do once a Mods row exists on the rail.
+-- Registering them at load time meant this mod had callbacks running on common
+-- engine events throughout startup and gameplay for no benefit, which is a large
+-- surface to be wrong on. They are installed once, on first injection.
+local inputHooksInstalled = false
+
+ensureInputHooks = function()
+    if inputHooksInstalled then return end
+    inputHooksInstalled = true
+
+    safeHook("/Script/ROD.RODConsoleMainMenuWidgetBase:OnButtonDownMenuItemDelegate",
+        function(_, widgetParameter, buttonParameter)
+            handleButton(widgetParameter, buttonParameter)
+        end)
+
+    safeHook("/Script/ROD.RODInputWidgetBase:OnInputButtonDown",
+        function(_, widgetParameter, buttonParameter)
+            handleButton(widgetParameter, buttonParameter)
+        end)
+
+    safeHook("/Script/ROD.RODListWidgetBase:ButtonDownEvent",
+        function(_, widgetParameter, buttonParameter)
+            handleButton(widgetParameter, buttonParameter)
+        end)
+
+    -- Pressing down on the last row never reaches the button hooks above: the
+    -- native list changes focus on its own and only announces the result here.
+    -- So the wrap is caught after the fact — the list is allowed to move to the
+    -- first row, and the post-hook immediately moves focus to Mods instead,
+    -- within the same frame so the wrong row is never drawn.
+    --
+    -- This also clears the Mods highlight when any other row takes focus: the
+    -- row sits outside the native animation array, so nothing else deselects it.
+    safeHook("/Script/ROD.RODListWidgetBase:FocusEvent",
+        function(self, widgetParameter)
+            local context = activeContext
+            local listKey = objectName(unwrap(self))
+            if context == nil or panel.isOpen() then
+                pendingFocusRedirects[listKey] = nil
+                return
+            end
+            if not contains(listKey, "WBP_Console_MainMenu_List_C") then return end
+
+            local widget = unwrap(widgetParameter)
+            if not isValid(widget) then return end
+            if not isModsIcon(widget) then clearModsSelection(context) end
+
+            local index = nil
+            pcall(function() index = widget:GetItemIndex() end)
+            if index == nil then return end
+
+            local previousIndex = listFocusIndexes[listKey]
+            listFocusIndexes[listKey] = index
+
+            -- When another mod owns a row on this rail it drives the boundary
+            -- itself, and stealing focus here would fight it.
+            if context.foreignRows > 0 then return end
+
+            local lastNativeIndex = context.modsIndex - 1
+            local wrappedDown = previousIndex == lastNativeIndex and index == 0
+            local wrappedUp = previousIndex == 0 and index == lastNativeIndex
+            if wrappedDown or wrappedUp then
+                pendingFocusRedirects[listKey] = true
+            end
+            dbg(string.format("focus %s -> %s (last native %d)%s",
+                tostring(previousIndex), tostring(index), lastNativeIndex,
+                (wrappedDown or wrappedUp) and " => redirect to Mods" or ""))
+        end,
+        function(self)
+            local listKey = objectName(unwrap(self))
+            if pendingFocusRedirects[listKey] ~= true then return end
+            pendingFocusRedirects[listKey] = nil
+            if activeContext ~= nil and not panel.isOpen() then
+                focusMods(activeContext)
+            end
+        end)
+
+    safeHook("/Script/ROD.RODListWidgetBase:ClickEvent",
+        function(_, widgetParameter, buttonParameter, _)
+            if isModsIcon(unwrap(widgetParameter)) then
+                consumeButton(buttonParameter)
+                ExecuteWithDelay(0, openPanel)
+            end
+        end)
+
+    safeHook("/Script/ROD.RODConsoleMainMenuWidgetBase:OnClickMenuItemDelegate",
+        function(_, widgetParameter, buttonParameter)
+            if isModsIcon(unwrap(widgetParameter)) then
+                consumeButton(buttonParameter)
+                ExecuteWithDelay(0, openPanel)
+            end
+        end)
+
+    -- The start menu closing must take the panel with it, or it would be left
+    -- floating over the world.
+    safeHook("/Script/ROD.RODWidgetBPFunctionLibrary:EndMenu", function()
+        if panel.isOpen() then ExecuteWithDelay(0, closePanel) end
+        activeContext = nil
     end)
 
-safeHook("/Script/ROD.RODInputWidgetBase:OnInputButtonDown",
-    function(_, widgetParameter, buttonParameter)
-        handleButton(widgetParameter, buttonParameter)
-    end)
-
-safeHook("/Script/ROD.RODListWidgetBase:ButtonDownEvent",
-    function(_, widgetParameter, buttonParameter)
-        handleButton(widgetParameter, buttonParameter)
-    end)
-
-safeHook("/Script/ROD.RODListWidgetBase:ClickEvent",
-    function(_, widgetParameter, buttonParameter, _)
-        if isModsIcon(unwrap(widgetParameter)) then
-            consumeButton(buttonParameter)
-            ExecuteWithDelay(0, openPanel)
-        end
-    end)
-
-safeHook("/Script/ROD.RODConsoleMainMenuWidgetBase:OnClickMenuItemDelegate",
-    function(_, widgetParameter, buttonParameter)
-        if isModsIcon(unwrap(widgetParameter)) then
-            consumeButton(buttonParameter)
-            ExecuteWithDelay(0, openPanel)
-        end
-    end)
-
--- The start menu closing must take the panel with it, or it would be left
--- floating over the world.
-safeHook("/Script/ROD.RODWidgetBPFunctionLibrary:EndMenu", function()
-    if panel.isOpen() then ExecuteWithDelay(0, closePanel) end
-    activeContext = nil
-end)
+    log("input hooks installed")
+end
 
 --========================================================--
 --                      KEYBOARD                          --
@@ -790,7 +970,8 @@ local function runCommand(params, reply)
                 end
             end
         end
-        reply("Commands: modmenu set <mod> <key> <value> | reset <mod> | open | close | buttons | probe")
+        reply("Commands: modmenu set <mod> <key> <value> | reset <mod> | open | close")
+        reply("          modmenu icons <text> [max] | probe | buttons")
         return
     end
 
@@ -809,6 +990,34 @@ local function runCommand(params, reply)
     if sub == "buttons" then
         logButtons = not logButtons
         reply("panel button code logging " .. (logButtons and "ON" or "OFF"))
+        return
+    end
+
+    -- Lists the textures the game has loaded so an icon can be chosen from what
+    -- actually exists. Output goes to the log rather than the command reply
+    -- because it runs deferred on the game thread, where `ar` is no longer live.
+    if sub == "icons" then
+        local filter = params[2] and string.lower(tostring(params[2])) or "icon"
+        local limit = tonumber(params[3]) or 60
+        reply("searching loaded textures for '" .. filter .. "' — results in the log")
+        ExecuteInGameThread(function()
+            local ok, list = pcall(function() return FindAllOf("Texture2D") end)
+            if not ok or type(list) ~= "table" then
+                log("no Texture2D objects are loaded right now")
+                return
+            end
+            local shown = 0
+            for _, texture in ipairs(list) do
+                local name = objectName(texture)
+                if string.find(string.lower(name), filter, 1, true) then
+                    log("  " .. name)
+                    shown = shown + 1
+                    if shown >= limit then break end
+                end
+            end
+            log(string.format("%d of %d loaded textures matched '%s'",
+                shown, #list, filter))
+        end)
         return
     end
 
