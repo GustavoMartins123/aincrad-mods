@@ -1,128 +1,110 @@
 # ModMenu
 
-A **Mods** entry in Echoes of Aincrad's start menu. Enable or disable the other
-mods and retune their values without leaving the game.
+A **Mods** entry in Echoes of Aincrad's Start Menu. It enables or disables the
+installed Lua mods and edits their supported settings without leaving the game.
 
-Open the start menu, go down past the last entry to **Mods**, press Enter.
-`Up/Down` moves, `Enter` expands a mod or toggles a switch, `Left/Right` changes
-a value, `Back`/`Esc` closes.
+Open the Start Menu, move below its final native or modded row to **Mods**, and
+confirm. `Up/Down` moves, `Enter` expands a mod or toggles a switch,
+`Left/Right` changes a value, and `Back`/`Esc` closes the panel.
 
-```
+```text
 MODS
 
   - Speed                          ON
       Starting speed          < 1.40x >
       Top speed               < 3.20x >
-      Time to top speed       < 1.80s >
-      Off during combat            ON
   + Auto Pickup                    ON
   + No Rescue                      ON
   + Field Equipment +              ON
+  + Enemy Director                 ON
   + Open World *                   ON
 
   * restart required    + reopen menu
 ```
 
-## How a change reaches the other mod
+The panel virtualises thirteen visible rows. Expanding a mod with more settings
+automatically scrolls that fixed viewport, so controller navigation is
+independent of the expanded list's length.
 
-UE4SS gives every Lua mod its own isolated state, so ModMenu cannot call into
-SpeedMod directly. It writes the value to that mod's `Scripts/runtime.lua`, and
-the mod picks it up itself through `Mods/shared/ModMenuBridge.lua`, which watches
-its settings files on a slow poll. Nothing is shared in memory.
+## How changes reach another mod
 
-Two files per mod, both optional:
+UE4SS gives each Lua mod an isolated state, so ModMenu cannot call another mod
+directly. It writes values to that mod's exact `Scripts/runtime.lua` path. The
+target mod watches and validates that file from its own state. Most existing
+mods use `Mods/shared/ModMenuBridge.lua`; a mod with a stricter loader can own
+the same file contract. Nothing is shared in memory.
 
-| file | written by | role |
-|------|-----------|------|
-| `Scripts/config.lua` | you, in a text editor | documented defaults, never rewritten by ModMenu |
-| `Scripts/runtime.lua` | ModMenu | applied on top of `config.lua`, so it always wins |
+| File | Written by | Role |
+|---|---|---|
+| `Scripts/config.lua` | Player or mod author | Canonical settings, never rewritten by ModMenu |
+| `Scripts/runtime.lua` | ModMenu | Optional live overrides applied over `config.lua` |
 
-`config.lua` keeps its comments and stays the place to set defaults. **Reset**
-deletes the overrides and hands control back to it. Editing `config.lua` by hand
-while the game runs also hot-reloads — no restart needed for that either.
+**Reset** removes runtime overrides and returns control to `config.lua`.
+Whether that file is required and whether hand edits hot-reload are contracts
+owned and validated by each target mod.
 
-## When a change takes effect
+## When changes take effect
 
-Most values apply within about a second. Two mods are marked because they
-honestly cannot:
+Most values apply within about one second. Two mod labels carry a marker:
 
-- **`+` Field Equipment** — its row is injected as the start menu is *built*, so
-  an `ENABLED` change lands the next time you open the menu.
-- **`*` Open World** — it opens a floor by growing arrays on each quest manifest
-  as that manifest is constructed. Switching it off cannot retract a floor that
-  is already open, so it takes a restart.
+- `+` Field Equipment: its rail entry is added while the Start Menu is built,
+  so close and reopen that menu after changing its enabled state.
+- `*` Open World: it changes quest manifests while they are constructed. It
+  cannot retract a floor that is already open and may require a restart.
+
+The ON/OFF value on a mod header controls both the live `ENABLED` override and
+the next-launch `enabled.txt` marker as one transaction. Enabling a script that
+UE4SS did not load at startup still requires a complete game restart.
 
 ## Diagnostics
 
-The UE4SS console exposes read-only status and diagnostics:
+The UE4SS console exposes read-only commands:
 
-```
-modmenu list                              show every mod and its current values
-modmenu probe                             dump the widget tree to the UE4SS log
-modmenu buttons                           log the button codes the panel receives
-```
-
-The console needs `GuiConsoleEnabled = 1` under `[Debug]` in `UE4SS-settings.ini`.
-
-## Adding a mod to the menu
-
-Two steps.
-
-1. Add an entry to `Scripts/registry.lua` naming the mod's folder, its settings,
-   and their bounds. Keep the bounds matched to whatever the mod already clamps
-   internally, so the menu can never ask for a value the mod will reject.
-2. In that mod's `main.lua`, attach to the bridge:
-
-```lua
-local bridge = -- see the loader block in any of the other mods
-bridge.attach({
-    modName = "YourMod",
-    scriptDir = SCRIPT_DIR,
-    load = applyExternalConfig,  -- your existing config.lua parser
-    apply = pushValuesIntoTheGame, -- optional; runs on the game thread
-})
+```text
+modmenu list       show every registered mod and its current values
+modmenu probe      dump the live menu widget tree
+modmenu buttons    log button codes received by the panel
 ```
 
-`load` receives the merged `config.lua` + `runtime.lua` table and should validate
-it exactly as the mod already does at startup — that same validation is what
-guards against a bad value arriving from the menu.
+The console requires `GuiConsoleEnabled = 1` under `[Debug]` in
+`UE4SS-settings.ini`.
 
-## Sitting next to Field Equipment
+## Adding a mod
 
-Both mods append a row to the same start-menu rail. The native list's TArrays
-cannot be grown from UE4SS Lua, so each row is a MenuIcon clone parked in a donor
-wrapper, sitting outside the list's own arrays, with only the navigation
-boundaries bridged.
+1. Add one entry to `Scripts/registry.lua`. The folder name and setting keys
+   must exactly match the target mod. Numeric bounds must match its validator.
+2. In the target mod, watch only its exact `Scripts/runtime.lua` path, merge it
+   over `config.lua`, and validate the complete result before applying any
+   value. A malformed or unsupported value must report an explicit error and
+   leave the mod fail-closed.
 
-That means the two mods have to agree on order. ModMenu counts the rows already
-on the rail and places itself underneath, and `FieldEquipmentMod` was changed to
-stop assuming it is the final row: it now looks for a row below it and hands
-focus over instead of wrapping to the top. With ModMenu absent that code path
-collapses back to the original behavior, so Field Equipment still works alone.
+Existing bridge users may attach through `ModMenuBridge`; a strict mod may
+implement the same canonical file contract directly.
 
-ModMenu injects on a 400ms delay against Field Equipment's 100ms, so the rows it
-counts are already in place.
+## Coexisting with Field Equipment
 
-## Three rules learned the crash way
+Both mods append a row to the same Start Menu rail. The native list's arrays
+cannot be grown safely from UE4SS Lua, so each row is a `MenuIcon` clone in a
+donor wrapper outside those native arrays. Only the navigation boundaries are
+bridged.
 
-**Never construct a widget of a watched class.** The panel originally created its
-own `WBP_Console_MainMenu_C` to use as a blank canvas. That is the exact class
-both mods watch with `NotifyOnNewObject`, so creating one made *both* of them try
-to inject a rail row into a widget that had never been constructed or added to
-the viewport. Reading its null `Slot` crashed the game outright
-(`EXCEPTION_ACCESS_VIOLATION` on a tiny address). The panel now draws into the
-menu that is already on screen and creates nothing but `TextBlock`s and an
-`Image`. Field Equipment survives making its own clone only because it sets an
-internal flag to skip its own notification — a flag ModMenu cannot reach from a
-separate Lua state.
+ModMenu waits 400 ms before injecting, after Field Equipment's 100 ms delay,
+then counts all rows already present and places itself below them. Field
+Equipment hands downward focus to the next modded row; ModMenu owns both of its
+boundaries and returns upward focus to the row directly above it.
 
-**Never write an out-of-range `CurrentIndex`.** That field is the native list's
-cursor into `Item_0..Item_6`. The Mods row sits past the end of that array, so
-writing its index points the game's own Blueprint at a row that does not exist.
-`focusIcon` only writes values the array can hold; the row's highlight comes from
-the widget calls, not the cursor.
+While the settings panel is open, ModMenu consumes its directional, confirm,
+and back inputs. The outer Start Menu does not receive those events.
 
-**Do engine work on the game thread.** Input arrives through `ExecuteWithDelay`,
-which runs on the async thread. Constructing UObjects or editing the widget tree
-from there is the other reliable way to crash. Everything that touches the engine
-goes through `ExecuteInGameThread` first.
+## Crash-safety rules
+
+- Never construct a widget of a class watched by `NotifyOnNewObject`. The panel
+  draws into the live Start Menu and creates only `TextBlock` and `Image`
+  children.
+- Never write an out-of-range native `CurrentIndex`. The modded row sits beyond
+  the authored `Item_0..Item_6` array; its highlight is controlled through the
+  widget, not by lying to the native cursor.
+- Perform UObject construction and widget-tree changes on the game thread.
+  Input can arrive from UE4SS's asynchronous thread.
+- Avoid **Restart All Mods** for this stack. Fully close and relaunch the game
+  when scripts or hooks must be reloaded.

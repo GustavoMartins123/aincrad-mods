@@ -3,8 +3,8 @@
 --
 -- This file is the only place that needs editing when a mod is added or gains a
 -- new tunable. Nothing here talks to the other mods directly: ModMenu writes the
--- chosen values into that mod's Scripts/runtime.lua and ModMenuBridge, which the
--- mod itself loads, picks them up within about a second.
+-- chosen values into that mod's Scripts/runtime.lua. Each mod watches that exact
+-- file from its own isolated Lua state and validates values before applying them.
 --
 -- entry fields
 --   mod       folder name under Mods/. Must match exactly.
@@ -20,7 +20,7 @@
 --   key       the name written to runtime.lua, exactly as the mod reads it.
 --   label     row label.
 --   type      "bool" | "number" | "choice"
---   default   the value the mod falls back to, shown when nothing overrides it.
+--   default   documented config.lua value shown before an effective value exists.
 --   min/max   inclusive bounds for "number". Chosen to match the safety clamps
 --             the mods already apply internally, so the menu can never ask for
 --             a value the mod will silently reject.
@@ -107,6 +107,60 @@ return {
         settings = {
             { key = "ENABLED", label = "Enabled", type = "bool", default = true },
             { key = "DEBUG_LOGS", label = "Debug logging", type = "bool", default = true },
+        },
+    },
+
+    {
+        mod = "WorldEnemyDirector",
+        label = "Enemy Director",
+        summary = "Multiply and mutate world enemies",
+        apply = "live",
+        settings = {
+            { key = "ENABLED", label = "Enabled", type = "bool", default = true },
+            { key = "SPAWN_MULTIPLIER", label = "Spawn multiplier", type = "number",
+              default = 1, min = 1, max = 8, step = 1, format = "%.0fx" },
+            { key = "MAX_ACTIVE_EXTRAS", label = "Maximum extras", type = "number",
+              default = 48, min = 0, max = 200, step = 4, format = "%.0f" },
+            { key = "SPAWN_RADIUS", label = "Spawn radius", type = "number",
+              default = 300, min = 100, max = 1500, step = 50, format = "%.0f cm" },
+            { key = "RANDOMIZE_EXTRA_SPECIES", label = "Random extra species",
+              type = "bool", default = false },
+            { key = "INCLUDE_BOSSES", label = "Include bosses",
+              type = "bool", default = false },
+            { key = "SCALE_MIN", label = "Minimum scale", type = "number",
+              default = 1.0, min = 0.25, max = 4.0, step = 0.25,
+              format = "%.2fx", ceilingKey = "SCALE_MAX" },
+            { key = "SCALE_MAX", label = "Maximum scale", type = "number",
+              default = 1.0, min = 0.25, max = 4.0, step = 0.25,
+              format = "%.2fx", floorKey = "SCALE_MIN" },
+            { key = "COLOR_MODE", label = "Colour mode", type = "choice",
+              default = "off", options = {
+                  { value = "off", label = "Off" },
+                  { value = "fixed", label = "Fixed" },
+                  { value = "random", label = "Random" },
+              } },
+            { key = "COLOR_PRESET", label = "Colour preset", type = "choice",
+              default = "crimson", options = {
+                  { value = "crimson", label = "Crimson" },
+                  { value = "emerald", label = "Emerald" },
+                  { value = "azure", label = "Azure" },
+                  { value = "gold", label = "Gold" },
+                  { value = "violet", label = "Violet" },
+                  { value = "cyan", label = "Cyan" },
+                  { value = "white", label = "White" },
+              } },
+            { key = "HEALTH_MULTIPLIER", label = "Health", type = "number",
+              default = 1.0, min = 0.1, max = 10.0, step = 0.1, format = "%.1fx" },
+            { key = "ATTACK_MULTIPLIER", label = "Attack", type = "number",
+              default = 1.0, min = 0.1, max = 10.0, step = 0.1, format = "%.1fx" },
+            { key = "DEFENCE_MULTIPLIER", label = "Defence", type = "number",
+              default = 1.0, min = 0.1, max = 10.0, step = 0.1, format = "%.1fx" },
+            { key = "MOVE_SPEED_MULTIPLIER", label = "Movement speed", type = "number",
+              default = 1.0, min = 0.25, max = 3.0, step = 0.05, format = "%.2fx" },
+            { key = "XP_MULTIPLIER", label = "Experience", type = "number",
+              default = 1.0, min = 0.0, max = 10.0, step = 0.1, format = "%.1fx" },
+            { key = "DEBUG_LOGS", label = "Debug logging",
+              type = "bool", default = false },
         },
     },
 

@@ -13,8 +13,9 @@
 --           hand, because FSlateFontInfo cannot be constructed from Lua. The
 --           panel therefore inherits the game's own typography for free.
 --
--- The layout is deliberately a single flat list with one mod expanded at a time,
--- which caps it at 13 rows and removes any need for scrolling.
+-- The layout is a single flat list with one mod expanded at a time. Twelve UMG
+-- row pairs are virtualised over that model so a mod may expose more settings
+-- without drawing through the footer or losing controller navigation.
 
 local Panel = {}
 
@@ -35,6 +36,7 @@ local LABEL_X = PANEL_LEFT + 48.0
 local VALUE_X = PANEL_LEFT + 620.0
 local FIRST_ROW_Y = PANEL_TOP + 96.0
 local SETTING_INDENT = 32.0
+local MAX_VISIBLE_ROWS = 12
 
 local SELECTED_COLOR = { R = 1.0, G = 0.85, B = 0.35, A = 1.0 }
 local NORMAL_COLOR = { R = 0.88, G = 0.92, B = 1.0, A = 1.0 }
@@ -62,6 +64,7 @@ local restoreVisibility = nil
 
 local expandedMod = nil
 local selectionIndex = 1
+local scrollOffset = 0
 local rows = {}
 local isOpen = false
 
@@ -112,6 +115,17 @@ end
 -- Rebuilds the flat list of rows from the registry and each mod's current
 -- effective settings. Called on open and after every change so the displayed
 -- value is always read back from disk rather than assumed.
+local function ensureSelectionVisible()
+    local maximumOffset = math.max(0, #rows - MAX_VISIBLE_ROWS)
+    if selectionIndex <= scrollOffset then
+        scrollOffset = selectionIndex - 1
+    elseif selectionIndex > scrollOffset + MAX_VISIBLE_ROWS then
+        scrollOffset = selectionIndex - MAX_VISIBLE_ROWS
+    end
+    if scrollOffset < 0 then scrollOffset = 0 end
+    if scrollOffset > maximumOffset then scrollOffset = maximumOffset end
+end
+
 local function buildRows()
     local built = {}
     for _, entry in ipairs(registry or {}) do
@@ -144,6 +158,7 @@ local function buildRows()
     rows = built
     if selectionIndex > #rows then selectionIndex = #rows end
     if selectionIndex < 1 then selectionIndex = 1 end
+    ensureSelectionVisible()
 end
 
 local function applyMarker(entry)
@@ -430,22 +445,8 @@ local function buildPanel()
 
     titleWidgets = { title = title, footer = footer, background = background }
 
-    -- One label/value pair per possible row: a header for every mod, plus the
-    -- settings of whichever single mod is expanded. Slots beyond the current row
-    -- count are simply collapsed, so over-allocating slightly is harmless.
-    local widest = 0
-    for _, entry in ipairs(registry or {}) do
-        local visibleSettings = 0
-        for _, setting in ipairs(entry.settings or {}) do
-            if setting.key ~= "ENABLED" then
-                visibleSettings = visibleSettings + 1
-            end
-        end
-        widest = math.max(widest, visibleSettings)
-    end
-    local maxRows = #(registry or {}) + widest
-
-    for index = 1, maxRows do
+    -- Fixed viewport: render maps these widgets onto a moving window in `rows`.
+    for index = 1, MAX_VISIBLE_ROWS do
         local label = constructWidget(TEXTBLOCK_CLASS, host)
         local value = constructWidget(TEXTBLOCK_CLASS, host)
         local y = FIRST_ROW_Y + (index - 1) * ROW_HEIGHT
@@ -462,7 +463,7 @@ local function buildPanel()
 
     -- No AddToViewport: the host is the start menu, already on screen. The
     -- panel's widgets sit above it on Z order alone.
-    log("panel built with " .. tostring(maxRows) .. " row slots")
+    log("panel built with " .. tostring(MAX_VISIBLE_ROWS) .. " virtual row slots")
     return true
 end
 
@@ -474,7 +475,8 @@ function Panel.render()
     if not isOpen then return end
 
     for index, widgets in ipairs(rowWidgets) do
-        local row = rows[index]
+        local modelIndex = scrollOffset + index
+        local row = rows[modelIndex]
         local labelWidget = widgets.label
         local valueWidget = widgets.value
 
@@ -482,7 +484,7 @@ function Panel.render()
             if isValid(labelWidget) then pcall(function() labelWidget:SetVisibility(COLLAPSED) end) end
             if isValid(valueWidget) then pcall(function() valueWidget:SetVisibility(COLLAPSED) end) end
         else
-            local selected = index == selectionIndex
+            local selected = modelIndex == selectionIndex
             local color = selected and SELECTED_COLOR
                 or (row.kind == "mod" and HEADER_COLOR or NORMAL_COLOR)
             local indent = row.kind == "setting" and SETTING_INDENT or 0.0
@@ -506,6 +508,19 @@ function Panel.render()
                 styleText(valueWidget, color)
             end
         end
+    end
+
+    if titleWidgets ~= nil and isValid(titleWidgets.title) then
+        local first = #rows == 0 and 0 or scrollOffset + 1
+        local last = math.min(#rows, scrollOffset + MAX_VISIBLE_ROWS)
+        pcall(function()
+            titleWidgets.title:SetText(FText(string.format(
+                "MODS    %d-%d / %d",
+                first,
+                last,
+                #rows
+            )))
+        end)
     end
 end
 
@@ -533,6 +548,14 @@ local function adjustNumber(row, direction)
     local updated = current + step * direction
     if setting.min ~= nil and updated < setting.min then updated = setting.min end
     if setting.max ~= nil and updated > setting.max then updated = setting.max end
+    if setting.floorKey ~= nil then
+        local floorValue = tonumber(row.effective[setting.floorKey])
+        if floorValue ~= nil and updated < floorValue then updated = floorValue end
+    end
+    if setting.ceilingKey ~= nil then
+        local ceilingValue = tonumber(row.effective[setting.ceilingKey])
+        if ceilingValue ~= nil and updated > ceilingValue then updated = ceilingValue end
+    end
     -- Repeated float steps drift visibly (1.4 + 0.05 + 0.05 = 1.5000000000000002)
     -- and that drift would be written to disk, so snap back onto a clean grid.
     local scale = 100000
@@ -597,6 +620,7 @@ function Panel.move(delta)
     selectionIndex = selectionIndex + delta
     if selectionIndex < 1 then selectionIndex = #rows end
     if selectionIndex > #rows then selectionIndex = 1 end
+    ensureSelectionVisible()
     Panel.render()
 end
 
@@ -655,6 +679,7 @@ function Panel.activate()
             and rows[selectionIndex + 1].entry.mod == row.entry.mod then
             selectionIndex = selectionIndex + 1
         end
+        ensureSelectionVisible()
         Panel.render()
         return
     end
@@ -698,6 +723,7 @@ function Panel.close()
     -- opened, after which Left/Right acted on the wrong row.
     expandedMod = nil
     selectionIndex = 1
+    scrollOffset = 0
 end
 
 -- Dumps the host widget tree so the exact canvas/child names can be confirmed

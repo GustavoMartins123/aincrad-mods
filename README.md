@@ -37,6 +37,7 @@ download, credits, permissions, changelog, and support information.
 | Auto Pickup Mod | Collects nearby drops and nature items automatically | Live |
 | No Rescue | Removes ledge steering and the hard-fall teleport | Live |
 | Field Equipment Mod | Opens the native Equipment screen while in the field | Reopen Start Menu |
+| World Enemy Director | Multiplies and mutates world enemies | Live |
 | Aincrad Open World | Opens complete floors and adds Free Roam quest entries | New quest manifests/restart |
 
 ## 1. Find the correct Win64 folder
@@ -323,6 +324,29 @@ disabling it is marked with `+`. Close and reopen the Start Menu to rebuild the
 row. If it was disabled before launch and therefore never loaded by UE4SS,
 restart the game after turning it on.
 
+### World Enemy Director
+
+World Enemy Director preserves the game's natural enemy actors and can create
+up to seven additional enemies per natural spawn through the reflected
+`ServerDebugEnemySpawn` RPC. Additional species can be randomised from classes
+that the current world has already loaded.
+
+The Mods panel exposes the spawn multiplier and cap, spawn radius, boss
+inclusion, scale range, fixed or random colour, health, attack, defence,
+movement speed, and experience multipliers. Natural quest actors are never
+replaced; only actors matched to this mod's spawn tickets may be destroyed when
+the multiplier is reduced or the mod is disabled.
+
+Combat multipliers are applied after the enemy's native initialization through
+its exact `Health`, `MaxHealth`, `ATK`, and `Def` Gameplay Ability System
+attributes. Live maximum-health changes preserve the enemy's current HP
+percentage, and disabling the director reverses only the deltas it applied.
+
+See
+[`ue4ss\Mods\WorldEnemyDirector\README.md`](ue4ss/Mods/WorldEnemyDirector/README.md)
+for its exact configuration contract, colour requirement, diagnostics, and
+known limitations.
+
 ### Aincrad Open World
 
 [Nexus Mods page](https://www.nexusmods.com/echoesofaincrad/mods/55)
@@ -366,7 +390,9 @@ native Start Menu entries and coordinates its navigation with Field Equipment.
 
 UE4SS isolates each Lua mod, so ModMenu does not call the other mods directly.
 It writes validated settings to each mod's `Scripts\runtime.lua`. The target mod
-reads and applies that file through the shared `ModMenuBridge.lua`.
+reads and validates that exact file from its own isolated state. Existing mods
+may use the shared `ModMenuBridge.lua`; World Enemy Director uses its own strict
+canonical loader and disables its operations when configuration is invalid.
 
 Disabling a mod is transactional: the menu updates both its live `ENABLED`
 setting and its next-launch `enabled.txt` marker. If either filesystem operation
@@ -388,6 +414,9 @@ fails, the previous state is restored and an explicit error is logged.
 - **No Rescue scope:** it removes fall rescue only. Water, pit, out-of-bounds,
   and quest recovery remain vanilla.
 - **Field Equipment scope:** it opens Equipment, not storage.
+- **Enemy Director native verification:** its reflected spawn, material, and
+  enemy-stat contracts were validated against public dumped headers and still
+  require an in-game test after each game update.
 - **Runtime UI rebuilding:** Field Equipment changes need the Start Menu to be
   reopened. Open World changes affect only manifests created after the change.
 - **Game updates:** engine classes, widgets, hooks, or signatures can change

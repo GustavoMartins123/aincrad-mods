@@ -1,0 +1,121 @@
+# World Enemy Director
+
+World Enemy Director is a UE4SS Lua mod for **Echoes of Aincrad**. It can add
+extra enemies beside the game's natural spawns and alter their visible scale,
+material colour, health, attack, defence, movement speed, and experience value.
+
+The mod preserves every natural enemy actor. This is deliberate: destroying and
+replacing the actor created by a quest can break objective tracking. Species
+randomisation therefore applies only to additional enemies owned by this mod.
+
+## Installation
+
+Place this directory at:
+
+```text
+EchoesofAincrad\Binaries\Win64\ue4ss\Mods\WorldEnemyDirector
+```
+
+Keep `enabled.txt` in the mod root, then restart the game. When the integrated
+ModMenu is installed, open the game's Start Menu, choose **Mods**, and expand
+**Enemy Director**.
+
+## Settings
+
+| Setting | Range | Behaviour |
+|---|---:|---|
+| Spawn multiplier | 1x-8x | Total population per natural enemy; 1x adds nothing |
+| Maximum extras | 0-200 | Global cap covering live, queued, and pending extras |
+| Spawn radius | 100-1500 cm | Random horizontal distance from the natural spawn |
+| Random extra species | On/Off | Chooses among enemy classes already loaded by the current world |
+| Include bosses | On/Off | Allows boss mutation and multiplication |
+| Minimum/maximum scale | 0.25x-4x | Stable random scale range per actor |
+| Colour mode | Off/Fixed/Random | Uses the game's material-parameter interface |
+| Colour preset | Seven presets | Colour used by Fixed, or palette used by Random |
+| Health/attack/defence | 0.10x-10x | Applies verified additive deltas through the enemy's Gameplay Ability System |
+| Movement speed | 0.25x-3x | Changes the reflected speed and calls `SetMovingSpeed` |
+| Experience | 0x-10x | Multiplies the reflected experience reward |
+
+`Scripts/config.lua` is the required canonical configuration. The ModMenu writes
+live overrides to `Scripts/runtime.lua`. Unknown keys, missing required keys,
+wrong types, out-of-range values, and malformed Lua disable all director
+operations explicitly. Existing natural mutations are rolled back and owned
+extras are destroyed when a live configuration is rejected.
+
+## Spawn and randomisation model
+
+The director listens for `RODEnemyCharacter` construction and pool reuse. For
+each eligible natural enemy, it issues up to `SPAWN_MULTIPLIER - 1` calls to the
+game's native `ServerDebugEnemySpawn` RPC. A spawn ticket must match the exact
+loaded `UClass` and nearby position before the new actor is considered owned.
+Unmatched actors remain natural and are never destroyed by this mod.
+
+Random species are selected only from natural enemy classes already loaded in
+the active world. The mod does not synchronously load arbitrary Blueprint
+assets during streaming, because native asset loads in that phase can crash the
+process.
+
+Reducing the multiplier removes only extras above the new target. Killed extras
+are not recreated indefinitely. Travel immediately clears all Lua object
+references; processing resumes only after the game's `ClientRestart` signal and
+the fixed settlement period.
+
+## Combat attributes
+
+The director waits for the enemy's native `OnFinishedInitialize` lifecycle
+event before accessing combat state. It then asks that enemy's `AbilitySystem`
+for its reflected attributes and requires the exact `Health`, `MaxHealth`,
+`ATK`, and `Def` contracts. Missing or rejected attributes produce an explicit
+per-enemy error; the mod does not substitute a display-only property.
+
+HP, ATK, and DEF changes are sent through
+`ARODCharacterBase.ApplyInstantGameplayEffect` as additive GAS deltas. The
+director also keeps the enemy's source fields synchronized because the game
+uses those fields for enemy parameter and reward calculations. Live health
+changes preserve the current HP percentage. Disabling the director applies the
+inverse deltas, restores the source fields, and does not silently heal damaged
+enemies.
+
+## Colour requirement
+
+Colour uses one exact material parameter named by `COLOR_PARAMETER_NAME`
+(`Color` by default). The enemy must implement
+`RODMaterialParameterInterface`. If that contract is absent, colour mutation is
+rejected for that actor and the error is written to `UE4SS.log`; the mod does not
+guess another parameter or material path.
+
+## Diagnostics
+
+Run this read-only command in the UE4SS console:
+
+```text
+enemy_director_status
+```
+
+It reports configuration health, world pause/fault state, natural and owned
+enemy counts, queued requests, pending spawn tickets, and loaded enemy classes.
+Enable `DEBUG_LOGS` only while diagnosing; normal operation avoids per-tick
+logging.
+
+## Known limitations
+
+- This first implementation is validated offline against dumped game headers;
+  each native behaviour still needs an in-game test on the current game build.
+- Only classes already loaded naturally in the current world can be randomised.
+- Natural quest actors are intentionally not replaced.
+- A material that lacks the exact configured colour parameter will keep its
+  original appearance and produce an explicit error.
+- Spawn RPC requests that fail or expire are reported and are not retried
+  silently.
+
+## Reverse-engineering references
+
+Implementation contracts were checked against the public
+[`toeofcharmander/mod_template`](https://github.com/toeofcharmander/mod_template)
+headers, enemy curve tables, and schemas for Echoes of Aincrad. The UE4SS
+out-parameter contract used to enumerate `FGameplayAttribute` values was also
+checked against the official
+[`UE4SS-RE/RE-UE4SS`](https://github.com/UE4SS-RE/RE-UE4SS) Lua binding source
+and documentation. Every returned struct element is read once through its
+canonical parameter wrapper's `get()`.
+No code or assets are loaded from either repository at runtime.
