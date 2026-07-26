@@ -1,4 +1,4 @@
--- ModMenu v1.0
+-- ModMenu v1.1.1
 -- Adds a native-styled "Mods" entry to Echoes of Aincrad's start menu, opening a
 -- panel that enables/disables the other mods and retunes their values in-game.
 --
@@ -12,7 +12,7 @@
 -- mod's Lua state, because UE4SS gives each mod its own.
 
 local MOD_NAME = "ModMenu"
-local MOD_VERSION = "v1.0"
+local MOD_VERSION = "v1.1.1"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -20,11 +20,6 @@ local MAIN_MENU_WIDGET_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu.WBP_Console_MainMenu_C"
 local MAIN_MENU_LIST_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_List.WBP_Console_MainMenu_List_C"
--- Overridable from config.lua. `modmenu icons <text>` lists the textures the
--- game actually has loaded, so a replacement can be picked from real data rather
--- than guessed at.
-local DEFAULT_ICON_ASSET =
-    "/Game/ROD/Widget/Common/IconImage/ItemCategoryIconImage/T_ItemCategoryIcon_Unknown"
 
 local MAX_NATIVE_MENU_ITEMS = 7
 local MENU_ICON_FRAGMENT = "WBP_Console_MainMenu_MenuIcon_C"
@@ -34,14 +29,13 @@ local ACCEPT_BUTTON = 1
 local BACK_BUTTON = 2
 local DPAD_UP = 13
 local DPAD_DOWN = 14
+local DPAD_LEFT = 15
+local DPAD_RIGHT = 16
 local LSTICK_UP = 17
 local LSTICK_DOWN = 18
--- There are deliberately no horizontal button codes here. They were once
--- inferred from the pattern above (15/16/19/20) and the guess was wrong: it
--- drove values the opposite way, so left raised a setting and right lowered it.
--- Left/right now come from the UE4SS keybinds instead, whose codes are exact
--- Windows virtual-key values. Every code the panel receives is logged, so the
--- real horizontal ones can be read off a session and filled in properly.
+-- Codes 15 and 16 were observed directly in UE4SS.log from the controller's
+-- horizontal D-pad. Analog horizontal codes remain deliberately unregistered
+-- until they are observed rather than inferred.
 
 local VISIBLE = 0
 local COLLAPSED = 1
@@ -56,28 +50,17 @@ end)()
 local CONFIG = {
     ENABLED = true,
     DEBUG_LOGS = false,
-    -- A letter drawn over the row instead of borrowed art. The placeholder
-    -- texture this row used is the same one Equipment uses, and guessing at
-    -- another asset path is what caused a crash earlier. A TextBlock needs no
-    -- asset to exist. Set ICON_LETTER to "" to fall back to ICON_ASSET.
+    -- A letter drawn over the row instead of borrowed art. This is the only icon
+    -- path: invalid configuration aborts the row injection explicitly.
     ICON_LETTER = "M",
-    ICON_LETTER_OFFSET = { X = 20.0, Y = 12.0 },
-    ICON_ASSET = DEFAULT_ICON_ASSET,
+    -- Calibrated against the native 64x64 rail icon.
+    ICON_LETTER_OFFSET = { X = 36.0, Y = 26.0 },
     ICON_TINT = { R = 1.00, G = 1.00, B = 1.00, A = 1.00 },
 }
 local logButtons = false
 
 local injectedMenus = {}
 local activeContext = nil
-local menuIconTexture = nil
-
--- The menu instance seen by the construction notification, held until injection
--- actually succeeds. UE4SS's shared game-thread hook has been observed dying
--- mid-session ("Ref was not function ... removing hook!"), which silently kills
--- ExecuteInGameThread for every mod. Injection therefore cannot rely on it: the
--- input hooks below run on the game thread by nature and retry this.
-local pendingMenu = nil
-local tryInjectPending
 
 -- Assigned further down, called the first time a Mods row is actually injected.
 -- Nothing this mod hooks is useful before a start menu exists, so the input
@@ -173,9 +156,6 @@ do
     if ok and type(external) == "table" then
         if external.ENABLED ~= nil then CONFIG.ENABLED = external.ENABLED ~= false end
         if external.DEBUG_LOGS ~= nil then CONFIG.DEBUG_LOGS = external.DEBUG_LOGS == true end
-        if type(external.ICON_ASSET) == "string" and external.ICON_ASSET ~= "" then
-            CONFIG.ICON_ASSET = external.ICON_ASSET
-        end
         if type(external.ICON_LETTER) == "string" then
             CONFIG.ICON_LETTER = external.ICON_LETTER
         end
@@ -225,44 +205,6 @@ panel.init({
 --========================================================--
 --                    RAIL INJECTION                      --
 --========================================================--
-
--- "/Game/.../T_Foo" also lives at "/Game/.../T_Foo.T_Foo"; accept either form so
--- config.lua can hold whichever path the player copied out of `modmenu icons`.
-local function texturePathsFor(asset)
-    local leaf = string.match(asset, "([^/]+)$") or asset
-    if string.find(leaf, ".", 1, true) then return { asset } end
-    return { asset .. "." .. leaf, asset .. ".0", asset }
-end
-
-local function applyMenuIconTexture(icon)
-    -- In letter mode the art is hidden behind a TextBlock, so there is nothing
-    -- worth painting and nothing worth reasserting on the guard timers.
-    if type(CONFIG.ICON_LETTER) == "string" and CONFIG.ICON_LETTER ~= "" then
-        return false
-    end
-    if not isValid(icon) or not isValid(icon.IconImage) then return false end
-
-    local asset = CONFIG.ICON_ASSET or DEFAULT_ICON_ASSET
-    local texture = menuIconTexture
-    if not isValid(texture) then
-        for _, path in ipairs(texturePathsFor(asset)) do
-            pcall(function() texture = StaticFindObject(path) end)
-            if isValid(texture) then break end
-        end
-    end
-    if not isValid(texture) then
-        -- The texture is not guaranteed to be resident when the start menu is
-        -- first constructed, so load its package on demand.
-        pcall(function() texture = LoadAsset(asset) end)
-    end
-    if not isValid(texture) then
-        log("icon texture unavailable: " .. tostring(asset))
-        return false
-    end
-    menuIconTexture = texture
-
-    return pcall(function() icon.IconImage:SetBrushFromTexture(texture, false) end)
-end
 
 local function menuItemAndPanel(mainList, index)
     local item = nil
@@ -348,16 +290,15 @@ local function countForeignInjectedRows(parent, mainList, nativeCount)
     return foreign
 end
 
--- Draws a letter over the row instead of relying on a texture.
---
--- The wrapper the row lives in is a CanvasPanel (it is what accepted the icon in
--- the first place), so a TextBlock can go straight on top of it. This needs no
--- asset path to be correct, which is the whole point: the row shared Equipment's
--- placeholder art, and guessing at a different asset is what crashed the game.
+-- Draws a letter over the row instead of relying on a texture. The donor wrapper
+-- is the CanvasPanel already proven to accept the Mods icon and a TextBlock.
+-- Avoid passing FAnchors from Lua: invalid native struct marshaling aborts the
+-- whole UE4SS process before pcall can report an error.
 local function applyIconLetter(context)
     local letter = CONFIG.ICON_LETTER
     if type(letter) ~= "string" or letter == "" then return false end
-    if context == nil or not isValid(context.wrapperPanel) or not isValid(context.icon) then
+    if context == nil or not isValid(context.wrapperPanel) or not isValid(context.icon)
+        or not isValid(context.icon.IconImage) then
         return false
     end
 
@@ -384,23 +325,44 @@ local function applyIconLetter(context)
     local slot = nil
     pcall(function() slot = context.wrapperPanel:AddChildToCanvas(label) end)
     if not isValid(slot) then
-        log("cannot draw the icon letter: the row wrapper rejected it")
+        log("cannot draw the icon letter: native row wrapper rejected it")
         return false
     end
 
-    local offset = CONFIG.ICON_LETTER_OFFSET or { X = 20.0, Y = 12.0 }
-    pcall(function() slot:SetAutoSize(true) end)
-    pcall(function() slot:SetPosition({ X = offset.X, Y = offset.Y }) end)
-    pcall(function() slot:SetZOrder(30) end)
-    pcall(function() label:SetVisibility(VISIBLE) end)
-    pcall(function() label:SetRenderOpacity(1.0) end)
-
-    -- The borrowed art would otherwise sit behind the letter.
-    pcall(function() context.icon.IconImage:SetVisibility(HIDDEN) end)
+    local offset = CONFIG.ICON_LETTER_OFFSET
+    local positioned, positionError = pcall(function()
+        slot:SetAutoSize(true)
+        slot:SetPosition({ X = offset.X, Y = offset.Y })
+        slot:SetZOrder(30)
+        label:SetVisibility(VISIBLE)
+        label:SetRenderOpacity(1.0)
+        context.icon.IconImage:SetVisibility(HIDDEN)
+    end)
+    if not positioned then
+        pcall(function() label:RemoveFromParent() end)
+        log("cannot position the icon letter: " .. tostring(positionError))
+        return false
+    end
 
     context.letterWidget = label
-    log("row icon replaced with the letter " .. letter)
+    log("row icon replaced with calibrated letter " .. letter)
     return true
+end
+
+local function enforceIconLetter(context)
+    if context == nil or not isValid(context.icon)
+        or not isValid(context.icon.IconImage)
+        or not isValid(context.letterWidget) then
+        log("centred Mods icon presentation is invalid")
+        return false
+    end
+    local ok, err = pcall(function()
+        context.icon.IconImage:SetVisibility(HIDDEN)
+        context.letterWidget:SetVisibility(VISIBLE)
+        context.letterWidget:SetRenderOpacity(1.0)
+    end)
+    if not ok then log("could not enforce centred Mods icon: " .. tostring(err)) end
+    return ok
 end
 
 -- Keeps the Mods row last on the rail and its item index honest.
@@ -582,11 +544,6 @@ local function injectModsEntry(mainMenu)
         icon:SetInputEnable(true)
         icon:BP_SetInputInteractionEnable(true)
         icon:SetDefaultAnimation()
-        applyMenuIconTexture(icon)
-        -- Equipment uses this same placeholder texture, so the two injected rows
-        -- are otherwise indistinguishable. Tinting is safer than guessing at
-        -- another asset path that may not exist in this build.
-        pcall(function() icon.IconImage:SetColorAndOpacity(CONFIG.ICON_TINT) end)
 
         local text = textLibrary:Conv_StringToText("Mods")
         icon:SetMenuName(text)
@@ -613,6 +570,14 @@ local function injectModsEntry(mainMenu)
         wrapperPanel = wrapperPanel,
         wrapperParent = parent,
     }
+    if not applyIconLetter(activeContext) then
+        pcall(function() wrapperPanel:RemoveFromParent() end)
+        injectedMenus[menuKey] = false
+        activeContext = nil
+        log("Mods entry injection aborted: centred icon construction failed")
+        return
+    end
+
     injectedMenus[menuKey] = icon
     -- Seed the focus tracker with wherever the list already is. Without this the
     -- first wrap after opening the menu has no previous index to compare against
@@ -624,7 +589,6 @@ local function injectModsEntry(mainMenu)
     log(string.format("added Mods entry at index %d (%d native rows, %d row(s) from other mods, list at %s)",
         modsIndex, nativeCount, foreignRows, tostring(startingIndex)))
 
-    pcall(applyIconLetter, activeContext)
     -- Only now is there anything for the input hooks to act on.
     if ensureInputHooks ~= nil then pcall(ensureInputHooks) end
     -- Another mod may have injected between the count above and the attach.
@@ -635,28 +599,11 @@ local function injectModsEntry(mainMenu)
     local function guardIcon()
         ExecuteInGameThread(function()
             if activeContext == nil or activeContext.icon ~= icon then return end
-            pcall(function() applyMenuIconTexture(icon) end)
+            enforceIconLetter(activeContext)
         end)
     end
     ExecuteWithDelay(250, guardIcon)
     ExecuteWithDelay(850, guardIcon)
-end
-
--- Safe to call from any game-thread callback, as often as you like: it does
--- nothing once the row is in.
-tryInjectPending = function()
-    local menu = pendingMenu
-    if menu == nil then return end
-    if not isValid(menu) then
-        pendingMenu = nil
-        return
-    end
-    if injectedMenus[objectName(menu)] ~= nil then
-        pendingMenu = nil
-        return
-    end
-    injectModsEntry(menu)
-    if injectedMenus[objectName(menu)] ~= nil then pendingMenu = nil end
 end
 
 --========================================================--
@@ -691,20 +638,32 @@ local function focusMods(context)
         pcall(function() context.mainList["Item_" .. tostring(index)]:SetDefaultAnimation() end)
     end
     focusIcon(context, context.icon, context.modsIndex)
-    pcall(function() applyMenuIconTexture(context.icon) end)
+    enforceIconLetter(context)
 end
 
 local function clearModsSelection(context)
     if context == nil or not isValid(context.icon) then return end
     pcall(function() context.icon:SetDefaultAnimation() end)
-    pcall(function() applyMenuIconTexture(context.icon) end)
+    enforceIconLetter(context)
 end
 
 -- Upwards out of the Mods row lands on the row directly above it, which is
 -- another mod's injected entry when one is present and the last native row
 -- otherwise.
 local function focusRowAbove(context)
+    if context == nil then return end
+    pcall(refreshRailPosition, context)
     clearModsSelection(context)
+
+    -- A custom rail row sits outside the authored animation array. Reset every
+    -- native row before handing focus to it so the result is independent of the
+    -- direction from which Mods was entered.
+    for index = 0, context.nativeCount - 1 do
+        pcall(function()
+            context.mainList["Item_" .. tostring(index)]:SetDefaultAnimation()
+        end)
+    end
+
     if context.foreignRows > 0 then
         local parent = context.wrapperParent
         local count = nil
@@ -732,26 +691,38 @@ local function focusFirstNative(context)
     focusIcon(context, context.firstItem, 0)
 end
 
--- Direction input never reaches this mod's button hooks: the native list handles
--- arrows internally and only announces the result through FocusEvent, so there
--- is nothing to consume. The only way to stop the menu underneath from moving
--- while the panel is up is to switch its input off at the widgets themselves.
--- UE4SS keybinds are outside the game's input system, so the panel still reacts.
+-- The panel is modal. Disable the native list, all authored entries and every
+-- foreign injected row. Only the Mods row stays live as the controller input
+-- sink; its button is consumed before the outer list can act on it.
 local function setNativeMenuInputEnabled(context, enabled)
     if context == nil then return end
 
-    -- Deliberately excludes this mod's own row. Switching everything off stops
-    -- the menu underneath from moving, but it also cut the only route controller
-    -- input had into this mod: a gamepad reaches widgets, not UE4SS keybinds, so
-    -- with every widget deaf the panel only answered to the keyboard. The Mods
-    -- row holds focus while the panel is up, so leaving it listening is what
-    -- keeps a controller working.
     local targets = {}
-    if isValid(context.mainList) then targets[#targets + 1] = context.mainList end
+    local targetKeys = {}
+    local function addTarget(target)
+        if not isValid(target) then return end
+        local key = objectName(target)
+        if targetKeys[key] then return end
+        targetKeys[key] = true
+        targets[#targets + 1] = target
+    end
+
+    addTarget(context.mainList)
     for index = 0, context.nativeCount - 1 do
         local item = nil
         pcall(function() item = context.mainList["Item_" .. tostring(index)] end)
-        if isValid(item) then targets[#targets + 1] = item end
+        addTarget(item)
+    end
+
+    local childCount = nil
+    pcall(function() childCount = context.wrapperParent:GetChildrenCount() end)
+    for index = 0, (tonumber(childCount) or 0) - 1 do
+        local wrapper = nil
+        pcall(function() wrapper = context.wrapperParent:GetChildAt(index) end)
+        local railIcon = iconInsideWrapper(wrapper)
+        if isValid(railIcon) and objectName(railIcon) ~= context.iconKey then
+            addTarget(railIcon)
+        end
     end
 
     local applied = 0
@@ -767,7 +738,7 @@ local function setNativeMenuInputEnabled(context, enabled)
         pcall(function() context.icon:BP_SetInputInteractionEnable(true) end)
     end
 
-    dbg(string.format("native menu input %s on %d/%d widget(s); Mods row kept live",
+    dbg(string.format("outer menu input %s on %d/%d widget(s); Mods row kept live",
         enabled and "enabled" or "disabled", applied, #targets))
 end
 
@@ -816,14 +787,17 @@ local function buildPanelNow()
     -- row into the uninitialised copy, which crashes the game.
     panel.attachTo(context.mainMenu, context.icon)
 
+    -- Capture the outer rail before constructing the modal panel. The same
+    -- physical Accept press continues through native callbacks after this hook;
+    -- capturing first prevents it from advancing the menu underneath.
+    setNativeMenuInputEnabled(context, false)
+
     if not panel.open() then
-        log("panel could not be opened; use the 'modmenu' console command instead")
+        setNativeMenuInputEnabled(context, true)
+        log("panel could not be opened; outer menu input was restored")
         return
     end
 
-    -- Only after the panel is really up, so a failed build never leaves the
-    -- start menu unable to take input.
-    setNativeMenuInputEnabled(context, false)
     warnedFocusWhilePanelOpen = false
     dbg("panel opened")
 end
@@ -834,6 +808,9 @@ local function openPanel()
         if not ok then
             log("panel failed to open: " .. tostring(err))
             pcall(panel.close)
+            if activeContext ~= nil then
+                pcall(setNativeMenuInputEnabled, activeContext, true)
+            end
         end
     end)
 end
@@ -877,6 +854,10 @@ local function routeToPanel(button)
         action = function() panel.move(-1) end
     elseif button == DPAD_DOWN or button == LSTICK_DOWN then
         action = function() panel.move(1) end
+    elseif button == DPAD_LEFT then
+        action = function() panel.adjust(-1) end
+    elseif button == DPAD_RIGHT then
+        action = function() panel.adjust(1) end
     elseif button == ACCEPT_BUTTON then
         action = function() panel.activate() end
     elseif button == BACK_BUTTON then
@@ -902,10 +883,6 @@ local function consumeButton(buttonParameter)
 end
 
 local function handleButton(widgetParameter, buttonParameter)
-    -- Runs on the game thread, so this is also where injection lands when the
-    -- scheduled attempts never fired.
-    pcall(tryInjectPending)
-
     local widget = unwrap(widgetParameter)
     local button = unwrap(buttonParameter)
 
@@ -925,13 +902,9 @@ local function handleButton(widgetParameter, buttonParameter)
             consumeButton(buttonParameter)
             clearModsSelection(activeContext)
         elseif button == DPAD_UP or button == LSTICK_UP then
-            -- When another mod owns the row directly above, let it focus its own
-            -- row. It knows how to restore its art and label and which native
-            -- rows to clear; doing that from here left its row deselected.
-            if activeContext ~= nil and activeContext.foreignRows > 0 then return end
             consumeButton(buttonParameter)
-            -- Locked for the same reason the panel is: this row's navigation is
-            -- reached through several hooks that all fire for one press.
+            -- Mods owns both of its boundaries. Depending on another mod's hook
+            -- order here made Up work or fail nondeterministically.
             withInputLock(function() focusRowAbove(activeContext) end)
         elseif button == DPAD_DOWN or button == LSTICK_DOWN then
             consumeButton(buttonParameter)
@@ -981,24 +954,15 @@ local notifyOk, notifyError = pcall(function()
         -- Deliberately later than FieldEquipmentMenu's 100ms: whichever rows
         -- other mods add must already be in the VerticalBox when this one counts
         -- them, so that the Mods entry lands underneath with the right index.
-        --
-        pendingMenu = mainMenu
-
-        -- The input hooks go in now rather than after injection. They run on the
-        -- game thread by nature, so they double as the fallback that performs
-        -- the injection when ExecuteInGameThread is dead — which happens
-        -- whenever UE4SS tears down its shared game-thread hook. Worst case the
-        -- row appears on the first key pressed in the menu instead of instantly.
-        if ensureInputHooks ~= nil then pcall(ensureInputHooks) end
-
-        -- The fast path, when the game-thread scheduler is healthy. Retried
-        -- because a single missed attempt would otherwise lose the row;
-        -- injectModsEntry is idempotent per menu instance.
-        for _, delay in ipairs({ 400, 1200, 2500 }) do
-            ExecuteWithDelay(delay, function()
-                ExecuteInGameThread(function() tryInjectPending() end)
+        ExecuteWithDelay(400, function()
+            local scheduled, scheduleError = pcall(function()
+                ExecuteInGameThread(function() injectModsEntry(mainMenu) end)
             end)
-        end
+            if not scheduled then
+                log("Mods entry injection scheduling failed: "
+                    .. tostring(scheduleError))
+            end
+        end)
     end)
 end)
 if not notifyOk then
@@ -1040,11 +1004,6 @@ ensureInputHooks = function()
     -- row sits outside the native animation array, so nothing else deselects it.
     safeHook("/Script/ROD.RODListWidgetBase:FocusEvent",
         function(self, widgetParameter)
-            -- Same fallback as handleButton: this fires the moment the menu
-            -- takes focus, which is the earliest reliable game-thread moment
-            -- after it is built.
-            pcall(tryInjectPending)
-
             local context = activeContext
             local listKey = objectName(unwrap(self))
 
@@ -1184,49 +1143,7 @@ end
 --========================================================--
 --                   CONSOLE COMMAND                      --
 --========================================================--
--- A complete alternative to the panel: everything the menu can do is reachable
--- from here, which keeps the mod usable if the in-game panel fails to build on a
--- given game build.
-
-local function findEntry(name)
-    if name == nil then return nil end
-    local wanted = string.lower(tostring(name))
-    for _, entry in ipairs(registry) do
-        if string.lower(entry.mod) == wanted or string.lower(entry.label) == wanted then
-            return entry
-        end
-    end
-    return nil
-end
-
-local function findSetting(entry, key)
-    if key == nil then return nil end
-    local wanted = string.lower(tostring(key))
-    for _, setting in ipairs(entry.settings or {}) do
-        if string.lower(setting.key) == wanted then return setting end
-    end
-    return nil
-end
-
-local function coerce(setting, raw)
-    if setting.type == "bool" then
-        local lowered = string.lower(tostring(raw))
-        if lowered == "on" or lowered == "true" or lowered == "1" then return true end
-        if lowered == "off" or lowered == "false" or lowered == "0" then return false end
-        return nil, "expected on/off"
-    end
-    local number = tonumber(raw)
-    if number == nil then return nil, "expected a number" end
-    if setting.type == "number" then
-        if setting.min ~= nil and number < setting.min then
-            return nil, string.format("minimum is %s", tostring(setting.min))
-        end
-        if setting.max ~= nil and number > setting.max then
-            return nil, string.format("maximum is %s", tostring(setting.max))
-        end
-    end
-    return number
-end
+-- Read-only diagnostics only. State changes have one canonical path: the panel.
 
 local function runCommand(params, reply)
     local sub = params[1] and string.lower(tostring(params[1])) or "list"
@@ -1256,20 +1173,7 @@ local function runCommand(params, reply)
                 end
             end
         end
-        reply("Commands: modmenu set <mod> <key> <value> | reset <mod> | open | close")
-        reply("          modmenu icons <text> [max] | probe | buttons")
-        return
-    end
-
-    if sub == "open" then
-        ExecuteInGameThread(openPanel)
-        reply("opening panel")
-        return
-    end
-
-    if sub == "close" then
-        ExecuteInGameThread(closePanel)
-        reply("closing panel")
+        reply("Diagnostics: modmenu probe | buttons")
         return
     end
 
@@ -1279,80 +1183,13 @@ local function runCommand(params, reply)
         return
     end
 
-    -- Lists the textures the game has loaded so an icon can be chosen from what
-    -- actually exists. Output goes to the log rather than the command reply
-    -- because it runs deferred on the game thread, where `ar` is no longer live.
-    if sub == "icons" then
-        local filter = params[2] and string.lower(tostring(params[2])) or "icon"
-        local limit = tonumber(params[3]) or 60
-        reply("searching loaded textures for '" .. filter .. "' — results in the log")
-        ExecuteInGameThread(function()
-            local ok, list = pcall(function() return FindAllOf("Texture2D") end)
-            if not ok or type(list) ~= "table" then
-                log("no Texture2D objects are loaded right now")
-                return
-            end
-            local shown = 0
-            for _, texture in ipairs(list) do
-                local name = objectName(texture)
-                if string.find(string.lower(name), filter, 1, true) then
-                    log("  " .. name)
-                    shown = shown + 1
-                    if shown >= limit then break end
-                end
-            end
-            log(string.format("%d of %d loaded textures matched '%s'",
-                shown, #list, filter))
-        end)
-        return
-    end
-
     if sub == "probe" then
         ExecuteInGameThread(function() panel.probe(function(line) log(line) end) end)
         reply("probe written to the UE4SS log")
         return
     end
 
-    if sub == "reset" then
-        local entry = findEntry(params[2])
-        if entry == nil then
-            reply("unknown mod: " .. tostring(params[2]))
-            return
-        end
-        local ok, err = store.resetMod(entry.mod)
-        reply(ok and (entry.mod .. " reset to config.lua")
-            or ("reset failed: " .. tostring(err)))
-        return
-    end
-
-    if sub == "set" then
-        local entry = findEntry(params[2])
-        if entry == nil then
-            reply("unknown mod: " .. tostring(params[2]))
-            return
-        end
-        local setting = findSetting(entry, params[3])
-        if setting == nil then
-            reply("unknown setting: " .. tostring(params[3]))
-            return
-        end
-        local value, err = coerce(setting, params[4])
-        if value == nil then
-            reply(string.format("%s.%s: %s", entry.mod, setting.key, tostring(err)))
-            return
-        end
-        local ok, writeError = store.setValue(entry.mod, setting.key, value)
-        if not ok then
-            reply("could not save: " .. tostring(writeError))
-            return
-        end
-        reply(string.format("%s.%s = %s", entry.mod, setting.key, tostring(value)))
-        if entry.apply == "restart" then reply("takes effect after a game restart") end
-        if entry.apply == "menu" then reply("takes effect next time the menu is opened") end
-        return
-    end
-
-    reply("Unknown command. Use: modmenu list")
+    reply("Unknown diagnostic. Use: modmenu list | probe | buttons")
 end
 
 local commandOk, commandError = pcall(function()

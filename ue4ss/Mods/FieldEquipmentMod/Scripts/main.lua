@@ -1,8 +1,8 @@
--- FieldEquipmentMenu v1.14.3-test
+-- FieldEquipmentMenu v1.14.4
 -- Add a native-styled Equipment entry to Echoes of Aincrad's start menu.
 
 local MOD_NAME = "FieldEquipmentMenu"
-local MOD_VERSION = "v1.14.3-release"
+local MOD_VERSION = "v1.14.4"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -1056,7 +1056,12 @@ end
 local function focusMenuIcon(context, icon, index)
     if context == nil or not isValidObject(icon) then return end
     mainMenuFocusIndexes[context.listKey] = index
-    pcall(function() context.mainList.CurrentIndex = index end)
+    -- CurrentIndex addresses only the authored Item_0..Item_6 array. A foreign
+    -- injected row can sit beyond it, so keep that position in the logical
+    -- tracker without writing an invalid native cursor.
+    if type(index) == "number" and index >= 0 and index < MAX_NATIVE_MENU_ITEMS then
+        pcall(function() context.mainList.CurrentIndex = index end)
+    end
     pcall(function() icon["Set Current Animation"](icon) end)
     if index == context.equipmentIndex then
         pcall(function() applyEquipmentIconTexture(icon) end)
@@ -1562,19 +1567,6 @@ local function handleBridgedButton(widgetParameter, buttonParameter)
         recoverEquipmentAfterNativeBack(activeEquipmentContext)
         -- Do not consume this input: the native submenu must still perform its
         -- own authored Back transition before we restore the injected entry.
-        return
-    end
-
-    -- A row another mod appended below Equipment. Only the upward boundary is
-    -- claimed here: that mod owns its own row, but focusing Equipment properly
-    -- means clearing every native row and restoring Equipment's own art and
-    -- label, which cannot be done well from another mod's Lua state. Doing it
-    -- from outside left Equipment looking deselected.
-    if activeEquipmentContext ~= nil
-        and isForeignRailIcon(activeEquipmentContext, widget)
-        and (button == DPAD_UP or button == LSTICK_UP) then
-        consumeButton(buttonParameter)
-        focusEquipment(activeEquipmentContext)
         return
     end
 

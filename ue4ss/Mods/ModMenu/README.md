@@ -52,17 +52,12 @@ honestly cannot:
   as that manifest is constructed. Switching it off cannot retract a floor that
   is already open, so it takes a restart.
 
-## Console
+## Diagnostics
 
-Everything the panel does is also reachable from the UE4SS console, which is the
-fallback if the panel fails to build on a given game build:
+The UE4SS console exposes read-only status and diagnostics:
 
 ```
 modmenu list                              show every mod and its current values
-modmenu set SpeedMod START_SPEED 1.8      change one value (bounds enforced)
-modmenu set norescue ENABLED off          on/off for switches
-modmenu reset SpeedMod                    drop overrides, back to config.lua
-modmenu open | close                      drive the panel
 modmenu probe                             dump the widget tree to the UE4SS log
 modmenu buttons                           log the button codes the panel receives
 ```
