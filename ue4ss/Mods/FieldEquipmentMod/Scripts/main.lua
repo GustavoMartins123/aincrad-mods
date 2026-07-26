@@ -1,13 +1,15 @@
--- FieldEquipmentMenu v1.14.7
+-- FieldEquipmentMenu v1.15.1
 -- Add a native-styled Equipment entry to Echoes of Aincrad's start menu.
+--
+-- Selecting that entry opens the Equipment screen alone, with the camera moved
+-- to frame the character, rather than beside a copy of the start menu's stat
+-- panel. See OPENING EQUIPMENT below for what was measured on this build.
 
 local MOD_NAME = "FieldEquipmentMenu"
-local MOD_VERSION = "v1.14.7"
+local MOD_VERSION = "v1.15.1"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
-local MAIN_MENU_WIDGET_CLASS =
-    "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu.WBP_Console_MainMenu_C"
 local MAIN_MENU_LIST_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_List.WBP_Console_MainMenu_List_C"
 local EQUIPMENT_WIDGET_CLASS =
@@ -15,6 +17,20 @@ local EQUIPMENT_WIDGET_CLASS =
 local EQUIPMENT_ICON_ASSET =
     "/Game/ROD/Widget/Common/IconImage/ItemCategoryIconImage/T_ItemCategoryIcon_Unknown"
 local EQUIPMENT_ICON_TEXTURE = EQUIPMENT_ICON_ASSET .. ".T_ItemCategoryIcon_Unknown"
+
+-- EMenuKind::ChestEquipMenu. Stamped on the widget so the menu manager files it
+-- as the chest equipment screen rather than as an anonymous debug menu.
+local MENU_KIND_CHEST_EQUIP = 33
+-- EActorMenuWidgetKind::ChestMenu, for the DebugOpen3DMenu probe only.
+local ACTOR_MENU_KIND_CHEST = 4
+
+-- The widget reaches the screen over a few frames; the close animation runs for
+-- roughly a second before the manager settles.
+local EQUIPMENT_MOUNT_CHECK_MS = 600
+local EQUIPMENT_CLOSE_SETTLE_MS = 900
+-- Applied after the rail is rebuilt, late enough that every other mod has had
+-- its own construction notification and appended its row.
+local EQUIPMENT_REFOCUS_DELAY_MS = 600
 
 local MAX_NATIVE_MENU_ITEMS = 7
 local ACCEPT_BUTTON = 1
@@ -31,12 +47,13 @@ local activeEquipmentContext = nil
 local transitionBusy = false
 local menuCloseBusy = false
 local equipmentSubmenuOpen = false
+-- Set only once the native Equipment screen is confirmed on screen. The menu
+-- manager fires EndMenu for the start menu it closes on the way there, and that
+-- must not be mistaken for the player leaving Equipment.
+local equipmentSessionArmed = false
 local mainMenuSubmenuActive = false
 local submenuTransitionSerial = 0
-local pendingDualPanel = nil
-local creatingStatOverlay = false
-local activeStatOverlay = nil
-local activeStatOverlayDonor = nil
+local pendingEquipmentFocus = false
 local equipmentReturnBusy = false
 local equipmentIconTexture = nil
 local nativeBackRecoveryBusy = false
@@ -49,13 +66,15 @@ local MENU_INJECTION_DELAY_SEC = 0.10
 local VISIBLE = 0
 local COLLAPSED = 1
 local HIDDEN = 2
-local HIT_TEST_INVISIBLE = 3
 
 local setEquipmentEntryVisibility
 local setNativeMenuPanelsVisibility
 local suppressInactiveTrailingNativeRows
 local restoreEquipmentEntryPresentation
-local activateDualPanel
+local focusEquipment
+local rearmEquipmentEntry
+local isCanonicalMainMenuCandidate
+local activeEquipmentContextIsAttached
 local beginEquipmentReturnToMain
 
 local SCRIPT_DIR = (function()
@@ -68,7 +87,8 @@ local SCRIPT_DIR = (function()
     return directory
 end)()
 
-local CONFIG = { ENABLED = true, DEBUG_LOGS = true }
+local CONFIG = { ENABLED = true, DEBUG_LOGS = true, FORCE_CAMERA = true }
+local CONFIG_KEYS = { ENABLED = true, DEBUG_LOGS = true, FORCE_CAMERA = true }
 
 local function log(message)
     if not CONFIG.DEBUG_LOGS then return end
@@ -78,16 +98,18 @@ end
 local function applyExternalConfig(external)
     if type(external) ~= "table" then error("settings must be a table") end
     for key in pairs(external) do
-        if key ~= "ENABLED" and key ~= "DEBUG_LOGS" then
+        if not CONFIG_KEYS[key] then
             error("unknown setting: " .. tostring(key))
         end
     end
-    if type(external.ENABLED) ~= "boolean" then error("ENABLED must be boolean") end
-    if type(external.DEBUG_LOGS) ~= "boolean" then
-        error("DEBUG_LOGS must be boolean")
+    for key in pairs(CONFIG_KEYS) do
+        if type(external[key]) ~= "boolean" then
+            error(key .. " must be boolean")
+        end
     end
-    CONFIG.ENABLED = external.ENABLED
-    CONFIG.DEBUG_LOGS = external.DEBUG_LOGS
+    for key in pairs(CONFIG_KEYS) do
+        CONFIG[key] = external[key]
+    end
 end
 
 local MOD_MENU_BRIDGE = (function()
@@ -137,137 +159,64 @@ local function objectName(object)
     return tostring(object)
 end
 
-local function findWidgetComponentFor(targetWidget)
-    if not isValidObject(targetWidget) then return nil end
-    local component = dereferenceWeakObject(targetWidget.ParentComponent)
-    if isValidObject(component) then return component end
-
-    local targetName = objectName(targetWidget)
-    local ok, components = pcall(function() return FindAllOf("RODWidgetComponent") end)
-    if not ok or components == nil then return nil end
-    for _, candidate in ipairs(components) do
-        if isValidObject(candidate) then
-            local rootWidget = nil
-            pcall(function() rootWidget = candidate:GetWidget() end)
-            if objectName(rootWidget) == targetName then
-                return candidate
-            end
-        end
-    end
-    return nil
-end
-
 local EQUIPMENT_CLASS_FRAGMENT = "WBP_Console_ChestMenu_Equipment_C"
 
 local function contains(value, fragment)
     return string.find(tostring(value or ""), fragment, 1, true) ~= nil
 end
 
-local function componentDetails(component)
-    local rootWidget = nil
-    local userWidget = nil
-    local owner = nil
-    pcall(function() rootWidget = component:GetWidget() end)
-    pcall(function() userWidget = component:GetUserWidgetObject() end)
-    pcall(function() owner = component:GetOwner() end)
-    return rootWidget, userWidget, owner
-end
-
--- DebugOpenMenu may mount a different live widget instance than the object
--- passed to it. Resolve the authored Equipment mount by class identity first,
--- and return the widget that the component is actually rendering.
-local function findLiveEquipmentMount(targetWidget, emitTrace)
-    local direct = findWidgetComponentFor(targetWidget)
-    if isValidObject(direct) then
-        local rootWidget, userWidget, owner = componentDetails(direct)
-        local liveWidget = isValidObject(rootWidget) and rootWidget or userWidget
-        return direct, liveWidget, owner
-    end
-
-    local liveWidgets = {}
-    if isValidObject(targetWidget) then
-        table.insert(liveWidgets, targetWidget)
-    end
-    local widgetOk, widgets = pcall(function()
+-- The Equipment screen counts as open only when the game has mounted it on a
+-- visible widget component, which is what DebugOpen3DMenu's menu actor does.
+-- The chest menu actor is pooled, so its component can still be holding the
+-- widget from an earlier visit, DebugOpenMenu can put the widget straight in the
+-- viewport with no component at all, and a widget the manager has finished with
+-- lingers until collection. So this reports which of the three it found rather
+-- than judging, and each caller applies its own bar:
+--
+--   "component"/"viewport" -> presented, this is a screen the player can see
+--   "detached"             -> the object exists but is on nothing
+--
+-- Opening only needs the object to exist; deciding the player is still inside
+-- Equipment needs it to be presented, or a leftover would trap them there.
+local function findLiveEquipmentWidget()
+    local ok, widgets = pcall(function()
         return FindAllOf(EQUIPMENT_CLASS_FRAGMENT)
     end)
-    if widgetOk and widgets ~= nil then
-        for _, candidate in ipairs(widgets) do
-            if isValidObject(candidate) then
-                table.insert(liveWidgets, candidate)
-                local component = dereferenceWeakObject(candidate.ParentComponent)
-                if isValidObject(component) then
-                    local rootWidget, userWidget, owner = componentDetails(component)
-                    local mountedWidget = isValidObject(rootWidget) and rootWidget
-                        or (isValidObject(userWidget) and userWidget or candidate)
-                    return component, mountedWidget, owner
-                end
+    if not ok or widgets == nil then return nil, nil, nil end
+
+    local viewportWidget = nil
+    local detachedWidget = nil
+    for _, candidate in ipairs(widgets) do
+        if isValidObject(candidate) then
+            local component = dereferenceWeakObject(candidate.ParentComponent)
+            local visible = false
+            if isValidObject(component) then
+                pcall(function() visible = component:IsVisible() end)
             end
-        end
-    end
-
-    local seen = {}
-    local traceCount = 0
-    for _, className in ipairs({ "RODWidgetComponent", "WidgetComponent" }) do
-        local componentsOk, components = pcall(function() return FindAllOf(className) end)
-        if componentsOk and components ~= nil then
-            for _, component in ipairs(components) do
-                if isValidObject(component) then
-                    local componentName = objectName(component)
-                    if not seen[componentName] then
-                        seen[componentName] = true
-                        local rootWidget, userWidget, owner = componentDetails(component)
-                        local rootName = objectName(rootWidget)
-                        local userName = objectName(userWidget)
-                        local ownerName = objectName(owner)
-                        if contains(rootName, EQUIPMENT_CLASS_FRAGMENT)
-                            or contains(userName, EQUIPMENT_CLASS_FRAGMENT) then
-                            local mountedWidget = isValidObject(rootWidget) and rootWidget or userWidget
-                            return component, mountedWidget, owner
-                        end
-
-                        if emitTrace and traceCount < 30
-                            and (contains(componentName, "Menu")
-                                or contains(rootName, "Menu")
-                                or contains(userName, "Menu")
-                                or contains(ownerName, "Menu")
-                                or contains(componentName, "Chest")
-                                or contains(rootName, "Chest")
-                                or contains(userName, "Chest")
-                                or contains(ownerName, "Chest")) then
-                            traceCount = traceCount + 1
-                            log("COMPONENT TRACE component=" .. componentName
-                                .. " root=" .. rootName
-                                .. " user=" .. userName
-                                .. " owner=" .. ownerName)
-                        end
-                    end
-                end
+            if visible then
+                local owner = nil
+                pcall(function() owner = component:GetOwner() end)
+                return candidate, "component", owner
             end
-        elseif emitTrace then
-            log("COMPONENT TRACE FindAllOf(" .. className .. ") failed")
-        end
-    end
 
-    if emitTrace then
-        log("EQUIPMENT TRACE requested=" .. objectName(targetWidget)
-            .. " live-widget-count=" .. tostring(#liveWidgets))
-        for index, candidate in ipairs(liveWidgets) do
-            if index > 12 then break end
-            local parentComponent = dereferenceWeakObject(candidate.ParentComponent)
-            local parentActor = dereferenceWeakObject(candidate.ParentActor)
-            log("EQUIPMENT TRACE widget=" .. objectName(candidate)
-                .. " parent-component=" .. objectName(parentComponent)
-                .. " parent-actor=" .. objectName(parentActor))
+            if viewportWidget == nil then
+                local inViewport = false
+                pcall(function() inViewport = candidate:IsInViewport() end)
+                if inViewport then viewportWidget = candidate end
+            end
+            if detachedWidget == nil then detachedWidget = candidate end
         end
     end
+    if viewportWidget ~= nil then return viewportWidget, "viewport", nil end
+    if detachedWidget ~= nil then return detachedWidget, "detached", nil end
     return nil, nil, nil
 end
 
-local function safeValue(callback)
-    local ok, value = pcall(callback)
-    if ok then return tostring(value) end
-    return "error"
+-- True only for a widget the player can actually see.
+local function equipmentScreenIsPresented()
+    local widget, presentation = findLiveEquipmentWidget()
+    return isValidObject(widget)
+        and (presentation == "component" or presentation == "viewport")
 end
 
 local function resolveLocalController()
@@ -394,73 +343,82 @@ local function attachEquipmentIconWithNativeWrapper(umgLibrary, controller, icon
     return donorList, donorPanel
 end
 
-local function openEquipmentWidget(ignoreActiveMenu)
-    local controller = resolveLocalController()
-    if not isValidObject(controller) then
-        log("cannot open equipment: local controller is not ready")
-        transitionBusy = false
-        return false
-    end
+--========================================================--
+--                   OPENING EQUIPMENT                    --
+--========================================================--
+-- Two things have to happen for this screen to look like the one a chest gives
+-- you: the Equipment widget has to be on screen, and the camera has to be moved
+-- to frame the character.
+--
+-- The widget half is settled. RODWidgetBPFunctionLibrary's DebugOpenMenu +
+-- OpenMenu pair is the only path measured to work on this build: it creates the
+-- widget, registers it with the menu manager and puts it up. The controller's
+-- own DebugOpen3DMenu(ChestMenu, ChestEquipMenu) reads like the better answer —
+-- it would bring the menu actor and its authored open flow with it — but it was
+-- tried on this build and returns without doing anything at all: no Lua error,
+-- no widget, no visible change. It is present in reflection and inert in the
+-- shipping build, so it is not usable from here. `fieldequip probe` re-measures
+-- that if a patch ever changes it.
+--
+-- The camera half is what this build adds. RODMenuWidgetBase carries the answer
+-- on the widget itself: IsOpenCameraEnable gates it, OpenForcedCameraSettings
+-- holds the framing, and ProcessForcedCameraValues applies it. Enabling the flag
+-- before the menu opens lets the widget's own open flow do the work, which costs
+-- nothing and cannot crash. Calling ProcessForcedCameraValues afterwards is the
+-- explicit fallback for the case where that flow does not consult the flag, and
+-- it is what FORCE_CAMERA turns off.
+--
+-- What is deliberately not here any more is the display-only clone of the start
+-- menu that older builds mounted beside Equipment for its stat panel. See
+-- RETURNING FROM EQUIPMENT for what that clone cost.
+local function describeCameraState(widget)
+    local enabled = nil
+    pcall(function() enabled = widget.IsOpenCameraEnable end)
+    return tostring(enabled)
+end
 
-    local umgLibrary, rodLibrary = resolveLibraries()
-    if not isValidObject(umgLibrary) or not isValidObject(rodLibrary) then
-        log("cannot open equipment: widget libraries are unavailable")
-        transitionBusy = false
-        return false
-    end
+local function applyEquipmentForcedCamera(widget)
+    if not CONFIG.FORCE_CAMERA then return end
+    if not isValidObject(widget) then return end
 
-    if not ignoreActiveMenu then
-        local activeOk, menuActive = pcall(function()
-            return rodLibrary:IsActiveMenuWidget(controller)
-        end)
-        if activeOk and menuActive then
-            transitionBusy = false
-            return false
-        end
-    end
-
-    local widgetClass = StaticFindObject(EQUIPMENT_WIDGET_CLASS)
-    if not isValidObject(widgetClass) then
-        log("cannot open equipment: widget class is not loaded")
-        transitionBusy = false
-        return false
-    end
-
-    local widget = nil
-    local created, createError = pcall(function()
-        widget = umgLibrary:Create(controller, widgetClass, controller)
+    -- Step log before the call, not after. Passing a native struct back into a
+    -- native function is the one operation here that pcall cannot protect: if it
+    -- takes the process down, this line is the last one in the log and names the
+    -- culprit. Turn FORCE_CAMERA off to skip it.
+    log("applying the Equipment forced camera (FORCE_CAMERA is on)")
+    local applied, applyError = pcall(function()
+        widget:ProcessForcedCameraValues(widget.OpenForcedCameraSettings)
     end)
-    if not created or not isValidObject(widget) then
-        log("equipment widget creation failed: " .. tostring(createError))
-        transitionBusy = false
-        return false
+    if applied then
+        log("forced camera applied")
+    else
+        log("forced camera could not be applied: " .. tostring(applyError))
+    end
+end
+
+local function verifyEquipmentMounted()
+    if not equipmentSubmenuOpen or equipmentSessionArmed then return end
+
+    local widget, presentation, owner = findLiveEquipmentWidget()
+    if isValidObject(widget) then
+        equipmentSessionArmed = true
+        log("Equipment screen is live via " .. tostring(presentation)
+            .. ": widget=" .. objectName(widget)
+            .. " actor=" .. objectName(owner)
+            .. " openCamera=" .. describeCameraState(widget))
+        applyEquipmentForcedCamera(widget)
+        return
     end
 
-    local handle = nil
-    local registered, registerError = pcall(function()
-        handle = rodLibrary:DebugOpenMenu(controller, widget)
-    end)
-    if not registered or handle == nil then
-        log("equipment menu registration failed: " .. tostring(registerError))
-        transitionBusy = false
-        return false
-    end
-
-    local opened, openError = pcall(function()
-        rodLibrary:OpenMenu(controller, handle)
-    end)
-    transitionBusy = false
-    if opened then
-        log("opened equipment and weapons")
-        return true
-    end
-
-    log("equipment menu opening failed: " .. tostring(openError))
-    return false
+    -- Nothing on screen. Whatever closed the start menu on the way here has to
+    -- be undone, or the player is left in the field with no menu at all.
+    log("Equipment screen never appeared; restoring the start menu")
+    equipmentSessionArmed = true
+    beginEquipmentReturnToMain()
 end
 
 local function selectInjectedEquipment()
-    if transitionBusy then return end
+    if transitionBusy or equipmentSubmenuOpen then return end
     transitionBusy = true
 
     ExecuteInGameThread(function()
@@ -470,421 +428,58 @@ local function selectInjectedEquipment()
         if context == nil or not isValidObject(context.mainMenu)
             or not isValidObject(context.mainList)
             or not isValidObject(controller)
-            or not isValidObject(umgLibrary)
-            or not isValidObject(rodLibrary) then
-            log("cannot open Equipment submenu: UI context is unavailable")
+            or not isValidObject(umgLibrary) or not isValidObject(rodLibrary) then
+            log("cannot open Equipment: UI context is unavailable")
             transitionBusy = false
             return
         end
 
-        -- DebugOpenMenu constructs and opens this particular chest widget
-        -- asynchronously. Once it exists, move it from the top-level menu layer
-        -- into the start menu's authored SubMenu canvas.
         equipmentSubmenuOpen = true
+        equipmentSessionArmed = false
         mainMenuSubmenuActive = true
         submenuTransitionSerial = submenuTransitionSerial + 1
         pendingFocusRedirects[context.listKey] = nil
-        pcall(function() context.mainList.CurrentIndex = 0 end)
-        setNativeMenuPanelsVisibility(context, COLLAPSED)
-        setEquipmentEntryVisibility(context, VISIBLE)
         restoreEquipmentEntryPresentation(context)
 
-        local widgetClass = StaticFindObject(EQUIPMENT_WIDGET_CLASS)
-        local widget = nil
-        local equipmentHandle = nil
-        local registered, registerError = pcall(function()
+        local opened, openError = pcall(function()
+            local widgetClass = StaticFindObject(EQUIPMENT_WIDGET_CLASS)
             if not isValidObject(widgetClass) then
                 error("Equipment widget class is not loaded")
             end
-            widget = umgLibrary:Create(controller, widgetClass, controller)
+
+            local widget = umgLibrary:Create(controller, widgetClass, controller)
             if not isValidObject(widget) then
                 error("Equipment widget creation returned null")
             end
 
+            -- These writes happen before the menu manager sees the widget, so
+            -- its open flow reads the values this mod wants rather than the
+            -- authored chest defaults. ParentMenu is what lets the manager treat
+            -- this as a screen opened from the start menu, and it is why Back
+            -- out of Equipment has always worked.
             widget.ParentMenu = context.mainMenu
-            widget.MenuKind = 33
-            equipmentHandle = rodLibrary:DebugOpenMenu(controller, widget)
-            if equipmentHandle == nil then
+            widget.MenuKind = MENU_KIND_CHEST_EQUIP
+            if CONFIG.FORCE_CAMERA then
+                widget.IsOpenCameraEnable = true
+            end
+
+            local handle = rodLibrary:DebugOpenMenu(controller, widget)
+            if handle == nil then
                 error("DebugOpenMenu returned no Equipment handle")
             end
+            rodLibrary:OpenMenu(controller, handle)
         end)
-        if not registered then
-            equipmentSubmenuOpen = false
-            mainMenuSubmenuActive = false
-            setNativeMenuPanelsVisibility(context, VISIBLE)
-            setEquipmentEntryVisibility(context, VISIBLE)
-            transitionBusy = false
-            log("native Equipment widget registration failed: " .. tostring(registerError))
-            return
-        end
-
-        do
-            log("Equipment opened; waiting for the old start-menu close animation")
-            ExecuteWithDelay(1600, function()
-                activateDualPanel(context, {
-                    widget = widget,
-                    controller = controller,
-                })
-            end)
-            return
-        end
-
-        pcall(function() context.mainMenu:SetSelectAnimation() end)
-        log("Equipment opened; waiting to attach it to the start-menu canvas")
-        ExecuteWithDelay(125, function()
-            ExecuteInGameThread(function()
-                local subMenu = nil
-                local slot = nil
-                local menuComponent = nil
-                local menuActor = nil
-                local attached, attachError = pcall(function()
-                    if not isValidObject(widget) or not isValidObject(context.mainMenu) then
-                        error("Equipment or start-menu widget expired")
-                    end
-                    subMenu = context.mainMenu.SubMenu
-                    if not isValidObject(subMenu) then
-                        error("start-menu SubMenu canvas is unavailable")
-                    end
-
-                    menuComponent = dereferenceWeakObject(widget.ParentComponent)
-                    if not isValidObject(menuComponent) then
-                        menuComponent = dereferenceWeakObject(context.mainMenu.ParentComponent)
-                    end
-                    if not isValidObject(menuComponent) then
-                        menuActor = dereferenceWeakObject(widget.ParentActor)
-                            or dereferenceWeakObject(context.mainMenu.ParentActor)
-                        if isValidObject(menuActor) then
-                            pcall(function()
-                                menuActor.WidgetComponents:ForEach(function(_, componentParameter)
-                                    local component = unwrap(componentParameter)
-                                    if not isValidObject(component) then return false end
-                                    local currentWidget = nil
-                                    pcall(function() currentWidget = component:GetWidget() end)
-                                    if objectName(currentWidget) == objectName(widget) then
-                                        menuComponent = component
-                                        return true
-                                    end
-                                    if not isValidObject(menuComponent) then
-                                        menuComponent = component
-                                    end
-                                    return false
-                                end)
-                            end)
-                        end
-                    end
-                    if not isValidObject(menuComponent) then
-                        error("world-space menu component is unavailable")
-                    end
-
-                    widget:RemoveFromParent()
-                    slot = subMenu:AddChildToCanvas(widget)
-                    if not isValidObject(slot) then
-                        error("SubMenu canvas rejected Equipment")
-                    end
-                    local drawSize = menuComponent:GetDrawSize()
-                    local zero = widget:GetDesiredSize()
-                    zero.X = 0.0
-                    zero.Y = 0.0
-                    slot:SetAutoSize(false)
-                    slot:SetPosition(zero)
-                    slot:SetAlignment(zero)
-                    slot:SetSize(drawSize)
-                    slot:SetZOrder(10)
-                    menuComponent:SetWidget(context.mainMenu)
-                    if not isValidObject(menuActor) then
-                        pcall(function() menuActor = menuComponent:GetOwner() end)
-                    end
-                    if isValidObject(menuActor) then
-                        menuActor:SetActorHiddenInGame(false)
-                    end
-                    menuComponent:SetActive(true, true)
-                    menuComponent:SetComponentTickEnabled(true)
-                    menuComponent:SetHiddenInGame(false, true)
-                    menuComponent:SetVisibility(true, true)
-                    menuComponent:SetTickWhenOffscreen(true)
-                    context.mainMenu:SetVisibility(VISIBLE)
-                    widget:SetVisibility(VISIBLE)
-                    pcall(function() context.mainMenu:SetInteraction(false) end)
-                    pcall(function() widget:SetInteraction(true) end)
-                    menuComponent:RequestRenderUpdate()
-                    menuComponent:RequestRedraw()
-                end)
-                transitionBusy = false
-                if not attached then
-                    equipmentSubmenuOpen = false
-                    mainMenuSubmenuActive = false
-                    setNativeMenuPanelsVisibility(context, VISIBLE)
-                    setEquipmentEntryVisibility(context, VISIBLE)
-                    pcall(function() context.mainMenu:SetVisibility(VISIBLE) end)
-                    pcall(function() context.mainMenu:SetBackAnimation() end)
-                    log("Equipment canvas attachment failed: " .. tostring(attachError))
-                    return
-                end
-
-                setNativeMenuPanelsVisibility(context, COLLAPSED)
-                setEquipmentEntryVisibility(context, VISIBLE)
-                restoreEquipmentEntryPresentation(context)
-                log("attached Equipment under the restored start-menu component: "
-                    .. objectName(menuComponent))
-                ExecuteWithDelay(500, function()
-                    ExecuteInGameThread(function()
-                        if not isValidObject(menuComponent) then
-                            log("RENDER TRACE component expired")
-                            return
-                        end
-
-                        local function renderTrace(stage)
-                            local rootWidget = nil
-                            pcall(function() rootWidget = menuComponent:GetWidget() end)
-                            log("RENDER " .. stage
-                                .. " main[visibility=" .. safeValue(function() return context.mainMenu:GetVisibility() end)
-                                .. " visible=" .. safeValue(function() return context.mainMenu:IsVisible() end)
-                                .. " rendered=" .. safeValue(function() return context.mainMenu:IsRendered() end)
-                                .. " opacity=" .. safeValue(function() return context.mainMenu:GetRenderOpacity() end) .. "]"
-                                .. " equip[visibility=" .. safeValue(function() return widget:GetVisibility() end)
-                                .. " visible=" .. safeValue(function() return widget:IsVisible() end)
-                                .. " rendered=" .. safeValue(function() return widget:IsRendered() end)
-                                .. " opacity=" .. safeValue(function() return widget:GetRenderOpacity() end) .. "]"
-                                .. " component[root=" .. objectName(rootWidget)
-                                .. " visible=" .. safeValue(function() return menuComponent:IsVisible() end)
-                                .. " widgetVisible=" .. safeValue(function() return menuComponent:IsWidgetVisible() end)
-                                .. " active=" .. safeValue(function() return menuComponent:IsActive() end) .. "]")
-                        end
-
-                        renderTrace("before-late-restore")
-                        local restored, restoreError = pcall(function()
-                            menuComponent:SetWidget(context.mainMenu)
-                            if isValidObject(menuActor) then
-                                menuActor:SetActorHiddenInGame(false)
-                            end
-                            menuComponent:SetActive(true, true)
-                            menuComponent:SetComponentTickEnabled(true)
-                            menuComponent:SetHiddenInGame(false, true)
-                            menuComponent:SetVisibility(true, true)
-                            menuComponent:SetTickWhenOffscreen(true)
-                            context.mainMenu:SetVisibility(VISIBLE)
-                            context.mainMenu:SetRenderOpacity(1.0)
-                            subMenu:SetVisibility(VISIBLE)
-                            subMenu:SetRenderOpacity(1.0)
-                            widget:SetVisibility(VISIBLE)
-                            widget:SetRenderOpacity(1.0)
-                            widget:ProcessForcedCameraValues(widget.OpenForcedCameraSettings)
-                            widget:OnStartOpenMenuAnimation()
-                            context.mainMenu:SetSelectAnimation()
-                            setNativeMenuPanelsVisibility(context, COLLAPSED)
-                            setEquipmentEntryVisibility(context, VISIBLE)
-                            restoreEquipmentEntryPresentation(context)
-                            context.mainMenu:SetInteraction(false)
-                            widget:SetInteraction(true)
-                            widget:SetFocus()
-                            widget:SetKeyboardFocus()
-                            widget:SetUserFocus(controller)
-                            context.mainMenu:ForceLayoutPrepass()
-                            menuComponent:RequestRenderUpdate()
-                            menuComponent:RequestRedraw()
-                        end)
-                        log("restored Equipment forced camera; success=" .. tostring(restored)
-                            .. " enabled=" .. safeValue(function() return widget.IsOpenCameraEnable end)
-                            .. " error=" .. tostring(restoreError))
-                        renderTrace("after-late-restore")
-                    end)
-                end)
-            end)
-        end)
-    end)
-end
-
-activateDualPanel = function(context, pending)
-    ExecuteInGameThread(function()
-        if context == nil or pending == nil or not isValidObject(context.mainMenu)
-            or not isValidObject(pending.widget) then
-            transitionBusy = false
-            equipmentSubmenuOpen = false
-            mainMenuSubmenuActive = false
-            log("stat-panel reactivation failed: the menu context expired")
-            return
-        end
-
-        local mainComponent = findWidgetComponentFor(context.mainMenu)
-        local mainActor = nil
-        if isValidObject(mainComponent) then
-            pcall(function() mainActor = mainComponent:GetOwner() end)
-        end
-
-        local overlay = nil
-        local overlayIcon = nil
-        local overlayWrapperDonor = nil
-        local overlayWrapperPanel = nil
-        local overlayList = nil
-        local overlayNativePanels = {}
-        local equipmentLabelText = nil
-        local activated, activateError = pcall(function()
-            if not isValidObject(mainComponent) then
-                error("existing start-menu component is unavailable")
-            end
-
-            local umgLibrary, _, textLibrary = resolveLibraries()
-            local overlayClass = StaticFindObject(MAIN_MENU_WIDGET_CLASS)
-            local iconClass = StaticFindObject(MAIN_MENU_ICON_CLASS)
-            if not isValidObject(umgLibrary) or not isValidObject(textLibrary)
-                or not isValidObject(overlayClass) or not isValidObject(iconClass) then
-                error("fresh main-menu overlay class or UMG library is unavailable")
-            end
-            equipmentLabelText = textLibrary:Conv_StringToText("Equipment")
-
-            -- The original main widget owns a delayed close animation. Create
-            -- a display-only clone so the menu manager cannot collapse it after
-            -- Equipment has opened.
-            creatingStatOverlay = true
-            overlay = umgLibrary:Create(pending.controller, overlayClass, pending.controller)
-            creatingStatOverlay = false
-            if not isValidObject(overlay) then
-                error("fresh main-menu overlay creation returned null")
-            end
-
-            mainComponent:SetVisibility(false, true)
-            context.mainMenu:RemoveFromParent()
-            pcall(function() overlay:InitializeMenuWidget() end)
-            pcall(function() overlay:OpenedMenu() end)
-            overlay:AddToViewport(0)
-            -- This clone is display-only. Its full-screen root otherwise sits
-            -- above the native Equipment widget and swallows mouse hit tests.
-            overlay:SetVisibility(HIT_TEST_INVISIBLE)
-            overlay:SetRenderOpacity(1.0)
-
-            local heroDetail = overlay.HeroDetail
-            local heroSlot = isValidObject(heroDetail) and heroDetail.Slot or nil
-            if not isValidObject(heroSlot) then
-                error("fresh overlay HeroDetail slot is unavailable")
-            end
-            local heroNudge = heroSlot.Nudge
-            heroNudge.X = -560.0
-            heroNudge.Y = 0.0
-            heroSlot:SetNudge(heroNudge)
-
-            overlayList = overlay.MainMenu_List
-            local lastItem = overlayList.Item_6
-            local lastPanel = lastItem.Slot.Parent
-            local iconParent = lastPanel.Slot.Parent
-            if not isValidObject(overlayList) or not isValidObject(lastItem)
-                or not isValidObject(lastPanel) or not isValidObject(iconParent) then
-                error("fresh overlay menu-list hierarchy is unavailable")
-            end
-            overlayIcon = umgLibrary:Create(pending.controller, iconClass, pending.controller)
-            if not isValidObject(overlayIcon) then
-                error("fresh overlay Equipment icon creation returned null")
-            end
-            overlayWrapperDonor, overlayWrapperPanel =
-                attachEquipmentIconWithNativeWrapper(
-                    umgLibrary, pending.controller, iconParent, overlayIcon)
-            overlayIcon:SetItemIndex(context.equipmentIndex)
-            overlayIcon:SetOwnerInputWidget(overlayList)
-            overlayIcon:SetInactive(false)
-            overlayIcon:SetBlank(false)
-            overlayIcon:SetInputEnable(false)
-            overlayIcon:BP_SetInputInteractionEnable(false)
-            overlayIcon:SetMenuName(equipmentLabelText)
-            for index = 0, MAX_NATIVE_MENU_ITEMS - 1 do
-                local panel = nil
-                pcall(function()
-                    panel = overlayList["Item_" .. tostring(index)].Slot.Parent
-                end)
-                if isValidObject(panel) then
-                    panel:SetVisibility(COLLAPSED)
-                    table.insert(overlayNativePanels, panel)
-                end
-            end
-            overlayList:SetVisibility(VISIBLE)
-            pcall(function() overlay:SetSelectAnimation() end)
-            -- Select (not Select_Full) is the authored one-icon submenu state:
-            -- it leaves MenuIcon opaque and fades the cyan SelectMenu arrow in.
-            overlayIcon:SetSelectAnimation()
-            if not applyEquipmentIconTexture(overlayIcon) then
-                error("dedicated Equipment icon texture is unavailable")
-            end
-            pcall(function() overlay:SetInteraction(false) end)
-            pending.widget:SetVisibility(VISIBLE)
-            pending.widget:SetRenderOpacity(1.0)
-            pending.widget:SetInteraction(true)
-
-            pending.widget:SetFocus()
-            pending.widget:SetKeyboardFocus()
-            pending.widget:SetUserFocus(pending.controller)
-            overlay:ForceLayoutPrepass()
-        end)
-        creatingStatOverlay = false
         transitionBusy = false
-        if not activated then
+        if not opened then
             equipmentSubmenuOpen = false
             mainMenuSubmenuActive = false
-            setNativeMenuPanelsVisibility(context, VISIBLE)
-            setEquipmentEntryVisibility(context, VISIBLE)
-            log("stat-panel reactivation beside Equipment failed: " .. tostring(activateError))
+            log("Equipment menu could not be opened: " .. tostring(openError))
             return
         end
 
-        equipmentSubmenuOpen = true
-        mainMenuSubmenuActive = true
-        activeStatOverlay = overlay
-        activeStatOverlayDonor = overlayWrapperDonor
-        log("mounted fresh stat overlay and Equipment icon: overlay="
-            .. objectName(overlay) .. " widget=" .. objectName(pending.widget))
-        ExecuteWithDelay(650, function()
-            ExecuteInGameThread(function()
-                if not equipmentSubmenuOpen or activeEquipmentContext ~= context
-                    or not isValidObject(overlay)
-                    or not isValidObject(pending.widget) then
-                    return
-                end
-                local guarded, guardError = pcall(function()
-                    local inViewport = false
-                    pcall(function() inViewport = overlay:IsInViewport() end)
-                    if not inViewport then
-                        overlay:AddToViewport(0)
-                    end
-                    overlay:SetVisibility(HIT_TEST_INVISIBLE)
-                    overlay:SetRenderOpacity(1.0)
-                    pcall(function() overlay.MainMenu_List:SetVisibility(VISIBLE) end)
-                    for _, panel in ipairs(overlayNativePanels) do
-                        if isValidObject(panel) then panel:SetVisibility(COLLAPSED) end
-                    end
-                    if isValidObject(overlayIcon) then
-                        if isValidObject(overlayWrapperPanel) then
-                            overlayWrapperPanel:SetVisibility(VISIBLE)
-                        end
-                        overlayIcon:SetVisibility(VISIBLE)
-                        overlayIcon:SetRenderOpacity(1.0)
-                        overlayIcon:SetMenuName(equipmentLabelText)
-                        overlayIcon.MenuName:SetText(equipmentLabelText)
-                        if not applyEquipmentIconTexture(overlayIcon) then
-                            error("Equipment icon texture guard failed")
-                        end
-                    end
-                    pending.widget:SetVisibility(VISIBLE)
-                    pending.widget:SetRenderOpacity(1.0)
-                    pending.widget:SetInteraction(true)
-                end)
-                log("fresh stat-overlay guard applied; success=" .. tostring(guarded)
-                    .. " error=" .. tostring(guardError))
-            end)
-        end)
-        ExecuteWithDelay(1300, function()
-            ExecuteInGameThread(function()
-                if not equipmentSubmenuOpen or activeEquipmentContext ~= context
-                    or not isValidObject(overlayIcon) then
-                    return
-                end
-                pcall(function()
-                    if isValidObject(overlayWrapperPanel) then
-                        overlayWrapperPanel:SetVisibility(VISIBLE)
-                    end
-                    overlayIcon:SetVisibility(VISIBLE)
-                    overlayIcon:SetRenderOpacity(1.0)
-                    overlayIcon:SetMenuName(equipmentLabelText)
-                    overlayIcon.MenuName:SetText(equipmentLabelText)
-                    applyEquipmentIconTexture(overlayIcon)
-                end)
-            end)
+        log("opened Equipment; verifying it reached the screen")
+        ExecuteWithDelay(EQUIPMENT_MOUNT_CHECK_MS, function()
+            ExecuteInGameThread(verifyEquipmentMounted)
         end)
     end)
 end
@@ -1077,11 +672,20 @@ local function injectEquipmentEntry(mainMenu)
     end
     ExecuteWithDelay(250, guardInitialEquipmentIcon)
     ExecuteWithDelay(850, guardInitialEquipmentIcon)
-    if pendingDualPanel ~= nil then
-        local pending = pendingDualPanel
-        pendingDualPanel = nil
-        ExecuteWithDelay(100, function()
-            activateDualPanel(context, pending)
+
+    -- Returning from Equipment rebuilds this rail from scratch, which is also
+    -- how every other mod gets its row back. Put the cursor back on Equipment
+    -- once that rebuild has settled, so leaving the screen lands where the
+    -- player left off rather than on Pouch.
+    if pendingEquipmentFocus then
+        pendingEquipmentFocus = false
+        ExecuteWithDelay(EQUIPMENT_REFOCUS_DELAY_MS, function()
+            ExecuteInGameThread(function()
+                if activeEquipmentContext ~= context or mainMenuSubmenuActive then
+                    return
+                end
+                focusEquipment(context)
+            end)
         end)
     end
 end
@@ -1201,7 +805,7 @@ local function focusRailRow(context, row, index)
     return true
 end
 
-local function focusEquipment(context)
+focusEquipment = function(context)
     if context == nil or not isValidObject(context.equipmentIcon) then return end
     -- Equipment is outside the native animation array. Selecting it
     -- therefore cannot make the list deselect its current authored row. Reset
@@ -1347,7 +951,7 @@ restoreEquipmentEntryPresentation = function(context)
     pcall(function() applyEquipmentIconTexture(context.equipmentIcon) end)
 end
 
-local function rearmEquipmentEntry(context, emitLog)
+rearmEquipmentEntry = function(context, emitLog)
     if context == nil or not isValidObject(context.mainMenu)
         or not isValidObject(context.mainList)
         or not isValidObject(context.equipmentIcon) then
@@ -1644,82 +1248,128 @@ local function handleBridgedButton(widgetParameter, buttonParameter)
     end
 end
 
-local function restoreNativeStartMenuAfterEquipment()
+--========================================================--
+--                 RETURNING FROM EQUIPMENT               --
+--========================================================--
+-- Whether the start menu survives an Equipment session is the menu manager's
+-- call, not this mod's. Both outcomes are handled, and neither one edits the
+-- widget tree of a menu the manager owns:
+--
+--   * survived  -> rearm this mod's input bridge on the menu that is already
+--                  there. Every other mod's row never moved.
+--   * torn down -> ask the game to open a new start menu. It constructs a fresh
+--                  WBP_Console_MainMenu_C, so this mod and every other rail mod
+--                  get their normal construction notification and inject again.
+--
+-- What is deliberately gone is the third path older builds took: detaching the
+-- real start menu, holding the reference across the whole Equipment session and
+-- pushing it back into its component afterwards. That resurrected widget looked
+-- right to this mod, because this mod rearmed itself explicitly, and was stale
+-- to everyone else — no construction notification ever fired for it, so other
+-- mods kept pointing at rows on a menu that had been through a teardown.
+local function startMenuSurvivedEquipment()
+    local context = activeEquipmentContext
+    if context == nil or not isValidObject(context.mainMenu) then return false end
+    if not isCanonicalMainMenuCandidate(context.mainMenu) then return false end
+    if not activeEquipmentContextIsAttached() then return false end
+
+    -- Owning a component is not enough: the component has to still be rendering
+    -- this widget, or the menu is on its way out.
+    local component = dereferenceWeakObject(context.mainMenu.ParentComponent)
+    if not isValidObject(component) then return false end
+    local mounted = nil
+    pcall(function() mounted = component:GetWidget() end)
+    return isValidObject(mounted)
+        and objectName(mounted) == objectName(context.mainMenu)
+end
+
+local function reopenStartMenuAfterEquipment()
+    -- One physical Back reaches several hooked functions, and the manager emits
+    -- its own EndMenu for nested pickers inside the Equipment screen. If the
+    -- screen is still mounted once its close animation would have finished, the
+    -- player did not actually leave it.
+    if equipmentScreenIsPresented() then
+        equipmentSubmenuOpen = true
+        mainMenuSubmenuActive = true
+        equipmentReturnBusy = false
+        log("Equipment is still on screen; kept the session open")
+        return
+    end
+
+    local context = activeEquipmentContext
+    if context ~= nil and startMenuSurvivedEquipment() then
+        equipmentSessionArmed = false
+        context.activeNativeSubmenuIndex = nil
+        pendingFocusRedirects[context.listKey] = nil
+        setNativeMenuPanelsVisibility(context, VISIBLE)
+        rearmEquipmentEntry(context, true)
+        focusEquipment(context)
+        equipmentReturnBusy = false
+        log("start menu outlived the Equipment session; rearmed it in place")
+        return
+    end
+
     local controller = resolveLocalController()
     if not isValidObject(controller) then
         equipmentReturnBusy = false
-        log("cannot restore start menu after Equipment: controller is unavailable")
+        equipmentSessionArmed = false
+        log("cannot reopen the start menu after Equipment: controller is unavailable")
         return
     end
+
+    -- Drop every reference to the menu that went away before asking for a new
+    -- one, so the construction notification is free to rebuild the context.
+    activeEquipmentContext = nil
+    equipmentContexts = {}
+    injectedMenus = {}
+    pendingFocusRedirects = {}
+    mainMenuFocusIndexes = {}
+    pendingEquipmentFocus = true
 
     local reopened, reopenError = pcall(function()
         controller:DebugOpenMainMenu()
     end)
+    equipmentReturnBusy = false
+    equipmentSessionArmed = false
     if not reopened then
-        equipmentReturnBusy = false
-        log("could not reopen native start menu after Equipment: " .. tostring(reopenError))
+        pendingEquipmentFocus = false
+        log("could not reopen the start menu after Equipment: " .. tostring(reopenError))
         return
     end
+    log("start menu was torn down with Equipment; reopened it so every rail mod "
+        .. "reinjects into the new widget")
 
-    ExecuteWithDelay(300, function()
+    -- Reinjection rides on the construction notification. If the game ever hands
+    -- back a pooled widget instead of building one, that notification never
+    -- fires and the rail is left without a live row. Say so rather than
+    -- reinjecting blind: pruning a rail this mod no longer owns would take other
+    -- mods' rows with it.
+    ExecuteWithDelay(2000, function()
         ExecuteInGameThread(function()
-            local context = activeEquipmentContext
-            if context == nil or not isValidObject(context.mainMenu) then
-                equipmentReturnBusy = false
-                log("native start-menu context was unavailable after Equipment closed")
-                return
-            end
-
-            local component = findWidgetComponentFor(context.mainMenu)
-            local actor = nil
-            if isValidObject(component) then
-                pcall(function() actor = component:GetOwner() end)
-            end
-            local restored, restoreError = pcall(function()
-                if not isValidObject(component) then
-                    error("native start-menu component is unavailable")
-                end
-                component:SetWidget(context.mainMenu)
-                if isValidObject(actor) then actor:SetActorHiddenInGame(false) end
-                component:SetActive(true, true)
-                component:SetComponentTickEnabled(true)
-                component:SetHiddenInGame(false, true)
-                component:SetVisibility(true, true)
-                component:SetTickWhenOffscreen(true)
-                context.mainMenu:SetVisibility(VISIBLE)
-                context.mainMenu:SetRenderOpacity(1.0)
-                context.mainMenu:SetInteraction(true)
-                setNativeMenuPanelsVisibility(context, VISIBLE)
-                if not rearmEquipmentEntry(context, false) then
-                    error("Equipment navigation could not be restored")
-                end
-                focusEquipment(context)
-                component:RequestRenderUpdate()
-                component:RequestRedraw()
-            end)
-            equipmentReturnBusy = false
-            if restored then
-                log("restored original interactive start menu after Equipment")
-            else
-                log("original start-menu restoration failed: " .. tostring(restoreError))
-            end
+            if activeEquipmentContext ~= nil then return end
+            pendingEquipmentFocus = false
+            log("the reopened start menu never reported a construction; "
+                .. "close and reopen the menu to get the Equipment row back")
         end)
     end)
 end
 
 beginEquipmentReturnToMain = function()
     if equipmentReturnBusy or not equipmentSubmenuOpen then return end
+    -- EndMenu also fires for the start menu the manager closes on the way into
+    -- Equipment. Until the Equipment screen is confirmed on screen, that is the
+    -- outgoing start menu, not the player leaving.
+    if not equipmentSessionArmed then
+        log("ignored a menu close that arrived before Equipment was on screen")
+        return
+    end
+
     equipmentReturnBusy = true
     equipmentSubmenuOpen = false
     mainMenuSubmenuActive = false
-    if isValidObject(activeStatOverlay) then
-        pcall(function() activeStatOverlay:RemoveFromParent() end)
-    end
-    activeStatOverlay = nil
-    activeStatOverlayDonor = nil
-    log("removed display-only stat overlay; waiting to restore native start menu")
-    ExecuteWithDelay(900, function()
-        ExecuteInGameThread(restoreNativeStartMenuAfterEquipment)
+    log("left Equipment; waiting for its authored close animation")
+    ExecuteWithDelay(EQUIPMENT_CLOSE_SETTLE_MS, function()
+        ExecuteInGameThread(reopenStartMenuAfterEquipment)
     end)
 end
 
@@ -1734,7 +1384,7 @@ local function safeHook(path, callback, postCallback)
     if not ok then log("hook unavailable: " .. path .. " / " .. tostring(err)) end
 end
 
-local function isCanonicalMainMenuCandidate(mainMenu)
+isCanonicalMainMenuCandidate = function(mainMenu)
     if not isValidObject(mainMenu)
         or not string.find(
             objectName(mainMenu),
@@ -1753,7 +1403,8 @@ local function isCanonicalMainMenuCandidate(mainMenu)
     end)
 
     -- The interactive menu is canonically owned by the world-space widget
-    -- component/actor. The stat overlay and discarded-world widgets are not.
+    -- component/actor. Widgets from a discarded world, and display-only copies
+    -- any mod might build, are not.
     return isValidObject(parentComponent)
         or isValidObject(parentActor)
 end
@@ -1789,7 +1440,7 @@ local function queueMenuInjection(menuKey)
     scheduleMenuInjection()
 end
 
-local function activeEquipmentContextIsAttached()
+activeEquipmentContextIsAttached = function()
     local context = activeEquipmentContext
     if context == nil
         or not isValidObject(context.mainMenu)
@@ -1894,7 +1545,8 @@ local notifyOk, notifyError = pcall(function()
     NotifyOnNewObject(
         "/Script/ROD.RODConsoleMainMenuWidgetBase",
         function(object)
-            if creatingStatOverlay then return end
+            -- This mod no longer constructs a WBP_Console_MainMenu_C of its
+            -- own, so every notification here is a real start menu.
             local mainMenu = unwrap(object)
             if not string.find(
                 objectName(mainMenu),
@@ -2153,6 +1805,9 @@ if not mouseBindOk then
     log("could not register Equipment LMB bridge: " .. tostring(mouseBindError))
 end
 
+-- Nothing in this build creates a viewport-only start menu any more. This still
+-- runs once at load so that hot-reloading over a session that used the old
+-- clone-based Equipment screen does not leave its overlay stuck on screen.
 local function cleanupOrphanedStatOverlays()
     local ok, widgets = pcall(function() return FindAllOf("WBP_Console_MainMenu_C") end)
     if not ok or widgets == nil then return end
@@ -2177,6 +1832,109 @@ end
 ExecuteWithDelay(100, function()
     ExecuteInGameThread(cleanupOrphanedStatOverlays)
 end)
+
+--========================================================--
+--                      DIAGNOSTICS                       --
+--========================================================--
+-- Read-only. This exists because the interesting failures on this build are
+-- native calls that succeed and do nothing, which no amount of reading headers
+-- will tell you apart from calls that work. `fieldequip probe` reports what is
+-- actually there; `fieldequip open3d` re-runs the DebugOpen3DMenu experiment on
+-- demand so a future patch can be retested without editing the mod.
+local function reportState(reply)
+    local controller = resolveLocalController()
+    reply("controller: " .. objectName(controller))
+    reply(string.format("state: enabled=%s forceCamera=%s open=%s armed=%s",
+        tostring(CONFIG.ENABLED), tostring(CONFIG.FORCE_CAMERA),
+        tostring(equipmentSubmenuOpen), tostring(equipmentSessionArmed)))
+
+    local context = activeEquipmentContext
+    if context == nil then
+        reply("rail: no Equipment row is live (open the start menu first)")
+    else
+        reply("rail: index " .. tostring(context.equipmentIndex)
+            .. " after " .. tostring(context.nativeCount) .. " native row(s) on "
+            .. objectName(context.mainMenu))
+    end
+
+    local widget, presentation, owner = findLiveEquipmentWidget()
+    if isValidObject(widget) then
+        reply("equipment widget: " .. objectName(widget)
+            .. " via " .. tostring(presentation) .. " actor " .. objectName(owner))
+        reply("  IsOpenCameraEnable = " .. describeCameraState(widget))
+    else
+        reply("equipment widget: none on screen")
+    end
+
+    for _, name in ipairs({
+        "DebugOpen3DMenu", "DebugOpenChangeEquipMenu", "DebugOpenMainMenu",
+    }) do
+        local present = "unavailable"
+        if isValidObject(controller) then
+            local ok, member = pcall(function() return controller[name] end)
+            if ok and member ~= nil then present = "reflected" end
+        end
+        reply(string.format("  %-26s %s", name, present))
+    end
+    reply("reflected only means the function exists; on this build "
+        .. "DebugOpen3DMenu returns without opening anything.")
+end
+
+local commandOk, commandError = pcall(function()
+    RegisterConsoleCommandHandler("fieldequip", function(_full, params, ar)
+        local function reply(message)
+            local delivered = pcall(function() ar:Log(tostring(message)) end)
+            if not delivered then
+                print("[" .. MOD_NAME .. "] " .. tostring(message) .. "\n")
+            end
+        end
+
+        local arguments = params or {}
+        local sub = arguments[1] and string.lower(tostring(arguments[1])) or "probe"
+        if sub == "probe" then
+            local ok, err = pcall(reportState, reply)
+            if not ok then reply("probe error: " .. tostring(err)) end
+            return true
+        end
+
+        if sub == "open3d" then
+            -- Replies before deferring: the console's `ar` is only valid for the
+            -- duration of this synchronous call.
+            reply("running DebugOpen3DMenu(ChestMenu, ChestEquipMenu); "
+                .. "watch UE4SS.log for the result")
+            ExecuteInGameThread(function()
+                local controller = resolveLocalController()
+                if not isValidObject(controller) then
+                    log("PROBE open3d: controller is unavailable")
+                    return
+                end
+                log("PROBE open3d: calling DebugOpen3DMenu")
+                local called, callError = pcall(function()
+                    controller:DebugOpen3DMenu(
+                        ACTOR_MENU_KIND_CHEST, MENU_KIND_CHEST_EQUIP)
+                end)
+                log("PROBE open3d: call returned ok=" .. tostring(called)
+                    .. " error=" .. tostring(callError))
+                ExecuteWithDelay(1000, function()
+                    ExecuteInGameThread(function()
+                        local widget, presentation = findLiveEquipmentWidget()
+                        log("PROBE open3d: equipment widget="
+                            .. objectName(widget)
+                            .. " via " .. tostring(presentation))
+                    end)
+                end)
+            end)
+            return true
+        end
+
+        reply("Usage: fieldequip probe | open3d")
+        return true
+    end)
+end)
+if not commandOk then
+    print(string.format("[%s] console command unavailable: %s\n",
+        MOD_NAME, tostring(commandError)))
+end
 
 -- Runtime settings. Injection happens as the start menu is constructed, so an
 -- ENABLED change lands the next time the menu is opened rather than instantly.

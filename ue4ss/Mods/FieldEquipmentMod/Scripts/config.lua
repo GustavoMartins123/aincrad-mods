@@ -10,4 +10,11 @@ return {
 
     -- Verbose logging in the UE4SS console.
     DEBUG_LOGS = true,
+
+    -- Move the camera to frame your character while the Equipment screen is up,
+    -- the way the screen behaves at a chest. This is the one setting that reads
+    -- a native struct off the widget and hands it straight back to a native
+    -- function; if the game ever stops surviving that, switch this off and the
+    -- screen still opens, just against whatever the camera was already doing.
+    FORCE_CAMERA = true,
 }

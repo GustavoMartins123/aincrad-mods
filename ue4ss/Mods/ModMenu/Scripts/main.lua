@@ -1,4 +1,4 @@
--- ModMenu v1.5
+-- ModMenu v1.5.1
 -- Adds a native-styled "Mods" entry to Echoes of Aincrad's start menu, opening a
 -- panel that enables/disables the other mods and retunes their values in-game.
 --
@@ -12,7 +12,7 @@
 -- mod's Lua state, because UE4SS gives each mod its own.
 
 local MOD_NAME = "ModMenu"
-local MOD_VERSION = "v1.5"
+local MOD_VERSION = "v1.5.1"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -512,18 +512,22 @@ local function injectModsEntry(mainMenu)
         return
     end
 
-    -- FieldEquipmentMenu deliberately creates a display-only clone of this
-    -- class for its stat overlay. The clone is added directly to the viewport
-    -- and has no owning widget component/actor; the real start menu is owned by
-    -- the game's world-space menu component. Injecting into the clone replaces
-    -- activeContext and strands the actual Mods row when the clone is removed.
+    -- The real start menu is owned by the game's world-space menu component.
+    -- Anything of this class without such an owner is a display-only copy — a
+    -- mod's overlay, or a widget left over from a discarded world. Injecting
+    -- into one replaces activeContext and strands the actual Mods row.
+    --
+    -- This guard used to be gated on an `inViewport` that was never assigned in
+    -- this function, so it was always nil and the guard never fired; the copies
+    -- were rejected one layer up, in isCanonicalMainMenuCandidate, which is why
+    -- that went unnoticed.
     local parentComponent = nil
     local parentActor = nil
     pcall(function()
         parentComponent = dereferenceWeakObject(mainMenu.ParentComponent)
         parentActor = dereferenceWeakObject(mainMenu.ParentActor)
     end)
-    if inViewport and not isValid(parentComponent) and not isValid(parentActor) then
+    if not isValid(parentComponent) and not isValid(parentActor) then
         injectedMenus[menuKey] = false
         log("ignored display-only main-menu overlay: " .. menuKey)
         return
@@ -1291,10 +1295,10 @@ ensureInputHooks = function()
         end)
 
     -- The start menu closing must take the panel with it, or it would be left
-    -- floating over the world. Keep the last context reference until a new real
-    -- menu replaces it: FieldEquipment temporarily closes/detaches that same
-    -- widget and later restores it. Clearing the context here made its Mods row
-    -- ownerless after returning from Equipment.
+    -- floating over the world. The context reference is deliberately kept until
+    -- a new real menu replaces it, rather than cleared here: a close is not
+    -- proof the menu is gone for good, and processMenuInjectionCycle already
+    -- drops the context the moment the row stops being attached to it.
     safeHook("/Script/ROD.RODWidgetBPFunctionLibrary:EndMenu", function()
         if panel.isOpen() then closePanel() end
         -- If this EndMenu came from the Mods row, retain the close lock until

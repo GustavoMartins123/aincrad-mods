@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.4.5"
+local MOD_VERSION = "1.4.6"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -337,7 +337,6 @@ local materialInterface = nil
 local rodGameState = nil
 local navigationSystem = nil
 local rodSpawnActorFunction = nil
-local rodSpawnActorParameterOrder = nil
 local disableWorld
 local releaseWorldForTravel
 local gcScheduled = false
@@ -483,10 +482,8 @@ local function resolveSpawnApi()
         navigationSystem = nav
     end
 
-    if not isValid(rodSpawnActorFunction)
-        or rodSpawnActorParameterOrder == nil then
+    if not isValid(rodSpawnActorFunction) then
         rodSpawnActorFunction = nil
-        rodSpawnActorParameterOrder = nil
 
         local functionOk, functionObject = pcall(
             StaticFindObject,
@@ -499,54 +496,10 @@ local function resolveSpawnApi()
         if not isValid(functionObject) then
             return false, "canonical RODSpawnActor UFunction is unavailable"
         end
-
-        local required = {
-            Class = true,
-            Transform = true,
-            Option = true,
-            inOwner = true,
-            InInstigator = true,
-            CollisionHandlingOverride = true,
-        }
-        local found = {}
-        local order = {}
-        local reflectOk, reflectError = pcall(function()
-            functionObject:ForEachProperty(function(property)
-                local fullName = property:GetFullName()
-                if type(fullName) ~= "string" or fullName == "" then
-                    error("reflected parameter has no canonical full name")
-                end
-                local name = fullName:match(":([^:]+)$")
-                if name == nil or name == "" then
-                    error("malformed reflected parameter name " .. fullName)
-                end
-                if required[name] == true then
-                    if found[name] == true then
-                        error("duplicate reflected parameter " .. name)
-                    end
-                    found[name] = true
-                    order[#order + 1] = name
-                end
-                return false
-            end)
-        end)
-        if not reflectOk then
-            return false, "RODSpawnActor reflection failed: " ..
-                tostring(reflectError)
-        end
-        for name, _ in pairs(required) do
-            if found[name] ~= true then
-                return false, "RODSpawnActor is missing reflected parameter " ..
-                    name
-            end
-        end
-        if #order ~= 6 then
-            return false, "RODSpawnActor reflected parameter count is " ..
-                tostring(#order) .. ", expected 6"
-        end
         rodSpawnActorFunction = functionObject
-        rodSpawnActorParameterOrder = order
-        log("SPAWN CONTRACT | reflected order=" .. table.concat(order, ","))
+        log(
+            "SPAWN CONTRACT | RODGameState.RODSpawnActor header contract acquired"
+        )
     end
     return true, nil
 end
@@ -1693,6 +1646,24 @@ local function processSpawnRequest()
         )
         return
     end
+    local contractObjectsOk, contractObjectsError = pcall(function()
+        if spawnClass:IsAnyClass() ~= true then
+            error("resolved Class is not a UClass")
+        end
+        if owner:IsA("/Script/Engine.Actor") ~= true then
+            error("resolved inOwner is not an Actor")
+        end
+        if instigator:IsA("/Script/Engine.Pawn") ~= true then
+            error("resolved InInstigator is not a Pawn")
+        end
+    end)
+    if not contractObjectsOk then
+        pauseForSpawnContractFailure(
+            "spawn object contract failed: " ..
+                firstErrorLine(contractObjectsError)
+        )
+        return
+    end
 
     local position, navigationError, navigationRetryable =
         resolveNavigableSpawnPosition(request, owner)
@@ -1746,22 +1717,14 @@ local function processSpawnRequest()
     local spawned = nil
     local insertedPending = false
     local okSpawn, spawnError = pcall(function()
-        local values = {
-            Class = spawnClass,
-            Transform = transform,
-            Option = option,
-            inOwner = owner,
-            InInstigator = instigator,
-            CollisionHandlingOverride =
-                SPAWN_COLLISION_ADJUST_OR_REJECT,
-        }
-        local arguments = {}
-        for index, name in ipairs(rodSpawnActorParameterOrder) do
-            arguments[index] = values[name]
-        end
         local result = rodSpawnActorFunction(
             rodGameState,
-            table.unpack(arguments, 1, #rodSpawnActorParameterOrder)
+            spawnClass,
+            transform,
+            option,
+            owner,
+            instigator,
+            SPAWN_COLLISION_ADJUST_OR_REJECT
         )
         if result == nil then error("RODSpawnActor returned no result") end
         local resultSpawnOn = tonumber(result.SpawnOn)

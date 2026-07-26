@@ -339,17 +339,32 @@ end
 -- menu machinery belongs to TOWN terminals only. Never touch the in-quest QuestManager's arrays:
 -- growing a TArray reallocates its buffer while native code may be mid-iteration (crash risk), and
 -- there is nothing to designate outside town.
+local lastMenuWorldError = nil
 local function inMenuWorld()
     local ok, name = pcall(function()
         local pc = FindFirstOf("PlayerController")
-        local n = pc:GetWorld():GetName()
-        if type(n) ~= "string" then n = n:ToString() end
-        return n
+        if not isValid(pc) then error("PlayerController is unavailable") end
+        local world = pc:GetWorld()
+        if not isValid(world) then error("PlayerController world is unavailable") end
+        local fullName = world:GetFullName()
+        if type(fullName) ~= "string" or fullName == "" then
+            error("UWorld canonical full name is unavailable")
+        end
+        local canonicalName = fullName:match("%.([^%.%s:]+)$")
+        if type(canonicalName) ~= "string" or canonicalName == "" then
+            error("malformed UWorld canonical full name: " .. fullName)
+        end
+        return canonicalName
     end)
-    if not ok or type(name) ~= "string" then
-        print("[OpenWorld] MENU WORLD ERROR | canonical world name is unavailable")
+    if not ok then
+        local reason = tostring(name):match("^[^\r\n]+") or tostring(name)
+        if reason ~= lastMenuWorldError then
+            lastMenuWorldError = reason
+            print("[OpenWorld] MENU WORLD ERROR | " .. reason)
+        end
         return false
     end
+    lastMenuWorldError = nil
     if name == "PL_ROD" then return false end          -- boot/title
     if name:find("_WP") then return false end           -- floor fields (PL_WL01_WP, ...)
     if name:find("Darkness") or name:find("WLM") then return false end -- dungeons

@@ -321,6 +321,8 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/55)
 
 ### Changed
 
+- Menu-world classification now uses the canonical `UWorld.GetFullName`
+  contract and reports one explicit fault per distinct unavailable-world state.
 - The existing `CONFIG` table is refreshed in place so closures registered by
   the original script observe new values.
 - Made the exact script directory, configuration schema, floor-data files, and
@@ -368,7 +370,7 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/64)
 **Baseline:** `FieldEquipmentMod 64 1
 2026-07-21T11-45Z 8WdQj6lM4.7z`  
 **Original script version:** v1.14.3-release  
-**Integrated script version:** v1.14.7
+**Integrated script version:** v1.15.1
 
 ### Added
 
@@ -399,9 +401,38 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/64)
   references from every historical menu.
 - Removed continuous `FindAllOf(WBP_Console_MainMenu_C)` polling during
   gameplay.
+- Removed the display-only `WBP_Console_MainMenu_C` clone that used to supply a
+  stat panel beside Equipment, along with the `HeroDetail` nudge that positioned
+  it. The stat panel no longer appears over the Equipment screen.
+- The Equipment widget is now opened with `IsOpenCameraEnable` set and its
+  `OpenForcedCameraSettings` applied through `ProcessForcedCameraValues`, so the
+  camera frames the character the way it does at a chest. The explicit
+  `ProcessForcedCameraValues` call is gated behind the new `FORCE_CAMERA`
+  setting, because it is the only place this mod hands a native struct back to a
+  native function; a step log is emitted immediately before it.
+- Added a read-only `fieldequip` console command (`probe`, `open3d`).
+- Returning from Equipment no longer detaches the real Start Menu and pushes it
+  back into its widget component by hand. The mod now rearms in place when the
+  menu survived, and otherwise reopens it through `DebugOpenMainMenu` so every
+  rail mod receives its normal construction notification.
+- The Equipment session is only treated as open once the widget is confirmed to
+  exist, so the `EndMenu` the manager fires for the outgoing Start Menu is no
+  longer mistaken for the player leaving.
+
+### Measured on this build
+
+- `ARODInGamePlayerController:DebugOpen3DMenu(ChestMenu, ChestEquipMenu)` is
+  present in reflection and callable without error, and does nothing: no widget,
+  no visible change, no log. It was tried as the Equipment entry point in
+  v1.15.0 and reverted. `RODWidgetBPFunctionLibrary:DebugOpenMenu` + `OpenMenu`
+  remains the only working path. `fieldequip open3d` re-runs the experiment if a
+  future patch changes it.
 
 ### Fixed
 
+- Fixed the Mods row, and any other mod's rail row, being lost after visiting
+  Equipment. The clone's rail carried only this mod's row, and the by-hand
+  restoration produced a Start Menu that no other mod was ever notified about.
 - Fixed navigation disappearing when moving upward from Mods to Equipment.
 - Fixed focus skipping directly to Settings or requiring an extra directional
   input after returning to Equipment.
@@ -413,8 +444,10 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/64)
 
 ### Unchanged
 
-The original native Equipment screen, stat-overlay lifecycle, back handling,
-menu restoration, and equipment workflow were retained.
+The rail injection technique, the navigation bridge around the injected row, and
+the equipment workflow itself were retained. The stat-overlay lifecycle and the
+by-hand menu restoration it required were removed rather than retained; see
+Changed above.
 
 ## New integrated ModMenu layer
 
@@ -422,7 +455,7 @@ menu restoration, and equipment workflow were retained.
 **Original archive:** None of the six Nexus baselines contains ModMenu or
 `ModMenuBridge.lua`
 
-**Current script version:** v1.5
+**Current script version:** v1.5.1
 
 ### Added
 
@@ -460,6 +493,10 @@ menu restoration, and equipment workflow were retained.
 
 ### Fixed
 
+- Fixed the display-only Start Menu guard in `injectModsEntry` being gated on an
+  `inViewport` variable that was never assigned in that function, so the guard
+  was permanently disabled. Rejection happened one layer up in
+  `isCanonicalMainMenuCandidate`, which is why it went unnoticed.
 - Fixed controller Left/Right handling inside the Mods panel.
 - Fixed Back/B closing behavior for the panel.
 - Fixed the outer Start Menu receiving the panel's navigation input.
@@ -497,7 +534,7 @@ menu restoration, and equipment workflow were retained.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v1.4.5
+**Current script version:** v1.4.6
 
 ### Added
 
@@ -522,10 +559,10 @@ menu restoration, and equipment workflow were retained.
   the unreliable zero path-length value exposed by this UE4SS build is not
   treated as a second contract.
 - Resolves the natural source enemy by exact object identity for native owner
-  and instigator, and reflects the live `RODSpawnActor` parameter order before
-  issuing the call.
-- Reads reflected parameter names from each property's canonical full name,
-  avoiding the unsupported `FName.ToString` binding in this UE4SS build.
+  and instigator.
+- Calls the exact `RODSpawnActor` parameter sequence declared by the supplied
+  game header. Runtime UFunction-property enumeration was removed because this
+  UE4SS build does not expose `ForEachProperty` on its Lua UFunction wrapper.
 - Requires 50-150 cm separation from natural, pending, and owned enemies and
   uses `AdjustIfPossibleButDontSpawnIfColliding`.
 - Supplies `FRODSpawnActorOption` with server spawn, source level, `Prowl`
