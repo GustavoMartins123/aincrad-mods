@@ -83,9 +83,11 @@ confirmed travel starts a clean scan of the new world. A standalone
 `ClientRestart` inside the same mission instead retains ownership of all
 existing extras; forgetting that ownership would make the director rediscover
 its own actors as natural spawns and multiply them again. Quest teleports pause
-the director for eight seconds while retaining the same-world state. An enabled
-director therefore starts in each mission automatically; an OFF/ON toggle is
-not part of the activation flow.
+the director for eight seconds while retaining the same-world state. Checkpoint
+fast travel uses that same quarantine because it repositions the current world
+without guaranteeing a `ClientRestart`. An enabled director therefore starts
+in each mission automatically; an OFF/ON toggle is not part of the activation
+flow.
 
 Before issuing any extra spawn, the initial discovery batch must remain stable
 for two seconds. This gives delayed boss initialization events time to remove

@@ -1,8 +1,8 @@
--- FieldEquipmentMenu v1.14.5
+-- FieldEquipmentMenu v1.14.6
 -- Add a native-styled Equipment entry to Echoes of Aincrad's start menu.
 
 local MOD_NAME = "FieldEquipmentMenu"
-local MOD_VERSION = "v1.14.5"
+local MOD_VERSION = "v1.14.6"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -40,6 +40,14 @@ local activeStatOverlayDonor = nil
 local equipmentReturnBusy = false
 local equipmentIconTexture = nil
 local nativeBackRecoveryBusy = false
+local pendingMenuInjections = {}
+local menuInjectionWorkQueued = false
+local nextMenuBootstrapScan = 0.0
+local menuAcquisitionErrorReported = false
+
+local MENU_INJECTION_DELAY_SEC = 0.10
+local MENU_INJECTION_POLL_MS = 100
+local MENU_BOOTSTRAP_SCAN_SEC = 0.25
 
 local VISIBLE = 0
 local COLLAPSED = 1
@@ -1045,10 +1053,16 @@ local function injectEquipmentEntry(mainMenu)
         end
     end
     suppressInactiveTrailingNativeRows(context)
-    equipmentContexts[objectName(equipmentIcon)] = context
+    -- A checkpoint constructs a new menu tree. Retain only the current context;
+    -- historical widget references can pin the discarded world.
+    equipmentContexts = {
+        [objectName(equipmentIcon)] = context,
+    }
     activeEquipmentContext = context
     menuCloseBusy = false
-    injectedMenus[menuKey] = equipmentIcon
+    injectedMenus = { [menuKey] = true }
+    mainMenuFocusIndexes = {}
+    pendingFocusRedirects = {}
     log("added Equipment entry at dynamic index " .. tostring(equipmentIndex)
         .. " after " .. tostring(nativeCount) .. " active native row(s)")
 
@@ -1723,6 +1737,147 @@ local function safeHook(path, callback, postCallback)
     if not ok then log("hook unavailable: " .. path .. " / " .. tostring(err)) end
 end
 
+local function isCanonicalMainMenuCandidate(mainMenu)
+    if not isValidObject(mainMenu)
+        or not string.find(
+            objectName(mainMenu),
+            "WBP_Console_MainMenu_C",
+            1,
+            true
+        ) then
+        return false
+    end
+
+    local parentComponent = nil
+    local parentActor = nil
+    pcall(function()
+        parentComponent = dereferenceWeakObject(mainMenu.ParentComponent)
+        parentActor = dereferenceWeakObject(mainMenu.ParentActor)
+    end)
+
+    -- The interactive menu is canonically owned by the world-space widget
+    -- component/actor. The stat overlay and discarded-world widgets are not.
+    return isValidObject(parentComponent)
+        or isValidObject(parentActor)
+end
+
+local function resolveMainMenuByKey(menuKey)
+    local ok, widgets = pcall(function()
+        return FindAllOf("WBP_Console_MainMenu_C")
+    end)
+    if not ok or type(widgets) ~= "table" then
+        return nil, "FindAllOf(WBP_Console_MainMenu_C) returned no table"
+    end
+
+    for _, widget in ipairs(widgets) do
+        if isCanonicalMainMenuCandidate(widget)
+            and objectName(widget) == menuKey then
+            return widget, nil
+        end
+    end
+    return nil, "exact constructed start-menu object is no longer live"
+end
+
+local function queueMenuInjection(menuKey)
+    if type(menuKey) ~= "string" or menuKey == ""
+        or injectedMenus[menuKey] ~= nil then
+        return
+    end
+
+    local readyAt = os.clock() + MENU_INJECTION_DELAY_SEC
+    local pending = pendingMenuInjections[menuKey]
+    if pending == nil or readyAt < pending then
+        pendingMenuInjections[menuKey] = readyAt
+    end
+end
+
+local function activeEquipmentContextIsAttached()
+    local context = activeEquipmentContext
+    if context == nil
+        or not isValidObject(context.mainMenu)
+        or not isValidObject(context.equipmentIcon)
+        or not isValidObject(context.equipmentWrapperPanel)
+        or not isValidObject(context.equipmentWrapperParent) then
+        return false
+    end
+
+    local attachedParent = nil
+    pcall(function()
+        attachedParent = context.equipmentWrapperPanel.Slot.Parent
+    end)
+    return isValidObject(attachedParent)
+        and objectName(attachedParent)
+            == objectName(context.equipmentWrapperParent)
+end
+
+local function scanCurrentMainMenus()
+    local ok, widgets = pcall(function()
+        return FindAllOf("WBP_Console_MainMenu_C")
+    end)
+    if not ok or type(widgets) ~= "table" then
+        if not menuAcquisitionErrorReported then
+            menuAcquisitionErrorReported = true
+            log("menu acquisition error: "
+                .. "FindAllOf(WBP_Console_MainMenu_C) returned no table")
+        end
+        return
+    end
+    menuAcquisitionErrorReported = false
+
+    for _, widget in ipairs(widgets) do
+        if isCanonicalMainMenuCandidate(widget) then
+            queueMenuInjection(objectName(widget))
+        end
+    end
+end
+
+local function processMenuInjectionCycle()
+    local now = os.clock()
+
+    if activeEquipmentContext ~= nil
+        and not activeEquipmentContextIsAttached() then
+        local staleKey = activeEquipmentContext.mainMenuKey
+        activeEquipmentContext = nil
+        equipmentContexts = {}
+        if staleKey ~= nil then injectedMenus[staleKey] = nil end
+    end
+
+    for menuKey, readyAt in pairs(pendingMenuInjections) do
+        if now >= readyAt then
+            pendingMenuInjections[menuKey] = nil
+            local mainMenu, resolveError = resolveMainMenuByKey(menuKey)
+            if mainMenu == nil then
+                log("Equipment injection failed closed for " .. menuKey
+                    .. ": " .. tostring(resolveError))
+            else
+                injectEquipmentEntry(mainMenu)
+            end
+        end
+    end
+
+    if activeEquipmentContext == nil and now >= nextMenuBootstrapScan then
+        nextMenuBootstrapScan = now + MENU_BOOTSTRAP_SCAN_SEC
+        scanCurrentMainMenus()
+    end
+end
+
+local function pollMenuInjections()
+    if not menuInjectionWorkQueued then
+        menuInjectionWorkQueued = true
+        ExecuteInGameThread(function()
+            menuInjectionWorkQueued = false
+            local handler = debug and debug.traceback or tostring
+            local ok, cycleError =
+                xpcall(processMenuInjectionCycle, handler)
+            if not ok then
+                log("menu acquisition cycle failed closed: "
+                    .. tostring(cycleError))
+            end
+        end)
+    end
+    ExecuteWithDelay(MENU_INJECTION_POLL_MS, pollMenuInjections)
+end
+
 safeHook("/Script/ROD.RODWidgetBPFunctionLibrary:EndMenu",
     function()
         beginEquipmentReturnToMain()
@@ -1747,27 +1902,10 @@ safeHook("/Script/ROD.RODConsoleMainMenuWidgetBase:EndSubMenu",
         finishMainMenuReturn(returnState)
     end)
 
--- The concrete Blueprint class is not loaded when UE4SS installs mods, so a
--- RegisterHook against one of its Blueprint events fails. Watch the native base
--- instead, then filter for the real start-menu instance as it is constructed.
-local notifyOk, notifyError = pcall(function()
-    NotifyOnNewObject("/Script/ROD.RODConsoleMainMenuWidgetBase", function(object)
-        if creatingStatOverlay then return end
-        local mainMenu = unwrap(object)
-        if not string.find(objectName(mainMenu), "WBP_Console_MainMenu_C", 1, true) then
-            return
-        end
-
-        ExecuteWithDelay(100, function()
-            ExecuteInGameThread(function()
-                injectEquipmentEntry(mainMenu)
-            end)
-        end)
-    end)
-end)
-if not notifyOk then
-    log("main-menu object notification unavailable: " .. tostring(notifyError))
-end
+-- One canonical acquisition path handles cold construction, checkpoint
+-- reconstruction, and a mod reload while the menu already exists. It retains
+-- only the exact object name until the game-thread injection resolves it.
+pollMenuInjections()
 
 safeHook("/Script/ROD.RODConsoleMainMenuWidgetBase:OnButtonDownMenuItemDelegate",
     function(_, widgetParameter, buttonParameter)

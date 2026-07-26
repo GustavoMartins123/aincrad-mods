@@ -1,4 +1,4 @@
--- ModMenu v1.3
+-- ModMenu v1.4
 -- Adds a native-styled "Mods" entry to Echoes of Aincrad's start menu, opening a
 -- panel that enables/disables the other mods and retunes their values in-game.
 --
@@ -12,7 +12,7 @@
 -- mod's Lua state, because UE4SS gives each mod its own.
 
 local MOD_NAME = "ModMenu"
-local MOD_VERSION = "v1.3"
+local MOD_VERSION = "v1.4"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -66,6 +66,14 @@ local logButtons = false
 local injectedMenus = {}
 local activeContext = nil
 local menuCloseBusy = false
+local pendingMenuInjections = {}
+local menuInjectionWorkQueued = false
+local nextMenuBootstrapScan = 0.0
+local menuAcquisitionErrorReported = false
+
+local MENU_INJECTION_DELAY_SEC = 0.40
+local MENU_INJECTION_POLL_MS = 100
+local MENU_BOOTSTRAP_SCAN_SEC = 0.25
 
 -- Assigned further down, called the first time a Mods row is actually injected.
 -- Nothing this mod hooks is useful before a start menu exists, so the input
@@ -512,10 +520,8 @@ local function injectModsEntry(mainMenu)
     -- and has no owning widget component/actor; the real start menu is owned by
     -- the game's world-space menu component. Injecting into the clone replaces
     -- activeContext and strands the actual Mods row when the clone is removed.
-    local inViewport = false
     local parentComponent = nil
     local parentActor = nil
-    pcall(function() inViewport = mainMenu:IsInViewport() end)
     pcall(function()
         parentComponent = dereferenceWeakObject(mainMenu.ParentComponent)
         parentActor = dereferenceWeakObject(mainMenu.ParentActor)
@@ -618,7 +624,11 @@ local function injectModsEntry(mainMenu)
         return
     end
 
-    injectedMenus[menuKey] = icon
+    -- Store only primitive state here. Keeping every historical widget in this
+    -- table pins menu/world objects across checkpoint teardown.
+    injectedMenus = { [menuKey] = true }
+    listFocusIndexes = {}
+    pendingFocusRedirects = {}
     -- Seed the focus tracker with wherever the list already is. Without this the
     -- first wrap after opening the menu has no previous index to compare against
     -- and cannot be recognised, so the first attempt to reach Mods silently
@@ -1013,31 +1023,143 @@ local function safeHook(path, callback, postCallback)
     if not ok then log("hook unavailable: " .. path .. " / " .. tostring(err)) end
 end
 
-local notifyOk, notifyError = pcall(function()
-    NotifyOnNewObject("/Script/ROD.RODConsoleMainMenuWidgetBase", function(object)
-        local mainMenu = unwrap(object)
-        -- Logged unconditionally: if the start menu never reaches this callback,
-        -- the problem is the notification, not the injection below it.
-        log("start-menu candidate constructed: " .. objectName(mainMenu))
-        if not contains(objectName(mainMenu), "WBP_Console_MainMenu_C") then return end
+local function isCanonicalMainMenuCandidate(mainMenu)
+    if not isValid(mainMenu)
+        or not contains(objectName(mainMenu), "WBP_Console_MainMenu_C") then
+        return false
+    end
 
-        -- Deliberately later than FieldEquipmentMenu's 100ms: whichever rows
-        -- other mods add must already be in the VerticalBox when this one counts
-        -- them, so that the Mods entry lands underneath with the right index.
-        ExecuteWithDelay(400, function()
-            local scheduled, scheduleError = pcall(function()
-                ExecuteInGameThread(function() injectModsEntry(mainMenu) end)
-            end)
-            if not scheduled then
-                log("Mods entry injection scheduling failed: "
-                    .. tostring(scheduleError))
+    local inViewport = false
+    local parentComponent = nil
+    local parentActor = nil
+    pcall(function() inViewport = mainMenu:IsInViewport() end)
+    pcall(function()
+        parentComponent = dereferenceWeakObject(mainMenu.ParentComponent)
+        parentActor = dereferenceWeakObject(mainMenu.ParentActor)
+    end)
+
+    -- The interactive start menu is canonically owned by the game's world-space
+    -- widget component/actor. Field Equipment's display-only copy and detached
+    -- objects from a discarded world have neither owner and are rejected.
+    return isValid(parentComponent) or isValid(parentActor)
+end
+
+local function resolveMainMenuByKey(menuKey)
+    local ok, widgets = pcall(function()
+        return FindAllOf("WBP_Console_MainMenu_C")
+    end)
+    if not ok or type(widgets) ~= "table" then
+        return nil, "FindAllOf(WBP_Console_MainMenu_C) returned no table"
+    end
+
+    for _, widget in ipairs(widgets) do
+        if isCanonicalMainMenuCandidate(widget)
+            and objectName(widget) == menuKey then
+            return widget, nil
+        end
+    end
+    return nil, "exact constructed start-menu object is no longer live"
+end
+
+local function queueMenuInjection(menuKey)
+    if type(menuKey) ~= "string" or menuKey == ""
+        or injectedMenus[menuKey] ~= nil then
+        return
+    end
+
+    local readyAt = os.clock() + MENU_INJECTION_DELAY_SEC
+    local pending = pendingMenuInjections[menuKey]
+    if pending == nil or readyAt < pending then
+        pendingMenuInjections[menuKey] = readyAt
+    end
+end
+
+local function activeMenuContextIsAttached()
+    local context = activeContext
+    if context == nil
+        or not isValid(context.mainMenu)
+        or not isValid(context.icon)
+        or not isValid(context.wrapperPanel)
+        or not isValid(context.wrapperParent) then
+        return false
+    end
+
+    local attachedParent = nil
+    pcall(function() attachedParent = context.wrapperPanel.Slot.Parent end)
+    return isValid(attachedParent)
+        and objectName(attachedParent) == objectName(context.wrapperParent)
+end
+
+local function scanCurrentMainMenus()
+    local ok, widgets = pcall(function()
+        return FindAllOf("WBP_Console_MainMenu_C")
+    end)
+    if not ok or type(widgets) ~= "table" then
+        if not menuAcquisitionErrorReported then
+            menuAcquisitionErrorReported = true
+            log("menu acquisition error: "
+                .. "FindAllOf(WBP_Console_MainMenu_C) returned no table")
+        end
+        return
+    end
+    menuAcquisitionErrorReported = false
+
+    for _, widget in ipairs(widgets) do
+        if isCanonicalMainMenuCandidate(widget) then
+            queueMenuInjection(objectName(widget))
+        end
+    end
+end
+
+local function processMenuInjectionCycle()
+    local now = os.clock()
+
+    if activeContext ~= nil and not activeMenuContextIsAttached() then
+        local staleKey = activeContext.mainMenuKey
+        activeContext = nil
+        if staleKey ~= nil then injectedMenus[staleKey] = nil end
+    end
+
+    for menuKey, readyAt in pairs(pendingMenuInjections) do
+        if now >= readyAt then
+            pendingMenuInjections[menuKey] = nil
+            local mainMenu, resolveError = resolveMainMenuByKey(menuKey)
+            if mainMenu == nil then
+                log("start-menu injection failed closed for " .. menuKey
+                    .. ": " .. tostring(resolveError))
+            else
+                injectModsEntry(mainMenu)
+            end
+        end
+    end
+
+    if activeContext == nil and now >= nextMenuBootstrapScan then
+        nextMenuBootstrapScan = now + MENU_BOOTSTRAP_SCAN_SEC
+        scanCurrentMainMenus()
+    end
+end
+
+local function pollMenuInjections()
+    if not menuInjectionWorkQueued then
+        menuInjectionWorkQueued = true
+        ExecuteInGameThread(function()
+            menuInjectionWorkQueued = false
+            local handler = debug and debug.traceback or tostring
+            local ok, cycleError =
+                xpcall(processMenuInjectionCycle, handler)
+            if not ok then
+                log("menu acquisition cycle failed closed: "
+                    .. tostring(cycleError))
             end
         end)
-    end)
-end)
-if not notifyOk then
-    log("main-menu object notification unavailable: " .. tostring(notifyError))
+    end
+    ExecuteWithDelay(MENU_INJECTION_POLL_MS, pollMenuInjections)
 end
+
+-- One canonical acquisition path handles cold construction, checkpoint
+-- reconstruction, and a mod reload while the menu already exists. It retains
+-- only the exact object name until the game-thread injection resolves it.
+pollMenuInjections()
 
 -- Every hook below only has anything to do once a Mods row exists on the rail.
 -- Registering them at load time meant this mod had callbacks running on common

@@ -60,11 +60,11 @@ Nexus Mods page before distributing a modified package.
 | Component | Original archive | Original version evidence | Integrated state |
 |---|---|---|---|
 | UE4SS | `UE4SS_1012_EOA 7 1.2.1 2026-07-24T10-03Z V4y6UZcT5.zip` | Nexus package 1.2.1 | Loader binaries unchanged; settings configured |
-| Terrain Runner | `SpeedMod v8 Stablized 45 8 2026-07-20T00-09Z 3CxMATjay.zip` | Archive label v8; `main.lua` identifies v7.11 | `main.lua` identifies v7.16 |
-| Auto Pickup | `AutoPickupMod 19 1.4 2026-07-23T15-17Z cLQPyYq9t.zip` | Archive label 1.4; `main.lua` identifies v1.3 | `main.lua` identifies v1.4 |
+| Terrain Runner | `SpeedMod v8 Stablized 45 8 2026-07-20T00-09Z 3CxMATjay.zip` | Archive label v8; `main.lua` identifies v7.11 | `main.lua` identifies v7.17 |
+| Auto Pickup | `AutoPickupMod 19 1.4 2026-07-23T15-17Z cLQPyYq9t.zip` | Archive label 1.4; `main.lua` identifies v1.3 | `main.lua` identifies v1.4.1 |
 | No Rescue | `Norescue 0.5.0 35 1 2026-07-13T13-48Z 3CxMATjJt.zip` | README identifies 0.5.0 | 0.5.0 plus integration changes |
 | Aincrad Open World | `AincradOpenWorld V1.0 55 1 2026-07-18T12-32Z V4y6UZc0K.zip` | Archive identifies V1.0 | V1.0 plus runtime bridge |
-| Field Equipment | `FieldEquipmentMod 64 1 2026-07-21T11-45Z 8WdQj6lM4.7z` | `main.lua` identifies v1.14.3-release | `main.lua` identifies v1.14.5 |
+| Field Equipment | `FieldEquipmentMod 64 1 2026-07-21T11-45Z 8WdQj6lM4.7z` | `main.lua` identifies v1.14.3-release | `main.lua` identifies v1.14.6 |
 
 ## UE4SS 1.2.1
 
@@ -116,7 +116,7 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/45)
 **Baseline:** `SpeedMod v8 Stablized 45 8
 2026-07-20T00-09Z 3CxMATjay.zip`  
 **Original script version:** v7.11  
-**Integrated script version:** v7.16
+**Integrated script version:** v7.17
 
 ### Added
 
@@ -143,6 +143,9 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/45)
 - Raised the validated top-speed limit from 4.50× to 8.00×.
 - Replaced the exposed `hero.CharacterMovement` field with the canonical
   `hero:GetMovementComponent()` call.
+- Replaced first-live-sample jog learning with the exact
+  hero-class-default `CharacterMovement.MaxWalkSpeed` baseline. Resuming while
+  Sprint is already held can no longer teach the detector the sprint cap.
 - Restricted player discovery to the canonical local host
   `RODWorldHeroCharacter`.
 - Reduced hero/movement retry frequency to the loading interval while those
@@ -167,6 +170,10 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/45)
   ready without changing to a secondary movement API.
 - Fixed jump baselines being captured from an already modified instance after
   travel by reading the exact hero-class default movement component.
+- Fixed checkpoint fast travel latching `mapLeaving` forever when the game
+  repositions the existing world without emitting `ClientRestart`.
+- Fixed horizontal boost failing to return after sleep while jump height
+  remained active.
 
 ### Current integrated defaults
 
@@ -198,7 +205,7 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/19)
 **Baseline:** `AutoPickupMod 19 1.4
 2026-07-23T15-17Z cLQPyYq9t.zip`  
 **Original script version:** v1.3, despite the archive's 1.4 label  
-**Integrated script version:** v1.4
+**Integrated script version:** v1.4.1
 
 ### Added
 
@@ -232,6 +239,10 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/19)
 - Removed force-resume travel watchdogs and alternate arrival paths.
   `ClientRestart` is now the sole mission-ready signal; if it is absent,
   pickup remains paused and reports an explicit transition error.
+- Fixed checkpoint fast travel being treated as mission-world replacement.
+  Same-world fast travel now clears range references, pauses for six seconds,
+  and resumes through the normal persistent poll without requiring
+  `ClientRestart`.
 
 ### Unchanged
 
@@ -357,7 +368,7 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/64)
 **Baseline:** `FieldEquipmentMod 64 1
 2026-07-21T11-45Z 8WdQj6lM4.7z`  
 **Original script version:** v1.14.3-release  
-**Integrated script version:** v1.14.5
+**Integrated script version:** v1.14.6
 
 ### Added
 
@@ -381,6 +392,10 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/64)
 - Reasserts Equipment's label, texture, and selected presentation without
   moving focus a second time.
 - Preserves the standalone wrap behavior when no other injected row exists.
+- Replaced delayed construction-callback captures with one canonical
+  game-thread acquisition cycle for the exact component-owned Start Menu.
+- Stores only the current Equipment context instead of retaining widget
+  references from every historical menu.
 
 ### Fixed
 
@@ -391,6 +406,8 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/64)
 - Fixed Field Equipment stealing focus back from another injected rail row.
 - Fixed custom injected indexes being written into the native list's
   `CurrentIndex`.
+- Fixed Equipment disappearing when a checkpoint rebuilt the Start Menu or the
+  mod was reloaded while a menu instance already existed.
 
 ### Unchanged
 
@@ -402,6 +419,8 @@ menu restoration, and equipment workflow were retained.
 **Origin:** Added for this integrated suite  
 **Original archive:** None of the six Nexus baselines contains ModMenu or
 `ModMenuBridge.lua`
+
+**Current script version:** v1.4
 
 ### Added
 
@@ -431,6 +450,10 @@ menu restoration, and equipment workflow were retained.
   quest manifests and may require a restart.
 - UE4SS's built-in `mods.txt` and `mods.json` remain unchanged; gameplay Lua
   mods continue to use only their `enabled.txt` markers.
+- Uses the same canonical component-owned Start Menu acquisition cycle as Field
+  Equipment, with its later 400 ms slot preserving deterministic row order.
+- Retains only primitive menu identity while waiting to inject and only the
+  current live context afterward.
 
 ### Fixed
 
@@ -445,6 +468,8 @@ menu restoration, and equipment workflow were retained.
   invalidated and reacquired.
 - Fixed live numeric edits exposing a partially written `runtime.lua`, which
   could make SpeedMod reject a temporarily missing `START_SPEED`.
+- Fixed the Mods row disappearing after checkpoint reconstruction and failing
+  to return after a mod reload while the live Start Menu already existed.
 - Fixed World Enemy Director retaining outgoing-mission enemy references until
   `ClientRestart`; quest-end events now release references before world
   collection and leave asynchronous actor teardown to Unreal.
@@ -470,7 +495,7 @@ menu restoration, and equipment workflow were retained.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v1.4.2
+**Current script version:** v1.4.3
 
 ### Added
 
@@ -506,6 +531,9 @@ menu restoration, and equipment workflow were retained.
 - Applies random visual size to skeletal-mesh `RelativeScale3D` instead of the
   character actor root, preserving capsule, NavMesh-agent, perception,
   controller, and movement geometry.
+- Classifies `ServerDecideFastTravel` as a same-world quarantine. Existing
+  ownership is retained and processing resumes after eight seconds instead of
+  waiting forever for a `ClientRestart` that checkpoint travel does not emit.
 
 ### Failure behavior
 

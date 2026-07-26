@@ -1,7 +1,7 @@
--- AutoPickupMod v1.4
+-- AutoPickupMod v1.4.1
 
 local MOD_NAME = "AutoPickupMod"
-local MOD_VERSION = "v1.4"
+local MOD_VERSION = "v1.4.1"
 
 local GAME_CONFIG_PATHS = {
     "/Game/ROD/DataAssets/GameConfig.Default__GameConfig_C",
@@ -1396,9 +1396,9 @@ requireLifecycleHook("/Script/ROD.RODPlayerState:ServerDecideTown", function()
 end, "ServerDecideTown")
 
 requireLifecycleHook("/Script/ROD.RODPlayerState:ServerDecideFastTravel", function()
-    dbg("Hook/ServerDecideFastTravel")
-    beginTravel("ServerDecideFastTravel")
-end, "ServerDecideFastTravel")
+    dbg("Hook/ServerDecideFastTravel(same-world)")
+    beginQuietOnly("ServerDecideFastTravel(same-world)", 6.0)
+end, "ServerDecideFastTravel(same-world)")
 
 requireLifecycleHook("/Script/ROD.RODPlayerState:ServerNotifyQuestTeleportOut", function()
     dbg("Hook/ServerNotifyQuestTeleportOut")

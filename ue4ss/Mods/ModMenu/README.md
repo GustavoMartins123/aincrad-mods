@@ -93,7 +93,8 @@ cannot be grown safely from UE4SS Lua, so each row is a `MenuIcon` clone in a
 donor wrapper outside those native arrays. Only the navigation boundaries are
 bridged.
 
-ModMenu waits 400 ms before injecting, after Field Equipment's 100 ms delay,
+Both mods acquire only the component-owned live Start Menu on the game thread.
+Field Equipment injects after a 100 ms readiness delay; ModMenu waits 400 ms,
 then counts all rows already present and places itself below them. Field
 Equipment hands downward focus to the next modded row; ModMenu owns both of its
 boundaries and returns upward focus to the row directly above it.
@@ -103,9 +104,11 @@ and back inputs. The outer Start Menu does not receive those events.
 
 ## Crash-safety rules
 
-- Never construct a widget of a class watched by `NotifyOnNewObject`. The panel
-  draws into the live Start Menu and creates only `TextBlock` and `Image`
-  children.
+- Never retain a menu `UObject` across the readiness delay. Acquisition keeps
+  only its exact primitive identity and resolves the component-owned object on
+  the game thread.
+- Keep only the current injected context; historical widget tables can pin a
+  discarded world through garbage collection.
 - Never write an out-of-range native `CurrentIndex`. The modded row sits beyond
   the authored `Item_0..Item_6` array; its highlight is controlled through the
   widget, not by lying to the native cursor.

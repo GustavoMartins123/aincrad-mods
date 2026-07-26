@@ -1,9 +1,9 @@
-print("[SpeedMod] Loading TERRAIN RUNNER v7.16 - PERSISTENT MISSION LIFECYCLE...")
+print("[SpeedMod] Loading TERRAIN RUNNER v7.17 - PERSISTENT MISSION LIFECYCLE...")
 print("[SpeedMod] Startup is passive; lifecycle hooks arm only after the initial world settles.")
 print("[SpeedMod] Quest/map travel uses an extended post-load guard; ClientRestart uses tick-safe quarantine.")
 
 --========================================================--
---     TERRAIN RUNNER v7.16 - MOD STACK COMPATIBILITY   --
+--     TERRAIN RUNNER v7.17 - MOD STACK COMPATIBILITY   --
 --========================================================--
 -- Goals:
 --   * Preserve the transition/teleport crash protections.
@@ -245,13 +245,16 @@ local nativeJumpZVelocity = nil
 local jumpWriteSupported = nil
 local movementReadyReported = false
 local movementErrorReported = false
+local movementBaselineKey = nil
+local movementBaselineErrorReported = false
+local movementCapErrorReported = false
 local jumpReadySignature = nil
 local jumpIdentityErrorReported = false
 local jumpBaselineErrorReported = false
 local heroWaitingReported = false
 local disabledStateReported = false
 local boostReadyReported = false
-local learnedJogCap = nil
+local nativeJogCap = nil
 local clockErrorReported = false
 
 local extraMultiplier = 0.0
@@ -389,6 +392,8 @@ local function isValidObj(obj)
     return ok and valid == true
 end
 
+local readNumber
+
 local function resolveMovementComponent(hero)
     local resolved, component = pcall(function()
         return hero:GetMovementComponent()
@@ -396,6 +401,94 @@ local function resolveMovementComponent(hero)
     if resolved and isValidObj(component) then return component, nil end
     if not resolved then return nil, tostring(component) end
     return nil, "GetMovementComponent returned an invalid component"
+end
+
+local function resolveCanonicalMovementBaseline(hero, movement)
+    local resolved, identityOrError, baseline = pcall(function()
+        local movementIdentity = movement:GetFullName()
+        if type(movementIdentity) ~= "string" or movementIdentity == "" then
+            error("live CharacterMovement identity is unavailable")
+        end
+
+        local heroClass = hero:GetClass()
+        if not isValidObj(heroClass) then
+            error("hero class is unavailable")
+        end
+
+        local heroCDO = heroClass:GetCDO()
+        if not isValidObj(heroCDO) then
+            error("hero class default object is unavailable")
+        end
+
+        local defaultMovement = heroCDO.CharacterMovement
+        if not isValidObj(defaultMovement) then
+            error("hero CDO CharacterMovement is unavailable")
+        end
+
+        local liveClass = movement:GetClass()
+        local defaultClass = defaultMovement:GetClass()
+        if not isValidObj(liveClass) or not isValidObj(defaultClass) then
+            error("movement component class identity is unavailable")
+        end
+
+        local liveClassName = liveClass:GetFullName()
+        local defaultClassName = defaultClass:GetFullName()
+        if type(liveClassName) ~= "string"
+            or type(defaultClassName) ~= "string"
+            or liveClassName ~= defaultClassName then
+            error("live movement class does not match the hero CDO")
+        end
+
+        local maxWalkSpeed = readNumber(defaultMovement, "MaxWalkSpeed")
+        if maxWalkSpeed == nil or maxWalkSpeed <= 0.0 then
+            error("hero CDO MaxWalkSpeed is unavailable")
+        end
+
+        return movementIdentity, maxWalkSpeed
+    end)
+
+    if not resolved then
+        return nil, nil, tostring(identityOrError)
+    end
+    return identityOrError, baseline, nil
+end
+
+local function bindCanonicalMovementBaseline(hero, movement)
+    local identityOk, currentIdentity = pcall(function()
+        return movement:GetFullName()
+    end)
+    if identityOk
+        and type(currentIdentity) == "string"
+        and currentIdentity ~= ""
+        and movementBaselineKey == currentIdentity
+        and nativeJogCap ~= nil then
+        return true
+    end
+
+    local movementIdentity, baseline, baselineError =
+        resolveCanonicalMovementBaseline(hero, movement)
+    if movementIdentity == nil or baseline == nil then
+        movementBaselineKey = nil
+        nativeJogCap = nil
+        if not movementBaselineErrorReported then
+            movementBaselineErrorReported = true
+            warn("MOVEMENT BASELINE ERROR | horizontal boost is fail-closed: "
+                .. tostring(baselineError))
+        end
+        return false
+    end
+
+    movementBaselineErrorReported = false
+    movementBaselineKey = movementIdentity
+    nativeJogCap = baseline
+    if not movementReadyReported then
+        movementReadyReported = true
+        warn(string.format(
+            "MOVEMENT READY | canonical CDO jog=%.2f",
+            nativeJogCap
+        ))
+    end
+    return true
 end
 
 local function acceptHero(hero)
@@ -450,7 +543,7 @@ local function resolveHero()
     return cachedHero
 end
 
-local function readNumber(object, propertyName)
+readNumber = function(object, propertyName)
     if object == nil then
         return nil
     end
@@ -870,9 +963,12 @@ local function resetState()
     clearJumpTracking()
     movementReadyReported = false
     movementErrorReported = false
+    movementBaselineKey = nil
+    movementBaselineErrorReported = false
+    movementCapErrorReported = false
     heroWaitingReported = false
     boostReadyReported = false
-    learnedJogCap = nil
+    nativeJogCap = nil
     clockErrorReported = false
 
     extraMultiplier = 0.0
@@ -997,32 +1093,19 @@ local function beginTravel(reason)
     end)
 end
 
-local function learnNativeJog(movement)
-    local currentCap = readNumber(movement, "MaxWalkSpeed")
-
-    if currentCap and currentCap > 0 then
-        if learnedJogCap == nil or currentCap < learnedJogCap then
-            learnedJogCap = currentCap
-            log("Learned native jog cap: " .. tostring(learnedJogCap))
-        end
-    end
-
-    return currentCap
-end
-
 local function detectNativeSprint(currentCap, horizontalSpeed)
     if horizontalSpeed < MIN_MOVING_SPEED then
         return false, "not moving"
     end
 
-    if learnedJogCap == nil or currentCap == nil then
+    if nativeJogCap == nil or currentCap == nil then
         return false, "movement cap unavailable"
     end
 
     local ratio = wasSprinting and
         SPRINT_CAP_HOLD_RATIO or SPRINT_CAP_ENTER_RATIO
 
-    if currentCap > (learnedJogCap * ratio) then
+    if currentCap > (nativeJogCap * ratio) then
         return true, wasSprinting and
             "movement-cap hold" or "movement cap"
     end
@@ -1110,10 +1193,10 @@ local function clampReferenceSpeed(speed)
         return nil
     end
 
-    if learnedJogCap and learnedJogCap > 0 then
+    if nativeJogCap and nativeJogCap > 0 then
         return math.min(
             speed,
-            learnedJogCap * MAX_REFERENCE_TO_JOG_RATIO
+            nativeJogCap * MAX_REFERENCE_TO_JOG_RATIO
         )
     end
 
@@ -1311,14 +1394,20 @@ local function tick(stepMs)
         return
     end
     movementErrorReported = false
-    if not movementReadyReported then
-        movementReadyReported = true
-        warn("MOVEMENT READY | GetMovementComponent resolved")
-    end
-
     -- Jump height is independent of the sprint boost and remains active during
     -- combat lock. It is still restored when the Speed mod itself is disabled.
     applyJumpHeight(hero, movement)
+
+    -- Horizontal sprint detection is bound to the concrete hero CDO, never to
+    -- the first live MaxWalkSpeed sample. A checkpoint may resume while Sprint
+    -- is already held; learning that live value would misclassify the sprint
+    -- cap as the jog baseline and permanently suppress the boost.
+    if not bindCanonicalMovementBaseline(hero, movement) then
+        clearAcceleration()
+        lastClockSeconds = nil
+        nextPollMs = LOADING_POLL_MS
+        return
+    end
 
     local combatSignal, combatReason = getCombatEngagementSignal(hero)
 
@@ -1452,14 +1541,26 @@ local function tick(stepMs)
     end
     local measuredStepMs = measuredDt * 1000.0
 
-    local currentCap = learnNativeJog(movement)
+    local currentCap = readNumber(movement, "MaxWalkSpeed")
+    if currentCap == nil or currentCap <= 0.0 then
+        if not movementCapErrorReported then
+            movementCapErrorReported = true
+            warn("MOVEMENT CAP ERROR | live MaxWalkSpeed is unavailable; "
+                .. "horizontal boost is fail-closed")
+        end
+        clearAcceleration()
+        lastClockSeconds = nil
+        nextPollMs = LOADING_POLL_MS
+        return
+    end
+    movementCapErrorReported = false
 
     local sprintSignal, detector =
         detectNativeSprint(currentCap, horizontalSpeed)
 
     local sprinting = sprintSignal
     local hardJogRelease = false
-    local jogReference = learnedJogCap
+    local jogReference = nativeJogCap
 
     if wasSprinting and
        jogReference and jogReference > 0 and
@@ -1591,7 +1692,7 @@ local function tick(stepMs)
         log(
             "speed=" .. string.format("%.1f", horizontalSpeed) ..
             " cap=" .. tostring(currentCap) ..
-            " jogCap=" .. tostring(learnedJogCap) ..
+            " jogCap=" .. tostring(nativeJogCap) ..
             " sprint=" .. tostring(sprinting) ..
             " detector=" .. detector ..
             " dropoutMs=" .. string.format("%.0f", sprintDropoutMs) ..
@@ -1704,9 +1805,16 @@ requireLifecycleHook(
 requireLifecycleHook(
     "/Script/ROD.RODPlayerState:ServerDecideFastTravel",
     function()
-        beginTravel("ServerDecideFastTravel")
+        -- Checkpoint fast travel repositions the existing world and does not
+        -- necessarily emit ClientRestart. Treating it as world replacement
+        -- left mapLeaving latched forever and disabled only the horizontal
+        -- injector while the previously written jump value appeared healthy.
+        beginQuietOnly(
+            "ServerDecideFastTravel(same-world)",
+            QUEST_QUIET_SEC
+        )
     end,
-    "ServerDecideFastTravel"
+    "ServerDecideFastTravel(same-world)"
 )
 
 requireLifecycleHook(

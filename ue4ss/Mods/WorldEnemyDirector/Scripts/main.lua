@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.4.2"
+local MOD_VERSION = "1.4.3"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -390,7 +390,7 @@ local function beginRestartSettle()
     ))
 end
 
-local function beginQuestTeleportSettle()
+local function beginSameWorldSettle(reason)
     if awaitingTravelRestart and worldPaused and resumeAtMs == nil then return end
     worldPaused = true
     local requestedResumeAtMs = elapsedMs + QUEST_TELEPORT_SETTLE_MS
@@ -398,9 +398,14 @@ local function beginQuestTeleportSettle()
         resumeAtMs = requestedResumeAtMs
     end
     log(string.format(
-        "WORLD QUARANTINE | ServerNotifyQuestTeleportOut | retained states and waiting %d seconds",
+        "WORLD QUARANTINE | %s | retained states and waiting %d seconds",
+        tostring(reason),
         QUEST_TELEPORT_SETTLE_MS / 1000
     ))
+end
+
+local function beginQuestTeleportSettle()
+    beginSameWorldSettle("ServerNotifyQuestTeleportOut")
 end
 
 local function resolveMaterialApi()
@@ -1895,13 +1900,19 @@ for _, travelHook in ipairs({
     { "/Script/ROD.RODGameState:QuestEnd", "QuestEnd" },
     { "/Script/ROD.RODGameState:ShowQuestResult", "GameState.ShowQuestResult" },
     { "/Script/ROD.RODPlayerState:ServerDecideTown", "ServerDecideTown" },
-    { "/Script/ROD.RODPlayerState:ServerDecideFastTravel", "ServerDecideFastTravel" },
     { "/Script/ROD.RODPlayerState:ServerShowQuestResult", "ServerShowQuestResult" },
 }) do
     local hookPath = travelHook[1]
     local hookLabel = travelHook[2]
     requireHook(hookPath, function() beginTravel(hookLabel) end)
 end
+
+requireHook(
+    "/Script/ROD.RODPlayerState:ServerDecideFastTravel",
+    function()
+        beginSameWorldSettle("ServerDecideFastTravel(same-world)")
+    end
+)
 
 requireHook(
     "/Script/ROD.RODPlayerState:ServerNotifyQuestTeleportOut",
