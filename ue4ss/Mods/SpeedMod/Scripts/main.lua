@@ -1,9 +1,9 @@
-print("[SpeedMod] Loading TERRAIN RUNNER v7.11 - RESTART QUARANTINE + QUEST LOAD GUARD / SIMPLE CONFIG...")
+print("[SpeedMod] Loading TERRAIN RUNNER v7.12 - LIVE JUMP HEIGHT + STRICT CONFIG...")
 print("[SpeedMod] Startup is passive; lifecycle hooks arm only after the initial world settles.")
 print("[SpeedMod] Quest/map travel uses an extended post-load guard; ClientRestart uses tick-safe quarantine.")
 
 --========================================================--
---     TERRAIN RUNNER v7.8 - MOD STACK COMPATIBILITY    --
+--     TERRAIN RUNNER v7.12 - MOD STACK COMPATIBILITY   --
 --========================================================--
 -- Goals:
 --   * Preserve the transition/teleport crash protections.
@@ -43,22 +43,34 @@ local RESTART_QUARANTINE_SEC = 10.0
 --                  EXTERNAL CONFIG LOADER                --
 --========================================================--
 -- Players only need to edit config.lua beside this main.lua.
--- Missing, broken, or unsafe settings fall back to the defaults below.
-local DEFAULT_SPEED_CONFIG = {
+-- This exact file is the canonical configuration source. Invalid or missing
+-- settings disable the mod explicitly instead of selecting substitute values.
+local BASE_SPEED_CONFIG = {
     ENABLED = true,
-    START_MULTIPLIER = 1.40,
-    MAX_MULTIPLIER = 3.20,
-    RAMP_SECONDS = 1.80,
+    START_SPEED = 1.40,
+    MAX_SPEED = 3.20,
+    SECONDS_TO_MAX_SPEED = 1.80,
+    JUMP_HEIGHT_MULTIPLIER = 1.00,
     DISABLE_IN_COMBAT = true,
 }
 
 local CONFIG = {
-    ENABLED = DEFAULT_SPEED_CONFIG.ENABLED,
-    START_MULTIPLIER = DEFAULT_SPEED_CONFIG.START_MULTIPLIER,
-    MAX_MULTIPLIER = DEFAULT_SPEED_CONFIG.MAX_MULTIPLIER,
-    RAMP_SECONDS = DEFAULT_SPEED_CONFIG.RAMP_SECONDS,
-    DISABLE_IN_COMBAT = DEFAULT_SPEED_CONFIG.DISABLE_IN_COMBAT,
+    ENABLED = BASE_SPEED_CONFIG.ENABLED,
+    START_SPEED = BASE_SPEED_CONFIG.START_SPEED,
+    MAX_SPEED = BASE_SPEED_CONFIG.MAX_SPEED,
+    SECONDS_TO_MAX_SPEED = BASE_SPEED_CONFIG.SECONDS_TO_MAX_SPEED,
+    JUMP_HEIGHT_MULTIPLIER = BASE_SPEED_CONFIG.JUMP_HEIGHT_MULTIPLIER,
+    DISABLE_IN_COMBAT = BASE_SPEED_CONFIG.DISABLE_IN_COMBAT,
 }
+
+local SAFE_MIN_START = 1.00
+local SAFE_MAX_START = 2.50
+local SAFE_MIN_MAX = 1.00
+local SAFE_MAX_MAX = 4.50
+local SAFE_MIN_RAMP_SECONDS = 0.25
+local SAFE_MAX_RAMP_SECONDS = 10.00
+local SAFE_MIN_JUMP_HEIGHT = 0.25
+local SAFE_MAX_JUMP_HEIGHT = 4.00
 
 local function getScriptDirectory()
     if debug == nil or type(debug.getinfo) ~= "function" then
@@ -83,78 +95,95 @@ end
 
 local function applyExternalConfig(external)
     if type(external) ~= "table" then
-        return false
+        return false, "config.lua must return a table"
     end
 
-    if external.ENABLED ~= nil then
-        CONFIG.ENABLED = external.ENABLED ~= false
+    if type(external.ENABLED) ~= "boolean" then
+        return false, "ENABLED must be boolean"
+    end
+    if type(external.DISABLE_IN_COMBAT) ~= "boolean" then
+        return false, "DISABLE_IN_COMBAT must be boolean"
     end
 
-    CONFIG.START_MULTIPLIER =
-        external.START_SPEED or
-        external.START_MULTIPLIER or
-        CONFIG.START_MULTIPLIER
-
-    CONFIG.MAX_MULTIPLIER =
-        external.MAX_SPEED or
-        external.MAX_MULTIPLIER or
-        CONFIG.MAX_MULTIPLIER
-
-    CONFIG.RAMP_SECONDS =
-        external.SECONDS_TO_MAX_SPEED or
-        external.RAMP_SECONDS or
-        CONFIG.RAMP_SECONDS
-
-    if external.DISABLE_IN_COMBAT ~= nil then
-        CONFIG.DISABLE_IN_COMBAT = external.DISABLE_IN_COMBAT ~= false
+    local function boundedNumber(key, minimum, maximum)
+        local value = external[key]
+        if type(value) ~= "number" or value ~= value
+            or value == math.huge or value == -math.huge then
+            return nil, key .. " must be a finite number"
+        end
+        if value < minimum or value > maximum then
+            return nil, string.format(
+                "%s must be between %.2f and %.2f",
+                key,
+                minimum,
+                maximum
+            )
+        end
+        return value, nil
     end
 
+    local startSpeed, startError =
+        boundedNumber("START_SPEED", SAFE_MIN_START, SAFE_MAX_START)
+    if startSpeed == nil then return false, startError end
+
+    local maxSpeed, maxError =
+        boundedNumber("MAX_SPEED", SAFE_MIN_MAX, SAFE_MAX_MAX)
+    if maxSpeed == nil then return false, maxError end
+    if maxSpeed < startSpeed then
+        return false, "MAX_SPEED must be greater than or equal to START_SPEED"
+    end
+
+    local rampSeconds, rampError = boundedNumber(
+        "SECONDS_TO_MAX_SPEED",
+        SAFE_MIN_RAMP_SECONDS,
+        SAFE_MAX_RAMP_SECONDS
+    )
+    if rampSeconds == nil then return false, rampError end
+
+    local jumpHeight, jumpError = boundedNumber(
+        "JUMP_HEIGHT_MULTIPLIER",
+        SAFE_MIN_JUMP_HEIGHT,
+        SAFE_MAX_JUMP_HEIGHT
+    )
+    if jumpHeight == nil then return false, jumpError end
+
+    -- Commit only after every field is valid, so a broken live edit cannot
+    -- partially mutate movement state.
+    CONFIG.ENABLED = external.ENABLED
+    CONFIG.START_SPEED = startSpeed
+    CONFIG.MAX_SPEED = maxSpeed
+    CONFIG.SECONDS_TO_MAX_SPEED = rampSeconds
+    CONFIG.JUMP_HEIGHT_MULTIPLIER = jumpHeight
+    CONFIG.DISABLE_IN_COMBAT = external.DISABLE_IN_COMBAT
     return true
 end
 
 local function loadExternalConfig()
-    local candidates = {}
     local scriptDirectory = getScriptDirectory()
-
-    if scriptDirectory ~= nil then
-        candidates[#candidates + 1] = scriptDirectory .. "config.lua"
+    if type(scriptDirectory) ~= "string" or scriptDirectory == "" then
+        CONFIG.ENABLED = false
+        print("[SpeedMod] CONFIG ERROR | script directory unavailable; mod disabled")
+        return false
     end
 
-    -- UE4SS normally uses its root folder as the working directory.
-    candidates[#candidates + 1] = "Mods/SpeedMod/Scripts/config.lua"
-    candidates[#candidates + 1] = "Mods\\SpeedMod\\Scripts\\config.lua"
-    candidates[#candidates + 1] = "config.lua"
-
-    local attempted = {}
-    local lastError = nil
-
-    for _, path in ipairs(candidates) do
-        if not attempted[path] then
-            attempted[path] = true
-
-            local ok, result = pcall(function()
-                return dofile(path)
-            end)
-
-            if ok and applyExternalConfig(result) then
-                print("[SpeedMod] CONFIG FILE | loaded " .. tostring(path))
-                return true
-            elseif not ok then
-                lastError = result
-            end
-        end
+    local path = scriptDirectory .. "config.lua"
+    local loaded, external = pcall(function() return dofile(path) end)
+    if not loaded then
+        CONFIG.ENABLED = false
+        print("[SpeedMod] CONFIG ERROR | " .. tostring(external) .. " | mod disabled")
+        return false
     end
 
-    print("[SpeedMod] CONFIG FILE | using safe defaults (config.lua not loaded)")
-    return false
+    local applied, configError = applyExternalConfig(external)
+    if not applied then
+        CONFIG.ENABLED = false
+        print("[SpeedMod] CONFIG ERROR | " .. tostring(configError) .. " | mod disabled")
+        return false
+    end
+
+    print("[SpeedMod] CONFIG FILE | loaded " .. tostring(path))
+    return true
 end
-
-local SAFE_MIN_START = 1.00
-local SAFE_MAX_START = 2.50
-local SAFE_MIN_MAX = 1.00
-local SAFE_MAX_MAX = 4.50
-local SAFE_MIN_RAMP_SECONDS = 0.25
-local SAFE_MAX_RAMP_SECONDS = 10.00
 
 -- Derived internal values. Do not edit these.
 local INITIAL_EXTRA_MULTIPLIER = 0.40
@@ -200,6 +229,9 @@ local MIN_INPUT_ACCELERATION = 10.0
 local DEBUG_LOGS = false
 
 local cachedHero = nil
+local jumpMovement = nil
+local nativeJumpZVelocity = nil
+local jumpWriteSupported = nil
 local learnedJogCap = nil
 local learnedJogVelocity = nil
 local fallbackCalibrationMs = 0
@@ -268,40 +300,9 @@ local function clamp(value, minimum, maximum)
 end
 
 local function applySpeedConfig()
-    local startMultiplier = tonumber(CONFIG.START_MULTIPLIER) or
-        DEFAULT_SPEED_CONFIG.START_MULTIPLIER
-    local maxMultiplier = tonumber(CONFIG.MAX_MULTIPLIER) or
-        DEFAULT_SPEED_CONFIG.MAX_MULTIPLIER
-    local rampSeconds = tonumber(CONFIG.RAMP_SECONDS) or
-        DEFAULT_SPEED_CONFIG.RAMP_SECONDS
-
-    startMultiplier = clamp(
-        startMultiplier,
-        SAFE_MIN_START,
-        SAFE_MAX_START
-    )
-    maxMultiplier = clamp(
-        maxMultiplier,
-        SAFE_MIN_MAX,
-        SAFE_MAX_MAX
-    )
-
-    -- Never allow the acceleration target to be below the launch speed.
-    if maxMultiplier < startMultiplier then
-        maxMultiplier = startMultiplier
-    end
-
-    rampSeconds = clamp(
-        rampSeconds,
-        SAFE_MIN_RAMP_SECONDS,
-        SAFE_MAX_RAMP_SECONDS
-    )
-
-    CONFIG.START_MULTIPLIER = startMultiplier
-    CONFIG.MAX_MULTIPLIER = maxMultiplier
-    CONFIG.RAMP_SECONDS = rampSeconds
-    CONFIG.ENABLED = CONFIG.ENABLED ~= false
-    CONFIG.DISABLE_IN_COMBAT = CONFIG.DISABLE_IN_COMBAT ~= false
+    local startMultiplier = CONFIG.START_SPEED
+    local maxMultiplier = CONFIG.MAX_SPEED
+    local rampSeconds = CONFIG.SECONDS_TO_MAX_SPEED
 
     INITIAL_EXTRA_MULTIPLIER = math.max(0.0, startMultiplier - 1.0)
     MAX_EXTRA_MULTIPLIER = math.max(
@@ -321,11 +322,12 @@ end
 
 local function speedConfigSummary()
     return string.format(
-        "enabled=%s | start=%.2fx | max=%.2fx | ramp=%.2fs | combatLock=%s",
+        "enabled=%s | start=%.2fx | max=%.2fx | ramp=%.2fs | jumpHeight=%.2fx | combatLock=%s",
         CONFIG.ENABLED and "true" or "false",
-        CONFIG.START_MULTIPLIER,
-        CONFIG.MAX_MULTIPLIER,
-        CONFIG.RAMP_SECONDS,
+        CONFIG.START_SPEED,
+        CONFIG.MAX_SPEED,
+        CONFIG.SECONDS_TO_MAX_SPEED,
+        CONFIG.JUMP_HEIGHT_MULTIPLIER,
         CONFIG.DISABLE_IN_COMBAT and "true" or "false"
     )
 end
@@ -373,33 +375,11 @@ local function isValidObj(obj)
     return ok and valid == true
 end
 
--- `hero.CharacterMovement` yields a UFunction rather than the component on this
--- game build, so the working accessor is discovered instead of assumed. Built
--- once at load and the winner remembered: this is called from a 16ms poll, where
--- allocating a fresh closure table per tick would be pure churn.
-local MOVEMENT_ACCESSORS = {
-    function(character) return character:GetCharacterMovement() end,
-    function(character) return character.CharacterMovement end,
-    function(character) return character:GetMovementComponent() end,
-    function(character) return character.MovementComponent end,
-}
-local movementAccessorIndex = nil
-
 local function resolveMovementComponent(hero)
-    if movementAccessorIndex ~= nil then
-        local ok, component = pcall(MOVEMENT_ACCESSORS[movementAccessorIndex], hero)
-        if ok and isValidObj(component) then return component end
-        -- The remembered accessor stopped working; fall back to rediscovery.
-        movementAccessorIndex = nil
-    end
-
-    for index = 1, #MOVEMENT_ACCESSORS do
-        local ok, component = pcall(MOVEMENT_ACCESSORS[index], hero)
-        if ok and isValidObj(component) then
-            movementAccessorIndex = index
-            return component
-        end
-    end
+    local resolved, component = pcall(function()
+        return hero:GetCharacterMovement()
+    end)
+    if resolved and isValidObj(component) then return component end
     return nil
 end
 
@@ -500,6 +480,113 @@ local function readBool(object, propertyName)
     end
 
     return nil
+end
+
+local function clearJumpTracking()
+    jumpMovement = nil
+    nativeJumpZVelocity = nil
+    jumpWriteSupported = nil
+end
+
+local function restoreJumpVelocity()
+    if not isValidObj(jumpMovement) or nativeJumpZVelocity == nil then
+        clearJumpTracking()
+        return true
+    end
+
+    local restored, restoreError = pcall(function()
+        jumpMovement.JumpZVelocity = nativeJumpZVelocity
+    end)
+    if not restored then
+        warn("JUMP HEIGHT ERROR | could not restore JumpZVelocity: " ..
+            tostring(restoreError))
+        clearJumpTracking()
+        return false
+    end
+
+    local restoredVelocity = readNumber(jumpMovement, "JumpZVelocity")
+    if restoredVelocity == nil
+        or math.abs(restoredVelocity - nativeJumpZVelocity) > 0.01 then
+        warn("JUMP HEIGHT ERROR | native JumpZVelocity restore was rejected")
+        clearJumpTracking()
+        return false
+    end
+
+    clearJumpTracking()
+    return true
+end
+
+-- CharacterMovement.JumpZVelocity is the canonical Unreal vertical launch
+-- property. Ballistic apex height is proportional to velocity squared, so the
+-- square root converts a requested height multiplier into launch velocity.
+local function applyJumpHeight(movement)
+    if not isValidObj(movement) then return false end
+
+    if jumpMovement ~= movement then
+        if not restoreJumpVelocity() then return false end
+        jumpMovement = movement
+        nativeJumpZVelocity = readNumber(movement, "JumpZVelocity")
+        jumpWriteSupported = nil
+
+        if nativeJumpZVelocity == nil or nativeJumpZVelocity <= 0.0 then
+            jumpWriteSupported = false
+            warn("JUMP HEIGHT ERROR | CharacterMovement.JumpZVelocity is unavailable")
+            return false
+        end
+    end
+
+    if jumpWriteSupported == false then return false end
+
+    local targetVelocity =
+        nativeJumpZVelocity * math.sqrt(CONFIG.JUMP_HEIGHT_MULTIPLIER)
+    local currentVelocity = readNumber(movement, "JumpZVelocity")
+    if currentVelocity ~= nil
+        and math.abs(currentVelocity - targetVelocity) <= 0.01 then
+        jumpWriteSupported = true
+        return true
+    end
+
+    local written, writeError = pcall(function()
+        movement.JumpZVelocity = targetVelocity
+    end)
+    if not written then
+        jumpWriteSupported = false
+        warn("JUMP HEIGHT ERROR | could not write JumpZVelocity: " ..
+            tostring(writeError))
+        return false
+    end
+
+    local verifiedVelocity = readNumber(movement, "JumpZVelocity")
+    if verifiedVelocity == nil
+        or math.abs(verifiedVelocity - targetVelocity) > 0.01 then
+        jumpWriteSupported = false
+        warn("JUMP HEIGHT ERROR | JumpZVelocity write was rejected")
+        return false
+    end
+
+    jumpWriteSupported = true
+    return true
+end
+
+local function applyLiveJumpSetting()
+    if not CONFIG.ENABLED then
+        restoreJumpVelocity()
+        return
+    end
+
+    local hero = resolveHero()
+    if not isValidObj(hero) then
+        warn("JUMP HEIGHT ERROR | hero is unavailable")
+        return
+    end
+
+    local movement = resolveMovementComponent(hero)
+    if not isValidObj(movement) then
+        warn("JUMP HEIGHT ERROR | CharacterMovement is unavailable")
+        return
+    end
+
+    applyJumpHeight(movement)
 end
 
 -- Combat lock intentionally ignores generic "current target" proximity.
@@ -684,6 +771,9 @@ end
 
 local function resetState()
     cachedHero = nil
+    -- World teardown owns the old movement component. Discard its reference;
+    -- writing into a component being destroyed is unsafe.
+    clearJumpTracking()
     learnedJogCap = nil
     learnedJogVelocity = nil
     fallbackCalibrationMs = 0
@@ -1175,6 +1265,7 @@ local function tick(stepMs)
     end
 
     if not CONFIG.ENABLED then
+        restoreJumpVelocity()
         clearAcceleration()
         lastClockSeconds = nil
         nextPollMs = IDLE_TICK_MS
@@ -1212,6 +1303,18 @@ local function tick(stepMs)
         lastClockSeconds = nil
         return
     end
+
+    local movement = resolveMovementComponent(hero)
+    if not isValidObj(movement) then
+        cachedHero = nil
+        clearAcceleration()
+        lastClockSeconds = nil
+        return
+    end
+
+    -- Jump height is independent of the sprint boost and remains active during
+    -- combat lock. It is still restored when the Speed mod itself is disabled.
+    applyJumpHeight(movement)
 
     local combatSignal, combatReason = getCombatEngagementSignal(hero)
 
@@ -1267,15 +1370,6 @@ local function tick(stepMs)
         end
 
         combatExitMs = 0
-    end
-
-    local movement = resolveMovementComponent(hero)
-
-    if not isValidObj(movement) then
-        cachedHero = nil
-        clearAcceleration()
-        lastClockSeconds = nil
-        return
     end
 
     -- MOVE_None is generally used while movement is disabled or while the
@@ -1780,59 +1874,56 @@ end
 --                RUNTIME SETTINGS BRIDGE                 --
 --========================================================--
 -- Lets the in-game Mods menu change these values without a restart. The bridge
--- hands over the merged config.lua + runtime.lua table and this mod's existing
--- loader validates it, so a value arriving from the menu is clamped by exactly
--- the same rules as one typed into config.lua.
+-- hands over the merged config.lua + runtime.lua table. The same strict
+-- validator is used for startup and live changes.
 do
     local function loadModMenuBridge()
-        local required, bridge = pcall(require, "ModMenuBridge")
-        if required and type(bridge) == "table" then return bridge end
-
-        local candidates = {}
         local directory = getScriptDirectory()
-        if directory ~= nil then
-            candidates[#candidates + 1] = directory .. "../../shared/ModMenuBridge.lua"
+        if type(directory) ~= "string" or directory == "" then
+            return nil, "script directory unavailable"
         end
-        candidates[#candidates + 1] = "Mods/shared/ModMenuBridge.lua"
-        candidates[#candidates + 1] = "Mods\\shared\\ModMenuBridge.lua"
 
-        for _, path in ipairs(candidates) do
-            local ok, result = pcall(function() return dofile(path) end)
-            if ok and type(result) == "table" then return result end
+        local path = directory .. "../../shared/ModMenuBridge.lua"
+        local loaded, result = pcall(function() return dofile(path) end)
+        if not loaded then
+            return nil, tostring(result)
         end
-        return nil
+        if type(result) ~= "table" then
+            return nil, "canonical ModMenuBridge did not return a table"
+        end
+        return result, nil
     end
 
-    local bridge = loadModMenuBridge()
+    local bridge, bridgeError = loadModMenuBridge()
     if bridge ~= nil then
-        bridge.attach({
+        local attachment = bridge.attach({
             modName = "SpeedMod",
             scriptDir = getScriptDirectory(),
-            load = function(external) applyExternalConfig(external) end,
+            load = function(external)
+                local applied, configError = applyExternalConfig(external)
+                if not applied then
+                    CONFIG.ENABLED = false
+                    error(configError)
+                end
+            end,
             apply = function()
                 applySpeedConfig()
                 -- A live ramp built from the old multipliers would otherwise keep
                 -- pushing the player at the previous speed until sprint ends.
                 resetLiveAcceleration()
+                applyLiveJumpSetting()
             end,
             log = function(message) print("[SpeedMod] " .. tostring(message) .. "\n") end,
         })
+        if attachment == nil then
+            CONFIG.ENABLED = false
+            warn("ModMenuBridge attach failed; SpeedMod disabled")
+        end
     else
-        print("[SpeedMod] ModMenuBridge unavailable; settings apply on restart only\n")
+        CONFIG.ENABLED = false
+        warn("ModMenuBridge unavailable; SpeedMod disabled: " ..
+            tostring(bridgeError))
     end
-end
-
-local function updateConfigValue(fieldName, rawValue, ar)
-    local value = tonumber(rawValue)
-    if value == nil then
-        consoleReply(ar, "That setting requires a number.")
-        return
-    end
-
-    CONFIG[fieldName] = value
-    applySpeedConfig()
-    resetLiveAcceleration()
-    consoleReply(ar, "CONFIG UPDATED | " .. speedConfigSummary())
 end
 
 local function runSpeedModCommand(params, ar)
@@ -1844,53 +1935,10 @@ local function runSpeedModCommand(params, ar)
 
     if subcommand == nil or subcommand == "show" or subcommand == "status" then
         consoleReply(ar, "CONFIG | " .. speedConfigSummary())
-        consoleReply(ar, "Commands: speedmod start <x> | max <x> | ramp <sec> | on | off | reset")
         return
     end
 
-    if subcommand == "start" then
-        updateConfigValue("START_MULTIPLIER", params[2], ar)
-        return
-    end
-
-    if subcommand == "max" then
-        updateConfigValue("MAX_MULTIPLIER", params[2], ar)
-        return
-    end
-
-    if subcommand == "ramp" then
-        updateConfigValue("RAMP_SECONDS", params[2], ar)
-        return
-    end
-
-    if subcommand == "on" then
-        CONFIG.ENABLED = true
-        applySpeedConfig()
-        resetLiveAcceleration()
-        consoleReply(ar, "ENABLED | " .. speedConfigSummary())
-        return
-    end
-
-    if subcommand == "off" then
-        CONFIG.ENABLED = false
-        resetLiveAcceleration()
-        consoleReply(ar, "DISABLED | native movement only")
-        return
-    end
-
-    if subcommand == "reset" then
-        CONFIG.ENABLED = DEFAULT_SPEED_CONFIG.ENABLED
-        CONFIG.START_MULTIPLIER = DEFAULT_SPEED_CONFIG.START_MULTIPLIER
-        CONFIG.MAX_MULTIPLIER = DEFAULT_SPEED_CONFIG.MAX_MULTIPLIER
-        CONFIG.RAMP_SECONDS = DEFAULT_SPEED_CONFIG.RAMP_SECONDS
-        CONFIG.DISABLE_IN_COMBAT = DEFAULT_SPEED_CONFIG.DISABLE_IN_COMBAT
-        applySpeedConfig()
-        resetLiveAcceleration()
-        consoleReply(ar, "DEFAULTS RESTORED | " .. speedConfigSummary())
-        return
-    end
-
-    consoleReply(ar, "Unknown command. Use: speedmod show")
+    consoleReply(ar, "Read-only command. Use: speedmod show")
 end
 
 local commandOk, commandError = pcall(function()

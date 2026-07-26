@@ -1,8 +1,8 @@
--- FieldEquipmentMenu v1.14.4
+-- FieldEquipmentMenu v1.14.5
 -- Add a native-styled Equipment entry to Echoes of Aincrad's start menu.
 
 local MOD_NAME = "FieldEquipmentMenu"
-local MOD_VERSION = "v1.14.4"
+local MOD_VERSION = "v1.14.5"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -238,10 +238,8 @@ local function safeValue(callback)
 end
 
 local function resolveLocalController()
-    for _, className in ipairs({ "RODInGamePlayerController", "PlayerController" }) do
-        local controller = FindFirstOf(className)
-        if isValidObject(controller) then return controller end
-    end
+    local controller = FindFirstOf("RODInGamePlayerController")
+    if isValidObject(controller) then return controller end
     return nil
 end
 
@@ -1056,10 +1054,9 @@ end
 local function focusMenuIcon(context, icon, index)
     if context == nil or not isValidObject(icon) then return end
     mainMenuFocusIndexes[context.listKey] = index
-    -- CurrentIndex addresses only the authored Item_0..Item_6 array. A foreign
-    -- injected row can sit beyond it, so keep that position in the logical
-    -- tracker without writing an invalid native cursor.
-    if type(index) == "number" and index >= 0 and index < MAX_NATIVE_MENU_ITEMS then
+    -- CurrentIndex addresses only the active authored rows. Equipment itself
+    -- begins at nativeCount, even if a hidden compiled Item_6 still exists.
+    if type(index) == "number" and index >= 0 and index < context.nativeCount then
         pcall(function() context.mainList.CurrentIndex = index end)
     end
     pcall(function() icon["Set Current Animation"](icon) end)
@@ -1813,6 +1810,14 @@ safeHook("/Script/ROD.RODListWidgetBase:FocusEvent",
         mainMenuFocusIndexes[listKey] = index
         local context = activeEquipmentContext
         if context ~= nil and context.listKey ~= listKey then context = nil end
+        local isInjectedEquipment = equipmentContextFor(widget) == context
+        if context ~= nil and isInjectedEquipment then
+            -- Another injected row may own the transition into Equipment, but
+            -- Equipment remains the sole owner of its label, texture and
+            -- selected animation. Reassert presentation without moving focus
+            -- again, which avoids a cross-mod focus loop.
+            restoreEquipmentEntryPresentation(context)
+        end
         if context ~= nil
             and index >= 0 and index < context.equipmentIndex then
             -- Equipment lives outside the native list's animation
@@ -1827,7 +1832,6 @@ safeHook("/Script/ROD.RODListWidgetBase:FocusEvent",
         -- After Logout is removed visually, the compiled native list can still
         -- focus its now-hidden old index before wrapping. Treat any native focus
         -- at or beyond the live count as the Equipment boundary too.
-        local isInjectedEquipment = equipmentContextFor(widget) == context
         -- A row belonging to another mod also reports an index at or beyond
         -- Equipment's. Claiming it as a stale native row would yank focus back
         -- out of that mod's entry the moment it is selected.

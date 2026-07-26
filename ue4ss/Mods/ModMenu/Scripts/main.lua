@@ -1,4 +1,4 @@
--- ModMenu v1.1.1
+-- ModMenu v1.2
 -- Adds a native-styled "Mods" entry to Echoes of Aincrad's start menu, opening a
 -- panel that enables/disables the other mods and retunes their values in-game.
 --
@@ -12,7 +12,7 @@
 -- mod's Lua state, because UE4SS gives each mod its own.
 
 local MOD_NAME = "ModMenu"
-local MOD_VERSION = "v1.1.1"
+local MOD_VERSION = "v1.2"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -61,6 +61,7 @@ local logButtons = false
 
 local injectedMenus = {}
 local activeContext = nil
+local menuCloseBusy = false
 
 -- Assigned further down, called the first time a Mods row is actually injected.
 -- Nothing this mod hooks is useful before a start menu exists, so the input
@@ -179,10 +180,8 @@ end
 --========================================================--
 
 local function resolveLocalController()
-    for _, className in ipairs({ "RODInGamePlayerController", "PlayerController" }) do
-        local controller = FindFirstOf(className)
-        if isValid(controller) then return controller end
-    end
+    local controller = FindFirstOf("RODInGamePlayerController")
+    if isValid(controller) then return controller end
     return nil
 end
 
@@ -192,6 +191,10 @@ end
 
 local function resolveTextLibrary()
     return StaticFindObject("/Script/Engine.Default__KismetTextLibrary")
+end
+
+local function resolveRodLibrary()
+    return StaticFindObject("/Script/ROD.Default__RODWidgetBPFunctionLibrary")
 end
 
 panel.init({
@@ -570,6 +573,7 @@ local function injectModsEntry(mainMenu)
         wrapperPanel = wrapperPanel,
         wrapperParent = parent,
     }
+    menuCloseBusy = false
     if not applyIconLetter(activeContext) then
         pcall(function() wrapperPanel:RemoveFromParent() end)
         injectedMenus[menuKey] = false
@@ -612,14 +616,16 @@ end
 
 local function focusIcon(context, icon, index)
     if context == nil or not isValid(icon) then return end
-    -- CurrentIndex is the native list's own cursor into Item_0..Item_6. The Mods
-    -- row sits past the end of that array, so writing its index there points the
-    -- game's own code at a row that does not exist. Only ever write a value the
-    -- native array can actually hold; the row's highlight comes from the widget
-    -- calls below, not from this cursor.
-    if type(index) == "number" and index >= 0 and index < MAX_NATIVE_MENU_ITEMS then
+    -- CurrentIndex is the cursor into the currently active authored rows, not
+    -- every compiled Item_0..Item_6 slot. Equipment starts at nativeCount and
+    -- Mods follows it, so neither custom index may enter the native cursor.
+    if type(index) == "number" and index >= 0 and index < context.nativeCount then
         pcall(function() context.mainList.CurrentIndex = index end)
     end
+    pcall(function() icon:SetInactive(false) end)
+    pcall(function() icon:SetBlank(false) end)
+    pcall(function() icon:SetInputEnable(true) end)
+    pcall(function() icon:BP_SetInputInteractionEnable(true) end)
     pcall(function() icon["Set Current Animation"](icon) end)
     pcall(function() icon:BP_SetInputWidgetFocus() end)
     pcall(function() icon:SetFocus() end)
@@ -768,8 +774,11 @@ local function onGameThread(action)
         return
     end
 
-    local scheduled = pcall(function() ExecuteInGameThread(action) end)
-    if not scheduled then action() end
+    local scheduled, dispatchError =
+        pcall(function() ExecuteInGameThread(action) end)
+    if not scheduled then
+        log("game-thread dispatch failed: " .. tostring(dispatchError))
+    end
 end
 
 local function buildPanelNow()
@@ -824,6 +833,29 @@ local function closePanel()
             pcall(focusMods, activeContext)
         end
         dbg("panel closed")
+    end)
+end
+
+local function closeMainMenuFromMods()
+    if menuCloseBusy then return end
+    menuCloseBusy = true
+
+    onGameThread(function()
+        local controller = resolveLocalController()
+        local rodLibrary = resolveRodLibrary()
+        if not isValid(controller) or not isValid(rodLibrary) then
+            log("cannot close start menu from Mods: UI context is unavailable")
+            menuCloseBusy = false
+            return
+        end
+
+        local ended, endError = pcall(function()
+            rodLibrary:EndMenu(controller)
+        end)
+        if not ended then
+            log("could not close start menu from Mods: " .. tostring(endError))
+            menuCloseBusy = false
+        end
     end)
 end
 
@@ -900,7 +932,9 @@ local function handleButton(widgetParameter, buttonParameter)
             openPanel()
         elseif button == BACK_BUTTON then
             consumeButton(buttonParameter)
-            clearModsSelection(activeContext)
+            -- Match Equipment's proven close path: leave the native input hook
+            -- before EndMenu tears down the widget that originated this event.
+            ExecuteWithDelay(0, closeMainMenuFromMods)
         elseif button == DPAD_UP or button == LSTICK_UP then
             consumeButton(buttonParameter)
             -- Mods owns both of its boundaries. Depending on another mod's hook
@@ -1094,6 +1128,7 @@ ensureInputHooks = function()
     safeHook("/Script/ROD.RODWidgetBPFunctionLibrary:EndMenu", function()
         if panel.isOpen() then closePanel() end
         activeContext = nil
+        menuCloseBusy = false
     end)
 
     log("input hooks installed")
