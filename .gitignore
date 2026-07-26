@@ -1,0 +1,35 @@
+# This is the game's binary directory. Almost nothing in it belongs in version
+# control — the shipping exe alone is ~370 MB. The only thing worth tracking
+# here is the UE4SS mod source under ue4ss/Mods.
+
+# Ignore everything at the top level...
+/*
+# ...except this file and the UE4SS tree.
+!/.gitignore
+!/ue4ss/
+
+# Inside ue4ss, keep the settings file and the mods. UE4SS itself is a
+# redistributable you reinstall, not something to commit.
+/ue4ss/*
+!/ue4ss/UE4SS-settings.ini
+!/ue4ss/Mods/
+
+# Mods that ship with UE4SS rather than being written here.
+/ue4ss/Mods/BPML_GenericFunctions/
+/ue4ss/Mods/BPModLoaderMod/
+/ue4ss/Mods/Keybinds/
+
+# Shared libraries that ship with UE4SS. ModMenuBridge.lua is ours, so it is
+# deliberately not listed and stays tracked.
+/ue4ss/Mods/shared/Types.lua
+/ue4ss/Mods/shared/UEHelpers/
+/ue4ss/Mods/shared/jsbProfiler/
+
+# Written by the in-game Mods menu. Per-machine state, not source: config.lua
+# holds the defaults worth committing, runtime.lua is whatever you last set.
+/ue4ss/Mods/*/Scripts/runtime.lua
+
+# Logs and dumps produced at runtime.
+*.log
+/ue4ss/*.txt
+/ue4ss/Mods/**/dumps/

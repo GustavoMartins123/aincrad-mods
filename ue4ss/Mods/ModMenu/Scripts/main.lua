@@ -116,13 +116,19 @@ local function loadModMenuBridge()
     return nil
 end
 
+-- Printed before anything can fail, so an empty console proves the mod was never
+-- loaded at all rather than loaded and aborted.
+print(string.format("[%s] main.lua entered | script dir: %s\n", MOD_NAME, SCRIPT_DIR))
+
 local bridge = loadModMenuBridge()
 local registry = loadLocalModule("registry")
 local store = loadLocalModule("store")
 local panel = loadLocalModule("panel")
 
 if bridge == nil or registry == nil or store == nil or panel == nil then
-    log("startup aborted: a required module is missing")
+    log(string.format("startup aborted | bridge=%s registry=%s store=%s panel=%s",
+        tostring(bridge ~= nil), tostring(registry ~= nil),
+        tostring(store ~= nil), tostring(panel ~= nil)))
     return
 end
 
@@ -304,10 +310,17 @@ local function attachIconWithNativeWrapper(umgLibrary, controller, parent, icon)
 end
 
 local function injectModsEntry(mainMenu)
-    if not CONFIG.ENABLED then return end
-    if not isValid(mainMenu) then return end
+    if not CONFIG.ENABLED then
+        log("injection skipped: disabled in config.lua")
+        return
+    end
+    if not isValid(mainMenu) then
+        log("injection skipped: the start menu went away before injection ran")
+        return
+    end
     local menuKey = objectName(mainMenu)
     if injectedMenus[menuKey] ~= nil then return end
+    log("injecting into " .. menuKey)
 
     local controller = resolveLocalController()
     local umgLibrary = resolveUmgLibrary()
@@ -612,6 +625,9 @@ end
 local notifyOk, notifyError = pcall(function()
     NotifyOnNewObject("/Script/ROD.RODConsoleMainMenuWidgetBase", function(object)
         local mainMenu = unwrap(object)
+        -- Logged unconditionally: if the start menu never reaches this callback,
+        -- the problem is the notification, not the injection below it.
+        log("start-menu candidate constructed: " .. objectName(mainMenu))
         if not contains(objectName(mainMenu), "WBP_Console_MainMenu_C") then return end
 
         -- Deliberately later than FieldEquipmentMenu's 100ms: whichever rows
