@@ -161,9 +161,13 @@ end
 
 local function describeValue(row)
     if row.kind == "mod" then
+        -- UE4SS decides whether a mod runs at all, from enabled.txt. That is the
+        -- state worth showing on the header; the mod's own ENABLED setting is
+        -- just one of its settings and lives in the expanded list.
+        local loaded = store.isModEnabled(row.entry.mod)
+        if loaded ~= nil then return loaded and "ON" or "OFF" end
         if row.enabledSetting == nil then return "" end
-        local value = store.valueOf(row.effective, row.enabledSetting)
-        return value and "ON" or "OFF"
+        return store.valueOf(row.effective, row.enabledSetting) and "ON" or "OFF"
     end
 
     local setting = row.setting
@@ -550,6 +554,25 @@ end
 
 local function toggleBool(row)
     if row.kind == "mod" then
+        -- Flip both halves of "enabled": enabled.txt is what UE4SS reads at
+        -- launch, and the mod's own ENABLED is what it honours while running.
+        -- Writing only one of them would leave the two disagreeing.
+        local loaded = store.isModEnabled(row.entry.mod)
+        if loaded ~= nil then
+            local wanted = not loaded
+            local ok, err = store.setModEnabled(row.entry.mod, wanted)
+            if not ok then
+                log("could not switch " .. row.entry.mod .. ": " .. tostring(err))
+                return false
+            end
+            if row.enabledSetting ~= nil then
+                store.setValue(row.entry.mod, row.enabledSetting.key, wanted)
+            end
+            buildRows()
+            Panel.render()
+            return true
+        end
+
         if row.enabledSetting == nil then return false end
         local current = store.valueOf(row.effective, row.enabledSetting)
         return commit(row.entry, row.enabledSetting.key, not current)

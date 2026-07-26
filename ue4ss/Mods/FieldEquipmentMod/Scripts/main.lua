@@ -1142,8 +1142,18 @@ end
 
 local function focusRailRow(context, row, index)
     if context == nil or row == nil or not isValidObject(row.icon) then return false end
-    -- Equipment sits outside the native animation array, so nothing else will
-    -- clear its selection art when focus moves to a foreign row.
+
+    -- Every authored row has to be reset, not just Equipment. Handing focus to a
+    -- row that lives outside the native animation array leaves whichever native
+    -- row was selected still lit, so two entries appear selected at once.
+    for nativeIndex = 0, context.nativeCount - 1 do
+        pcall(function()
+            context.mainList["Item_" .. tostring(nativeIndex)]:SetDefaultAnimation()
+        end)
+    end
+
+    -- Equipment sits outside that array too, so nothing else will clear its
+    -- selection art either.
     pcall(function() context.equipmentIcon:SetDefaultAnimation() end)
     pcall(function() applyEquipmentIconTexture(context.equipmentIcon) end)
     focusMenuIcon(context, row.icon, index)
@@ -1552,6 +1562,19 @@ local function handleBridgedButton(widgetParameter, buttonParameter)
         recoverEquipmentAfterNativeBack(activeEquipmentContext)
         -- Do not consume this input: the native submenu must still perform its
         -- own authored Back transition before we restore the injected entry.
+        return
+    end
+
+    -- A row another mod appended below Equipment. Only the upward boundary is
+    -- claimed here: that mod owns its own row, but focusing Equipment properly
+    -- means clearing every native row and restoring Equipment's own art and
+    -- label, which cannot be done well from another mod's Lua state. Doing it
+    -- from outside left Equipment looking deselected.
+    if activeEquipmentContext ~= nil
+        and isForeignRailIcon(activeEquipmentContext, widget)
+        and (button == DPAD_UP or button == LSTICK_UP) then
+        consumeButton(buttonParameter)
+        focusEquipment(activeEquipmentContext)
         return
     end
 

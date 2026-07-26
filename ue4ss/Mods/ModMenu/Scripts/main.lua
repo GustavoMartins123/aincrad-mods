@@ -36,13 +36,12 @@ local DPAD_UP = 13
 local DPAD_DOWN = 14
 local LSTICK_UP = 17
 local LSTICK_DOWN = 18
--- Inferred from the pattern above; the game's own code only ever needed the
--- vertical ones, so these have not been observed directly. `modmenu buttons`
--- logs every code the panel receives so they can be corrected from one session.
-local DPAD_LEFT = 15
-local DPAD_RIGHT = 16
-local LSTICK_LEFT = 19
-local LSTICK_RIGHT = 20
+-- There are deliberately no horizontal button codes here. They were once
+-- inferred from the pattern above (15/16/19/20) and the guess was wrong: it
+-- drove values the opposite way, so left raised a setting and right lowered it.
+-- Left/right now come from the UE4SS keybinds instead, whose codes are exact
+-- Windows virtual-key values. Every code the panel receives is logged, so the
+-- real horizontal ones can be read off a session and filled in properly.
 
 local VISIBLE = 0
 local COLLAPSED = 1
@@ -57,6 +56,12 @@ end)()
 local CONFIG = {
     ENABLED = true,
     DEBUG_LOGS = false,
+    -- A letter drawn over the row instead of borrowed art. The placeholder
+    -- texture this row used is the same one Equipment uses, and guessing at
+    -- another asset path is what caused a crash earlier. A TextBlock needs no
+    -- asset to exist. Set ICON_LETTER to "" to fall back to ICON_ASSET.
+    ICON_LETTER = "M",
+    ICON_LETTER_OFFSET = { X = 20.0, Y = 12.0 },
     ICON_ASSET = DEFAULT_ICON_ASSET,
     ICON_TINT = { R = 1.00, G = 1.00, B = 1.00, A = 1.00 },
 }
@@ -65,6 +70,14 @@ local logButtons = false
 local injectedMenus = {}
 local activeContext = nil
 local menuIconTexture = nil
+
+-- The menu instance seen by the construction notification, held until injection
+-- actually succeeds. UE4SS's shared game-thread hook has been observed dying
+-- mid-session ("Ref was not function ... removing hook!"), which silently kills
+-- ExecuteInGameThread for every mod. Injection therefore cannot rely on it: the
+-- input hooks below run on the game thread by nature and retry this.
+local pendingMenu = nil
+local tryInjectPending
 
 -- Assigned further down, called the first time a Mods row is actually injected.
 -- Nothing this mod hooks is useful before a start menu exists, so the input
@@ -77,6 +90,8 @@ local ensureInputHooks
 -- into "enter the Mods row" instead.
 local listFocusIndexes = {}
 local pendingFocusRedirects = {}
+-- Reported once per panel session rather than once per frame.
+local warnedFocusWhilePanelOpen = false
 
 local function log(message)
     print(string.format("[%s] %s\n", MOD_NAME, tostring(message)))
@@ -161,6 +176,15 @@ do
         if type(external.ICON_ASSET) == "string" and external.ICON_ASSET ~= "" then
             CONFIG.ICON_ASSET = external.ICON_ASSET
         end
+        if type(external.ICON_LETTER) == "string" then
+            CONFIG.ICON_LETTER = external.ICON_LETTER
+        end
+        if type(external.ICON_LETTER_OFFSET) == "table" then
+            for _, axis in ipairs({ "X", "Y" }) do
+                local value = tonumber(external.ICON_LETTER_OFFSET[axis])
+                if value ~= nil then CONFIG.ICON_LETTER_OFFSET[axis] = value end
+            end
+        end
         if type(external.ICON_TINT) == "table" then
             for _, channel in ipairs({ "R", "G", "B", "A" }) do
                 local value = tonumber(external.ICON_TINT[channel])
@@ -211,6 +235,11 @@ local function texturePathsFor(asset)
 end
 
 local function applyMenuIconTexture(icon)
+    -- In letter mode the art is hidden behind a TextBlock, so there is nothing
+    -- worth painting and nothing worth reasserting on the guard timers.
+    if type(CONFIG.ICON_LETTER) == "string" and CONFIG.ICON_LETTER ~= "" then
+        return false
+    end
     if not isValid(icon) or not isValid(icon.IconImage) then return false end
 
     local asset = CONFIG.ICON_ASSET or DEFAULT_ICON_ASSET
@@ -319,6 +348,119 @@ local function countForeignInjectedRows(parent, mainList, nativeCount)
     return foreign
 end
 
+-- Draws a letter over the row instead of relying on a texture.
+--
+-- The wrapper the row lives in is a CanvasPanel (it is what accepted the icon in
+-- the first place), so a TextBlock can go straight on top of it. This needs no
+-- asset path to be correct, which is the whole point: the row shared Equipment's
+-- placeholder art, and guessing at a different asset is what crashed the game.
+local function applyIconLetter(context)
+    local letter = CONFIG.ICON_LETTER
+    if type(letter) ~= "string" or letter == "" then return false end
+    if context == nil or not isValid(context.wrapperPanel) or not isValid(context.icon) then
+        return false
+    end
+
+    local class = StaticFindObject("/Script/UMG.TextBlock")
+    if not isValid(class) then
+        log("cannot draw the icon letter: TextBlock class unavailable")
+        return false
+    end
+
+    local label = nil
+    pcall(function() label = StaticConstructObject(class, context.icon) end)
+    if not isValid(label) then
+        log("cannot draw the icon letter: TextBlock construction failed")
+        return false
+    end
+
+    pcall(function() label:SetText(FText(letter)) end)
+    -- Borrow the row's own label styling so the letter matches the menu's font.
+    pcall(function() label:SetFont(context.icon.MenuName.Font) end)
+    pcall(function()
+        label:SetColorAndOpacity({ SpecifiedColor = CONFIG.ICON_TINT, ColorUseRule = 0 })
+    end)
+
+    local slot = nil
+    pcall(function() slot = context.wrapperPanel:AddChildToCanvas(label) end)
+    if not isValid(slot) then
+        log("cannot draw the icon letter: the row wrapper rejected it")
+        return false
+    end
+
+    local offset = CONFIG.ICON_LETTER_OFFSET or { X = 20.0, Y = 12.0 }
+    pcall(function() slot:SetAutoSize(true) end)
+    pcall(function() slot:SetPosition({ X = offset.X, Y = offset.Y }) end)
+    pcall(function() slot:SetZOrder(30) end)
+    pcall(function() label:SetVisibility(VISIBLE) end)
+    pcall(function() label:SetRenderOpacity(1.0) end)
+
+    -- The borrowed art would otherwise sit behind the letter.
+    pcall(function() context.icon.IconImage:SetVisibility(HIDDEN) end)
+
+    context.letterWidget = label
+    log("row icon replaced with the letter " .. letter)
+    return true
+end
+
+-- Keeps the Mods row last on the rail and its item index honest.
+--
+-- The index used to be computed once at injection and then trusted forever,
+-- which breaks the moment another mod appends its own row afterwards: Mods stops
+-- being the final entry and its cached index points at someone else's row. Mods
+-- is a menu about the other mods, so it belongs at the bottom no matter what
+-- order anything loaded in. This re-reads the live tree, moves the row back to
+-- the end if something slipped in below it, and recomputes the index from what
+-- is actually there.
+local function refreshRailPosition(context)
+    if context == nil then return end
+    local parent = context.wrapperParent
+    local wrapper = context.wrapperPanel
+    if not isValid(parent) or not isValid(wrapper) then return end
+
+    local count = nil
+    pcall(function() count = parent:GetChildrenCount() end)
+    if type(count) ~= "number" or count <= 0 then return end
+
+    local wrapperKey = objectName(wrapper)
+    local ownPosition, lastRowPosition = nil, nil
+    for index = 0, count - 1 do
+        local child = nil
+        pcall(function() child = parent:GetChildAt(index) end)
+        if isValid(child) and iconInsideWrapper(child) ~= nil then
+            lastRowPosition = index
+            if objectName(child) == wrapperKey then ownPosition = index end
+        end
+    end
+    if ownPosition == nil then return end
+
+    if lastRowPosition ~= ownPosition then
+        -- Something was appended below. Detach and re-append to reclaim the end.
+        local moved = pcall(function()
+            wrapper:RemoveFromParent()
+            parent:AddChildToVerticalBox(wrapper)
+        end)
+        if moved then
+            pcall(function() wrapper:SetVisibility(VISIBLE) end)
+            pcall(function() wrapper:ForceLayoutPrepass() end)
+            log("another mod appended a row below Mods; moved Mods back to the end")
+        end
+    end
+
+    -- countForeignInjectedRows counts every injected row including this one, so
+    -- the others are one fewer.
+    local injected = countForeignInjectedRows(parent, context.mainList, context.nativeCount)
+    local others = math.max(0, injected - 1)
+    local index = context.nativeCount + others
+    if index ~= context.modsIndex or others ~= context.foreignRows then
+        context.modsIndex = index
+        context.foreignRows = others
+        pcall(function() context.icon:SetItemIndex(index) end)
+        dbg(string.format("rail position refreshed: index %d (%d native, %d other injected)",
+            index, context.nativeCount, others))
+    end
+end
+
 -- The native list owns the only wrapper geometry that lays a row out correctly,
 -- so a throwaway list is created purely to donate its final row's CanvasPanel.
 local function attachIconWithNativeWrapper(umgLibrary, controller, parent, icon)
@@ -363,7 +505,10 @@ local function injectModsEntry(mainMenu)
         return
     end
     local menuKey = objectName(mainMenu)
-    if injectedMenus[menuKey] ~= nil then return end
+    if injectedMenus[menuKey] ~= nil then
+        dbg("already injected into " .. menuKey)
+        return
+    end
 
     -- FieldEquipmentMenu builds a display-only clone of the main-menu widget when
     -- Equipment opens, and that construction fires this mod's notification too.
@@ -479,8 +624,11 @@ local function injectModsEntry(mainMenu)
     log(string.format("added Mods entry at index %d (%d native rows, %d row(s) from other mods, list at %s)",
         modsIndex, nativeCount, foreignRows, tostring(startingIndex)))
 
+    pcall(applyIconLetter, activeContext)
     -- Only now is there anything for the input hooks to act on.
     if ensureInputHooks ~= nil then pcall(ensureInputHooks) end
+    -- Another mod may have injected between the count above and the attach.
+    pcall(refreshRailPosition, activeContext)
 
     -- The native open animation can repaint the final authored row, so reapply
     -- the Mods brush once it settles.
@@ -492,6 +640,23 @@ local function injectModsEntry(mainMenu)
     end
     ExecuteWithDelay(250, guardIcon)
     ExecuteWithDelay(850, guardIcon)
+end
+
+-- Safe to call from any game-thread callback, as often as you like: it does
+-- nothing once the row is in.
+tryInjectPending = function()
+    local menu = pendingMenu
+    if menu == nil then return end
+    if not isValid(menu) then
+        pendingMenu = nil
+        return
+    end
+    if injectedMenus[objectName(menu)] ~= nil then
+        pendingMenu = nil
+        return
+    end
+    injectModsEntry(menu)
+    if injectedMenus[objectName(menu)] ~= nil then pendingMenu = nil end
 end
 
 --========================================================--
@@ -567,6 +732,45 @@ local function focusFirstNative(context)
     focusIcon(context, context.firstItem, 0)
 end
 
+-- Direction input never reaches this mod's button hooks: the native list handles
+-- arrows internally and only announces the result through FocusEvent, so there
+-- is nothing to consume. The only way to stop the menu underneath from moving
+-- while the panel is up is to switch its input off at the widgets themselves.
+-- UE4SS keybinds are outside the game's input system, so the panel still reacts.
+local function setNativeMenuInputEnabled(context, enabled)
+    if context == nil then return end
+
+    -- Deliberately excludes this mod's own row. Switching everything off stops
+    -- the menu underneath from moving, but it also cut the only route controller
+    -- input had into this mod: a gamepad reaches widgets, not UE4SS keybinds, so
+    -- with every widget deaf the panel only answered to the keyboard. The Mods
+    -- row holds focus while the panel is up, so leaving it listening is what
+    -- keeps a controller working.
+    local targets = {}
+    if isValid(context.mainList) then targets[#targets + 1] = context.mainList end
+    for index = 0, context.nativeCount - 1 do
+        local item = nil
+        pcall(function() item = context.mainList["Item_" .. tostring(index)] end)
+        if isValid(item) then targets[#targets + 1] = item end
+    end
+
+    local applied = 0
+    for _, target in ipairs(targets) do
+        local ok = false
+        if pcall(function() target:SetInputEnable(enabled) end) then ok = true end
+        if pcall(function() target:BP_SetInputInteractionEnable(enabled) end) then ok = true end
+        if ok then applied = applied + 1 end
+    end
+
+    if isValid(context.icon) then
+        pcall(function() context.icon:SetInputEnable(true) end)
+        pcall(function() context.icon:BP_SetInputInteractionEnable(true) end)
+    end
+
+    dbg(string.format("native menu input %s on %d/%d widget(s); Mods row kept live",
+        enabled and "enabled" or "disabled", applied, #targets))
+end
+
 local function isModsIcon(widget)
     if activeContext == nil or not isValid(widget) then return false end
     return objectName(widget) == activeContext.iconKey
@@ -581,6 +785,18 @@ end
 -- runs on the async thread — doing engine work from there is the other classic
 -- way to earn an access violation.
 local function onGameThread(action)
+    -- Almost every caller here arrives from a RegisterHook callback, which is
+    -- already the game thread. Going through ExecuteInGameThread from there was
+    -- worse than pointless: when UE4SS has torn down its shared game-thread hook
+    -- the work is queued and never runs, and the pcall still reports success
+    -- because queuing itself did not fail. Run directly whenever possible.
+    local inGameThread = false
+    pcall(function() inGameThread = IsInGameThread() == true end)
+    if inGameThread then
+        action()
+        return
+    end
+
     local scheduled = pcall(function() ExecuteInGameThread(action) end)
     if not scheduled then action() end
 end
@@ -604,6 +820,11 @@ local function buildPanelNow()
         log("panel could not be opened; use the 'modmenu' console command instead")
         return
     end
+
+    -- Only after the panel is really up, so a failed build never leaves the
+    -- start menu unable to take input.
+    setNativeMenuInputEnabled(context, false)
+    warnedFocusWhilePanelOpen = false
     dbg("panel opened")
 end
 
@@ -621,7 +842,10 @@ local function closePanel()
     if not panel.isOpen() then return end
     onGameThread(function()
         pcall(panel.close)
-        if activeContext ~= nil then pcall(focusMods, activeContext) end
+        if activeContext ~= nil then
+            setNativeMenuInputEnabled(activeContext, true)
+            pcall(focusMods, activeContext)
+        end
         dbg("panel closed")
     end)
 end
@@ -644,23 +868,24 @@ end
 local function routeToPanel(button)
     if not panel.isOpen() then return false end
 
-    if logButtons then log("panel received button code " .. tostring(button)) end
+    if logButtons or CONFIG.DEBUG_LOGS then
+        log("panel received button code " .. tostring(button))
+    end
 
-    withInputLock(function()
-        if button == DPAD_UP or button == LSTICK_UP then
-            panel.move(-1)
-        elseif button == DPAD_DOWN or button == LSTICK_DOWN then
-            panel.move(1)
-        elseif button == DPAD_LEFT or button == LSTICK_LEFT then
-            panel.adjust(-1)
-        elseif button == DPAD_RIGHT or button == LSTICK_RIGHT then
-            panel.adjust(1)
-        elseif button == ACCEPT_BUTTON then
-            panel.activate()
-        elseif button == BACK_BUTTON then
-            closePanel()
-        end
-    end)
+    local action = nil
+    if button == DPAD_UP or button == LSTICK_UP then
+        action = function() panel.move(-1) end
+    elseif button == DPAD_DOWN or button == LSTICK_DOWN then
+        action = function() panel.move(1) end
+    elseif button == ACCEPT_BUTTON then
+        action = function() panel.activate() end
+    elseif button == BACK_BUTTON then
+        action = function() closePanel() end
+    end
+
+    -- Taking the shared input lock for a button that maps to nothing would
+    -- block the keybind carrying the same press from acting on it.
+    if action ~= nil then withInputLock(action) end
 
     -- Every button is swallowed while the panel is up, whether or not the lock
     -- let it through, otherwise the start menu underneath keeps reacting to
@@ -677,6 +902,10 @@ local function consumeButton(buttonParameter)
 end
 
 local function handleButton(widgetParameter, buttonParameter)
+    -- Runs on the game thread, so this is also where injection lands when the
+    -- scheduled attempts never fired.
+    pcall(tryInjectPending)
+
     local widget = unwrap(widgetParameter)
     local button = unwrap(buttonParameter)
 
@@ -691,11 +920,15 @@ local function handleButton(widgetParameter, buttonParameter)
     if isModsIcon(widget) then
         if button == ACCEPT_BUTTON then
             consumeButton(buttonParameter)
-            ExecuteWithDelay(0, openPanel)
+            openPanel()
         elseif button == BACK_BUTTON then
             consumeButton(buttonParameter)
             clearModsSelection(activeContext)
         elseif button == DPAD_UP or button == LSTICK_UP then
+            -- When another mod owns the row directly above, let it focus its own
+            -- row. It knows how to restore its art and label and which native
+            -- rows to clear; doing that from here left its row deselected.
+            if activeContext ~= nil and activeContext.foreignRows > 0 then return end
             consumeButton(buttonParameter)
             -- Locked for the same reason the panel is: this row's navigation is
             -- reached through several hooks that all fire for one press.
@@ -748,9 +981,24 @@ local notifyOk, notifyError = pcall(function()
         -- Deliberately later than FieldEquipmentMenu's 100ms: whichever rows
         -- other mods add must already be in the VerticalBox when this one counts
         -- them, so that the Mods entry lands underneath with the right index.
-        ExecuteWithDelay(400, function()
-            ExecuteInGameThread(function() injectModsEntry(mainMenu) end)
-        end)
+        --
+        pendingMenu = mainMenu
+
+        -- The input hooks go in now rather than after injection. They run on the
+        -- game thread by nature, so they double as the fallback that performs
+        -- the injection when ExecuteInGameThread is dead — which happens
+        -- whenever UE4SS tears down its shared game-thread hook. Worst case the
+        -- row appears on the first key pressed in the menu instead of instantly.
+        if ensureInputHooks ~= nil then pcall(ensureInputHooks) end
+
+        -- The fast path, when the game-thread scheduler is healthy. Retried
+        -- because a single missed attempt would otherwise lose the row;
+        -- injectModsEntry is idempotent per menu instance.
+        for _, delay in ipairs({ 400, 1200, 2500 }) do
+            ExecuteWithDelay(delay, function()
+                ExecuteInGameThread(function() tryInjectPending() end)
+            end)
+        end
     end)
 end)
 if not notifyOk then
@@ -792,10 +1040,42 @@ ensureInputHooks = function()
     -- row sits outside the native animation array, so nothing else deselects it.
     safeHook("/Script/ROD.RODListWidgetBase:FocusEvent",
         function(self, widgetParameter)
+            -- Same fallback as handleButton: this fires the moment the menu
+            -- takes focus, which is the earliest reliable game-thread moment
+            -- after it is built.
+            pcall(tryInjectPending)
+
             local context = activeContext
             local listKey = objectName(unwrap(self))
-            if context == nil or panel.isOpen() then
+
+            -- Cheap: a walk over a handful of children. Catches a mod that
+            -- injected its row after this one did.
+            if context ~= nil and not panel.isOpen() then
+                pcall(refreshRailPosition, context)
+            end
+
+            if context == nil then
                 pendingFocusRedirects[listKey] = nil
+                return
+            end
+
+            -- While the panel is up, watch and report — never correct.
+            --
+            -- This used to pull focus back to the Mods row, which fed itself:
+            -- re-focusing moved the focus, that raised this event again on the
+            -- next frame, and the pair looped for as long as the panel stayed
+            -- open, logging every frame. A re-entrancy flag did not help,
+            -- because the repeat arrives a frame later with the flag already
+            -- cleared. Disabling the native widgets' input is the actual fix; if
+            -- focus still moves, that fix did not take and saying so once is
+            -- worth more than fighting it.
+            if panel.isOpen() then
+                pendingFocusRedirects[listKey] = nil
+                if not warnedFocusWhilePanelOpen then
+                    warnedFocusWhilePanelOpen = true
+                    log("native focus is still moving with the panel open; " ..
+                        "the input disable did not take on this build")
+                end
                 return
             end
             if not contains(listKey, "WBP_Console_MainMenu_List_C") then return end
@@ -838,7 +1118,7 @@ ensureInputHooks = function()
         function(_, widgetParameter, buttonParameter, _)
             if isModsIcon(unwrap(widgetParameter)) then
                 consumeButton(buttonParameter)
-                ExecuteWithDelay(0, openPanel)
+                openPanel()
             end
         end)
 
@@ -846,14 +1126,14 @@ ensureInputHooks = function()
         function(_, widgetParameter, buttonParameter)
             if isModsIcon(unwrap(widgetParameter)) then
                 consumeButton(buttonParameter)
-                ExecuteWithDelay(0, openPanel)
+                openPanel()
             end
         end)
 
     -- The start menu closing must take the panel with it, or it would be left
     -- floating over the world.
     safeHook("/Script/ROD.RODWidgetBPFunctionLibrary:EndMenu", function()
-        if panel.isOpen() then ExecuteWithDelay(0, closePanel) end
+        if panel.isOpen() then closePanel() end
         activeContext = nil
     end)
 
@@ -956,10 +1236,16 @@ local function runCommand(params, reply)
             local effective = store.readEffective(entry.mod)
             local marker = entry.apply == "restart" and "  (restart)"
                 or (entry.apply == "menu" and "  (reopen menu)" or "")
+            -- Same truth the panel shows: whether UE4SS will load the mod.
+            local loaded = store.isModEnabled(entry.mod)
             local enabled = "?"
-            for _, setting in ipairs(entry.settings or {}) do
-                if setting.key == "ENABLED" then
-                    enabled = store.valueOf(effective, setting) and "ON" or "OFF"
+            if loaded ~= nil then
+                enabled = loaded and "ON" or "OFF"
+            else
+                for _, setting in ipairs(entry.settings or {}) do
+                    if setting.key == "ENABLED" then
+                        enabled = store.valueOf(effective, setting) and "ON" or "OFF"
+                    end
                 end
             end
             reply(string.format("%-18s %-3s%s", entry.mod, enabled, marker))

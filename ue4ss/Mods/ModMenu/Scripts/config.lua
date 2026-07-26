@@ -10,7 +10,14 @@ return {
     -- in UE4SS.log. Set to false once navigation is behaving.
     DEBUG_LOGS = true,
 
-    -- Texture for the Mods row icon.
+    -- Drawn over the Mods row instead of an icon texture. A TextBlock needs no
+    -- asset to exist, so this cannot fail the way a wrong asset path can.
+    -- Set to "" to use ICON_ASSET below instead.
+    ICON_LETTER = "M",
+    -- Nudge the letter if it does not sit centred on the row.
+    ICON_LETTER_OFFSET = { X = 20.0, Y = 12.0 },
+
+    -- Texture for the Mods row icon. Only used when ICON_LETTER is "".
     --
     -- To pick a different one, open the start menu and run `modmenu icons icon`
     -- in the UE4SS console — it lists the textures the game currently has

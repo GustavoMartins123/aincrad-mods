@@ -128,6 +128,45 @@ function Store.writeRuntime(modName, values)
     return writeFile(runtimePathFor(modName), Store.serialize(values))
 end
 
+--========================================================--
+--                 UE4SS LOAD STATE                       --
+--========================================================--
+-- Whether a mod is switched on is UE4SS's business, not this menu's, and UE4SS
+-- decides it from the presence of Mods/<Mod>/enabled.txt. Reading a mod's own
+-- ENABLED setting instead would report a mod as ON while UE4SS was not loading
+-- it at all, which is exactly the sort of lie a settings menu must not tell.
+
+function Store.enabledPathFor(modName)
+    local dir = Store.scriptDirFor(modName)
+    if dir == nil then return nil end
+    -- scriptDirFor points at Scripts/; enabled.txt sits beside it in the mod root.
+    return dir .. "../enabled.txt"
+end
+
+function Store.isModEnabled(modName)
+    local path = Store.enabledPathFor(modName)
+    if path == nil or bridge == nil then return nil end
+    return bridge.readFile(path) ~= nil
+end
+
+function Store.setModEnabled(modName, enabled)
+    local path = Store.enabledPathFor(modName)
+    if path == nil then return false, "no path" end
+
+    if enabled then
+        if bridge ~= nil and bridge.readFile(path) ~= nil then return true, nil end
+        return writeFile(path, "")
+    end
+
+    local removed = false
+    pcall(function() removed = os.remove(path) == true end)
+    if removed then return true, nil end
+    -- Report honestly rather than claim success: an enabled.txt that could not
+    -- be deleted means UE4SS will still load the mod next launch.
+    if bridge ~= nil and bridge.readFile(path) == nil then return true, nil end
+    return false, "could not remove enabled.txt"
+end
+
 -- Persists one changed setting, leaving every other override in place.
 function Store.setValue(modName, key, value)
     local values = Store.readRuntime(modName)

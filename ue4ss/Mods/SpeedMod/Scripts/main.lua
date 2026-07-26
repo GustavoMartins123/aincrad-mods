@@ -373,6 +373,36 @@ local function isValidObj(obj)
     return ok and valid == true
 end
 
+-- `hero.CharacterMovement` yields a UFunction rather than the component on this
+-- game build, so the working accessor is discovered instead of assumed. Built
+-- once at load and the winner remembered: this is called from a 16ms poll, where
+-- allocating a fresh closure table per tick would be pure churn.
+local MOVEMENT_ACCESSORS = {
+    function(character) return character:GetCharacterMovement() end,
+    function(character) return character.CharacterMovement end,
+    function(character) return character:GetMovementComponent() end,
+    function(character) return character.MovementComponent end,
+}
+local movementAccessorIndex = nil
+
+local function resolveMovementComponent(hero)
+    if movementAccessorIndex ~= nil then
+        local ok, component = pcall(MOVEMENT_ACCESSORS[movementAccessorIndex], hero)
+        if ok and isValidObj(component) then return component end
+        -- The remembered accessor stopped working; fall back to rediscovery.
+        movementAccessorIndex = nil
+    end
+
+    for index = 1, #MOVEMENT_ACCESSORS do
+        local ok, component = pcall(MOVEMENT_ACCESSORS[index], hero)
+        if ok and isValidObj(component) then
+            movementAccessorIndex = index
+            return component
+        end
+    end
+    return nil
+end
+
 local function acceptHero(hero)
     if not isValidObj(hero) then
         return nil
@@ -1239,22 +1269,7 @@ local function tick(stepMs)
         combatExitMs = 0
     end
 
-    -- `hero.CharacterMovement` resolves to a UFunction rather than the component
-    -- on this game build, so the accessors are tried in turn and the first one
-    -- that yields a real object wins.
-    local movement = nil
-    for _, accessor in ipairs({
-        function() return hero:GetCharacterMovement() end,
-        function() return hero.CharacterMovement end,
-        function() return hero:GetMovementComponent() end,
-        function() return hero.MovementComponent end,
-    }) do
-        local ok, candidate = pcall(accessor)
-        if ok and isValidObj(candidate) then
-            movement = candidate
-            break
-        end
-    end
+    local movement = resolveMovementComponent(hero)
 
     if not isValidObj(movement) then
         cachedHero = nil

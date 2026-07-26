@@ -252,12 +252,20 @@ function Bridge.attach(options)
     -- mod's own startup log stays the single source of truth for load-time values.
     pcall(refresh, true)
 
-    local looping = pcall(function()
-        LoopAsync(pollMs, function()
+    -- Deliberately ExecuteWithDelay recursion rather than LoopAsync. Every other
+    -- mod in this stack polls this way, and UE4SS has been seen to tear down the
+    -- shared EngineTick hook with "Ref was not function" — which silently kills
+    -- ExecuteInGameThread for every mod at once. Sticking to the callback
+    -- pattern the rest of the stack already proves out removes this library as a
+    -- suspect for that.
+    local function schedulePoll()
+        ExecuteWithDelay(pollMs, function()
             pcall(refresh, false)
-            return false
+            schedulePoll()
         end)
-    end)
+    end
+
+    local looping = pcall(schedulePoll)
     if not looping then
         logger("runtime settings watch unavailable; values apply on restart only")
     end
