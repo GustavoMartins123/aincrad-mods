@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.4.4"
+local MOD_VERSION = "1.4.5"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -512,7 +512,14 @@ local function resolveSpawnApi()
         local order = {}
         local reflectOk, reflectError = pcall(function()
             functionObject:ForEachProperty(function(property)
-                local name = property:GetFName():ToString()
+                local fullName = property:GetFullName()
+                if type(fullName) ~= "string" or fullName == "" then
+                    error("reflected parameter has no canonical full name")
+                end
+                local name = fullName:match(":([^:]+)$")
+                if name == nil or name == "" then
+                    error("malformed reflected parameter name " .. fullName)
+                end
                 if required[name] == true then
                     if found[name] == true then
                         error("duplicate reflected parameter " .. name)

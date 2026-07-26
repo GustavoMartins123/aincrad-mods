@@ -1,6 +1,5 @@
 local MOD_NAME = "ExperienceNotifications"
-local MOD_VERSION = "1.1.0"
-local DEATH_REWARD_WINDOW_MS = 2000
+local MOD_VERSION = "1.2.0"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -21,11 +20,9 @@ end
 
 local SCRIPT_DIR = scriptDir()
 local CONFIG = nil
-local nextDeathToken = 0
-local nextRewardToken = 0
-local deathWindows = {}
-local rewardWindows = {}
 local lastDisplayError = nil
+local acquisitionReadyReported = false
+local displayReadyReported = false
 
 local function log(message)
     print(string.format("[%s] %s\n", MOD_NAME, tostring(message)))
@@ -96,35 +93,10 @@ local function readHookValue(parameter, name)
     return value
 end
 
-local function removeDeathToken(token)
-    for index = #deathWindows, 1, -1 do
-        if deathWindows[index].token == token then
-            table.remove(deathWindows, index)
-            return
-        end
-    end
-end
-
-local function removeRewardToken(token)
-    for index = #rewardWindows, 1, -1 do
-        if rewardWindows[index].token == token then
-            table.remove(rewardWindows, index)
-            return
-        end
-    end
-end
-
 local displayExperience
 
-local function displayPair(death, reward)
-    dbg(string.format(
-        "REWARD PAIR | enemy=%s expected=%.0f actual=%d",
-        death.enemyKey,
-        death.expectedExperience,
-        reward.amount
-    ))
+local function queueDisplay(amount)
     ExecuteWithDelay(1, function()
-        local amount = reward.amount
         ExecuteInGameThread(function()
             local okDisplay, displayError =
                 xpcall(function() displayExperience(amount) end, debug.traceback)
@@ -134,42 +106,48 @@ local function displayPair(death, reward)
                     lastDisplayError = text
                     log("DISPLAY ERROR | " .. text)
                 end
+            elseif not displayReadyReported then
+                displayReadyReported = true
+                log("DISPLAY READY | native EXP notification displayed")
             end
         end)
     end)
 end
 
-local function queueEnemyDeath(enemyParameter)
+local function queueEnemyAcquisition(sourceParameter, acquisitionParameter)
     if CONFIG == nil or not CONFIG.ENABLED then return end
-    local enemy = readHookValue(enemyParameter, "Enemy")
-    if not isValid(enemy) then
-        error("NotifyEnemyConfirmedDeath supplied an invalid enemy")
+    local source = readHookValue(sourceParameter, "Source")
+    if not isValid(source) then
+        error("ApplyAcquisition supplied an invalid Source")
     end
 
-    local okData, enemyKey, expectedExperience = pcall(function()
-        return enemy:GetFullName(), tonumber(enemy.ExperiencePoint)
+    local okEnemy, isEnemy = pcall(function()
+        return source:IsA("/Script/ROD.RODEnemyCharacter")
     end)
-    if not okData or type(enemyKey) ~= "string" or enemyKey == ""
-        or not finiteNumber(expectedExperience) then
-        error("confirmed-death enemy reward data is unreadable")
+    if not okEnemy then
+        error("Source class validation failed: " .. tostring(isEnemy))
     end
+    if isEnemy ~= true then return end
 
-    nextDeathToken = nextDeathToken + 1
-    local token = nextDeathToken
-    local death = {
-        token = token,
-        enemyKey = enemyKey,
-        expectedExperience = expectedExperience,
-    }
-    if #rewardWindows > 0 then
-        local reward = table.remove(rewardWindows, 1)
-        displayPair(death, reward)
-        return
+    local acquisition = readHookValue(acquisitionParameter, "AcquisitionData")
+    if acquisition == nil then
+        error("ApplyAcquisition supplied no AcquisitionData")
     end
-    deathWindows[#deathWindows + 1] = death
-    ExecuteWithDelay(DEATH_REWARD_WINDOW_MS, function()
-        removeDeathToken(token)
+    local okExperience, amount = pcall(function()
+        return tonumber(acquisition.ExperiencePoint)
     end)
+    if not okExperience or not finiteNumber(amount) then
+        error("AcquisitionData.ExperiencePoint is not a finite number")
+    end
+    if amount <= 0 then return end
+    amount = math.floor(amount + 0.5)
+
+    if not acquisitionReadyReported then
+        acquisitionReadyReported = true
+        log("ACQUISITION READY | enemy EXP transaction detected")
+    end
+    dbg("ENEMY EXP | +" .. amount)
+    queueDisplay(amount)
 end
 
 local function resolveNotificationUi()
@@ -221,14 +199,6 @@ displayExperience = function(amount)
         if not isValid(messageWidget.InformationText) then
             error("event message InformationText is unavailable")
         end
-        local slot = panel:AddChild(messageWidget)
-        if not isValid(slot) then
-            error("native Information panel rejected the EXP widget")
-        end
-        addedToPanel = true
-        messageWidget:SetVisibility(0)
-        messageLog:SetVisibleStackMessage()
-        messageLog:SetMessageTimer(messageWidget)
         local expectedText = string.format("EXP +%d", amount)
         messageWidget.InformationText:SetText(FText(expectedText))
         local actualText = messageWidget.InformationText:GetText():ToString()
@@ -239,6 +209,14 @@ displayExperience = function(amount)
                 tostring(actualText)
             ))
         end
+        local slot = panel:AddChild(messageWidget)
+        if not isValid(slot) then
+            error("native Information panel rejected the EXP widget")
+        end
+        addedToPanel = true
+        messageWidget:SetVisibility(0)
+        messageLog:SetVisibleStackMessage()
+        messageLog:SetMessageTimer(messageWidget)
     end)
 
     if not ok then
@@ -249,36 +227,6 @@ displayExperience = function(amount)
     end
     lastDisplayError = nil
     dbg("DISPLAYED | EXP +" .. amount)
-end
-
-local function consumeHeroExperience(context, experienceParameter)
-    if CONFIG == nil or not CONFIG.ENABLED then return end
-    local playerState = readHookValue(context, "PlayerState")
-    if not isValid(playerState) then
-        error("CalcHeroLevelUp supplied an invalid PlayerState")
-    end
-    local okHost, isHost = pcall(function() return playerState:IsHost() end)
-    if not okHost then error("RODPlayerState:IsHost failed: " .. tostring(isHost)) end
-    if isHost ~= true then return end
-
-    local amount = tonumber(readHookValue(experienceParameter, "AddExp"))
-    if not finiteNumber(amount) or amount <= 0 then
-        error("CalcHeroLevelUp AddExp must be a positive finite number")
-    end
-    amount = math.floor(amount + 0.5)
-    local reward = { amount = amount }
-    if #deathWindows > 0 then
-        local death = table.remove(deathWindows, 1)
-        displayPair(death, reward)
-        return
-    end
-
-    nextRewardToken = nextRewardToken + 1
-    reward.token = nextRewardToken
-    rewardWindows[#rewardWindows + 1] = reward
-    ExecuteWithDelay(DEATH_REWARD_WINDOW_MS, function()
-        removeRewardToken(reward.token)
-    end)
 end
 
 local function requireHook(path, preCallback, postCallback)
@@ -296,37 +244,19 @@ local function requireHook(path, preCallback, postCallback)
 end
 
 requireHook(
-    "/Script/ROD.RODGameState:NotifyEnemyConfirmedDeath",
-    function(_, enemyParameter)
+    "/Script/ROD.RODGameState:ApplyAcquisition",
+    function(_, sourceParameter, acquisitionParameter)
         local ok, hookError = xpcall(
-            function() queueEnemyDeath(enemyParameter) end,
+            function()
+                queueEnemyAcquisition(sourceParameter, acquisitionParameter)
+            end,
             debug.traceback
         )
-        if not ok then log("DEATH HOOK ERROR | " .. tostring(hookError)) end
+        if not ok then
+            log("ACQUISITION HOOK ERROR | " .. tostring(hookError))
+        end
     end
 )
-
-requireHook(
-    "/Script/ROD.RODPlayerState:CalcHeroLevelUp",
-    function(context, experienceParameter)
-        local ok, hookError = xpcall(
-            function() consumeHeroExperience(context, experienceParameter) end,
-            debug.traceback
-        )
-        if not ok then log("REWARD HOOK ERROR | " .. tostring(hookError)) end
-    end
-)
-
-for _, path in ipairs({
-    "/Script/Engine.PlayerController:ClientTravelInternal",
-    "/Script/ROD.RODGameState:StartQuestEnd",
-    "/Script/ROD.RODGameState:QuestEnd",
-}) do
-    requireHook(path, function()
-        deathWindows = {}
-        rewardWindows = {}
-    end)
-end
 
 do
     local attachment, attachmentError = MOD_MENU_BRIDGE.attach({
@@ -335,16 +265,10 @@ do
         pollMs = 750,
         load = readSettings,
         apply = function()
-            if not CONFIG.ENABLED then
-                deathWindows = {}
-                rewardWindows = {}
-            end
             log("settings reloaded in-game")
         end,
         fail = function(reason)
             CONFIG.ENABLED = false
-            deathWindows = {}
-            rewardWindows = {}
             log("CONFIG ERROR | " .. tostring(reason) .. " | notifications disabled")
         end,
         log = log,
@@ -354,4 +278,4 @@ do
     end
 end
 
-log("READY | native EXP labels follow confirmed enemy rewards")
+log("READY | native EXP labels follow enemy acquisition transactions")

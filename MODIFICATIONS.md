@@ -497,7 +497,7 @@ menu restoration, and equipment workflow were retained.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v1.4.4
+**Current script version:** v1.4.5
 
 ### Added
 
@@ -524,6 +524,8 @@ menu restoration, and equipment workflow were retained.
 - Resolves the natural source enemy by exact object identity for native owner
   and instigator, and reflects the live `RODSpawnActor` parameter order before
   issuing the call.
+- Reads reflected parameter names from each property's canonical full name,
+  avoiding the unsupported `FName.ToString` binding in this UE4SS build.
 - Requires 50-150 cm separation from natural, pending, and owned enemies and
   uses `AdjustIfPossibleButDontSpawnIfColliding`.
 - Supplies `FRODSpawnActorOption` with server spawn, source level, `Prowl`
@@ -553,13 +555,14 @@ work, and emits one concise world fault. It is not retried every poll cycle.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v1.1.0
+**Current script version:** v1.2.0
 
 ### Added
 
 - A live ModMenu toggle for native EXP notifications.
-- Exact correlation between `NotifyEnemyConfirmedDeath` and the host player's
-  matching `CalcHeroLevelUp(AddExp)` call in either native callback order.
+- Exact observation of the single
+  `ApplyAcquisition(Source, AcquisitionData)` reward transaction, filtered to
+  enemy sources and using `AcquisitionData.ExperiencePoint` directly.
 - An `EXP +N` entry built with the game's `URODEventMessageWidget`, inserted in
   the active `URODInfoMessageLogWidget.Information` stack.
 - Native timer ownership through `SetMessageTimer`, avoiding Lua references to
@@ -570,8 +573,8 @@ work, and emits one concise world fault. It is not retried every poll cycle.
 The game's `DT_InfoMessageDataTable` contains no EXP row; `1014` and `1015` are
 explicitly stealing/collection messages. The component therefore does not
 misuse a localization row or substitute an unrelated message key. If the
-confirmed-death, reward, or active message-stack contract is unavailable, it
-reports an explicit error and does not create another overlay.
+acquisition or active message-stack contract is unavailable, it reports an
+explicit error and does not create another overlay.
 
 ## Generated and local-state files
 

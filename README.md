@@ -391,10 +391,9 @@ known limitations.
 ### Experience Notifications
 
 Experience Notifications shows `EXP +N` in the game's native side-message
-stack after a confirmed enemy death. It correlates
-`NotifyEnemyConfirmedDeath` with the host player's exact
-`CalcHeroLevelUp(AddExp)` call in either callback order, so the displayed
-number is the reward actually applied after the game's own calculations.
+stack after an enemy reward. It reads the single native
+`ApplyAcquisition(Source, AcquisitionData)` transaction, requires `Source` to
+be an enemy, and displays its exact `AcquisitionData.ExperiencePoint` value.
 
 The feature creates the game's `URODEventMessageWidget` inside the active
 `URODInfoMessageLogWidget.Information` panel and hands its lifetime to the
