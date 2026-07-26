@@ -1,6 +1,6 @@
 local MOD_NAME = "ExperienceNotifications"
-local MOD_VERSION = "1.0.0"
-local DEATH_REWARD_WINDOW_MS = 1500
+local MOD_VERSION = "1.1.0"
+local DEATH_REWARD_WINDOW_MS = 2000
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -22,7 +22,9 @@ end
 local SCRIPT_DIR = scriptDir()
 local CONFIG = nil
 local nextDeathToken = 0
+local nextRewardToken = 0
 local deathWindows = {}
+local rewardWindows = {}
 local lastDisplayError = nil
 
 local function log(message)
@@ -103,6 +105,40 @@ local function removeDeathToken(token)
     end
 end
 
+local function removeRewardToken(token)
+    for index = #rewardWindows, 1, -1 do
+        if rewardWindows[index].token == token then
+            table.remove(rewardWindows, index)
+            return
+        end
+    end
+end
+
+local displayExperience
+
+local function displayPair(death, reward)
+    dbg(string.format(
+        "REWARD PAIR | enemy=%s expected=%.0f actual=%d",
+        death.enemyKey,
+        death.expectedExperience,
+        reward.amount
+    ))
+    ExecuteWithDelay(1, function()
+        local amount = reward.amount
+        ExecuteInGameThread(function()
+            local okDisplay, displayError =
+                xpcall(function() displayExperience(amount) end, debug.traceback)
+            if not okDisplay then
+                local text = tostring(displayError)
+                if text ~= lastDisplayError then
+                    lastDisplayError = text
+                    log("DISPLAY ERROR | " .. text)
+                end
+            end
+        end)
+    end)
+end
+
 local function queueEnemyDeath(enemyParameter)
     if CONFIG == nil or not CONFIG.ENABLED then return end
     local enemy = readHookValue(enemyParameter, "Enemy")
@@ -120,11 +156,17 @@ local function queueEnemyDeath(enemyParameter)
 
     nextDeathToken = nextDeathToken + 1
     local token = nextDeathToken
-    deathWindows[#deathWindows + 1] = {
+    local death = {
         token = token,
         enemyKey = enemyKey,
         expectedExperience = expectedExperience,
     }
+    if #rewardWindows > 0 then
+        local reward = table.remove(rewardWindows, 1)
+        displayPair(death, reward)
+        return
+    end
+    deathWindows[#deathWindows + 1] = death
     ExecuteWithDelay(DEATH_REWARD_WINDOW_MS, function()
         removeDeathToken(token)
     end)
@@ -148,7 +190,7 @@ local function resolveNotificationUi()
     return messageLog, widgetLibrary, nil
 end
 
-local function displayExperience(amount)
+displayExperience = function(amount)
     local messageLog, widgetLibrary, resolveError = resolveNotificationUi()
     if messageLog == nil then error(resolveError) end
 
@@ -179,9 +221,6 @@ local function displayExperience(amount)
         if not isValid(messageWidget.InformationText) then
             error("event message InformationText is unavailable")
         end
-        messageWidget.InformationText:SetText(
-            FText(string.format("EXP +%d", amount))
-        )
         local slot = panel:AddChild(messageWidget)
         if not isValid(slot) then
             error("native Information panel rejected the EXP widget")
@@ -190,6 +229,16 @@ local function displayExperience(amount)
         messageWidget:SetVisibility(0)
         messageLog:SetVisibleStackMessage()
         messageLog:SetMessageTimer(messageWidget)
+        local expectedText = string.format("EXP +%d", amount)
+        messageWidget.InformationText:SetText(FText(expectedText))
+        local actualText = messageWidget.InformationText:GetText():ToString()
+        if actualText ~= expectedText then
+            error(string.format(
+                "native InformationText verification failed: expected=%q actual=%q",
+                expectedText,
+                tostring(actualText)
+            ))
+        end
     end)
 
     if not ok then
@@ -203,7 +252,7 @@ local function displayExperience(amount)
 end
 
 local function consumeHeroExperience(context, experienceParameter)
-    if CONFIG == nil or not CONFIG.ENABLED or #deathWindows == 0 then return end
+    if CONFIG == nil or not CONFIG.ENABLED then return end
     local playerState = readHookValue(context, "PlayerState")
     if not isValid(playerState) then
         error("CalcHeroLevelUp supplied an invalid PlayerState")
@@ -217,26 +266,18 @@ local function consumeHeroExperience(context, experienceParameter)
         error("CalcHeroLevelUp AddExp must be a positive finite number")
     end
     amount = math.floor(amount + 0.5)
-    local death = table.remove(deathWindows, 1)
-    dbg(string.format(
-        "REWARD | enemy=%s expected=%.0f actual=%d",
-        death.enemyKey,
-        death.expectedExperience,
-        amount
-    ))
+    local reward = { amount = amount }
+    if #deathWindows > 0 then
+        local death = table.remove(deathWindows, 1)
+        displayPair(death, reward)
+        return
+    end
 
-    ExecuteWithDelay(1, function()
-        ExecuteInGameThread(function()
-            local okDisplay, displayError =
-                xpcall(function() displayExperience(amount) end, debug.traceback)
-            if not okDisplay then
-                local text = tostring(displayError)
-                if text ~= lastDisplayError then
-                    lastDisplayError = text
-                    log("DISPLAY ERROR | " .. text)
-                end
-            end
-        end)
+    nextRewardToken = nextRewardToken + 1
+    reward.token = nextRewardToken
+    rewardWindows[#rewardWindows + 1] = reward
+    ExecuteWithDelay(DEATH_REWARD_WINDOW_MS, function()
+        removeRewardToken(reward.token)
     end)
 end
 
@@ -281,7 +322,10 @@ for _, path in ipairs({
     "/Script/ROD.RODGameState:StartQuestEnd",
     "/Script/ROD.RODGameState:QuestEnd",
 }) do
-    requireHook(path, function() deathWindows = {} end)
+    requireHook(path, function()
+        deathWindows = {}
+        rewardWindows = {}
+    end)
 end
 
 do
@@ -291,12 +335,16 @@ do
         pollMs = 750,
         load = readSettings,
         apply = function()
-            if not CONFIG.ENABLED then deathWindows = {} end
+            if not CONFIG.ENABLED then
+                deathWindows = {}
+                rewardWindows = {}
+            end
             log("settings reloaded in-game")
         end,
         fail = function(reason)
             CONFIG.ENABLED = false
             deathWindows = {}
+            rewardWindows = {}
             log("CONFIG ERROR | " .. tostring(reason) .. " | notifications disabled")
         end,
         log = log,

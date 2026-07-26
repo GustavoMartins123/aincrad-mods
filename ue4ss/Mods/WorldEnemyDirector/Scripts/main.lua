@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.4.0"
+local MOD_VERSION = "1.4.1"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -26,8 +26,10 @@ local QUEST_TELEPORT_SETTLE_MS = 8000
 local DISCOVERY_STABILIZE_MS = 2000
 local SETTINGS_POLL_MS = 1000
 local SPAWN_INITIALIZE_MS = 8000
-local NAV_QUERY_ATTEMPTS = 12
+local NAV_ATTEMPTS_PER_PASS = 4
+local NAV_MAX_ATTEMPTS = 36
 local NAV_MIN_SEPARATION_CM = 150.0
+local NAV_GOLDEN_ANGLE_RADIANS = 2.399963229728653
 local MAX_DISCOVERY_PER_TICK = 8
 local GAMEPLAY_MOD_ADDITIVE = 0
 local SPAWN_ON_SERVER = 0
@@ -1096,11 +1098,15 @@ local function planarDistanceSquared(a, b)
     return dx * dx + dy * dy
 end
 
-local function spawnPositionIsSeparated(position)
-    local requiredSeparation = math.min(
+local function minimumSpawnSeparation()
+    return math.min(
         NAV_MIN_SEPARATION_CM,
         math.max(50.0, CONFIG.SPAWN_RADIUS * 0.35)
     )
+end
+
+local function spawnPositionIsSeparated(position)
+    local requiredSeparation = minimumSpawnSeparation()
     local requiredSquared = requiredSeparation * requiredSeparation
 
     for _, origin in pairs(origins) do
@@ -1124,41 +1130,121 @@ local function spawnPositionIsSeparated(position)
     return true
 end
 
+local function readLastPathPoint(path)
+    local points
+    local stateOk, pathValid, pathPartial = pcall(function()
+        points = path.PathPoints
+        return path:IsValid(), path:IsPartial()
+    end)
+    if not stateOk then
+        return nil, "UNavigationPath state is unreadable: " ..
+            tostring(pathValid)
+    end
+    if pathValid ~= true then return nil, "UNavigationPath is invalid" end
+    if pathPartial == true then return nil, "UNavigationPath is partial" end
+    if points == nil then return nil, "UNavigationPath.PathPoints is unavailable" end
+
+    local lastPoint = nil
+    local pointsOk, pointsError = pcall(function()
+        points:ForEach(function(_, element)
+            local rawPoint = element:get()
+            local parsed = vector(rawPoint)
+            if parsed == nil then
+                error("PathPoints contains an invalid FVector")
+            end
+            lastPoint = parsed
+        end)
+    end)
+    if not pointsOk then
+        return nil, "UNavigationPath.PathPoints read failed: " ..
+            tostring(pointsError)
+    end
+    if lastPoint == nil then
+        return nil, "UNavigationPath contains no path points"
+    end
+    return lastPoint, nil
+end
+
+local function pathCandidate(request, attempt)
+    local separation = minimumSpawnSeparation()
+    local usableRadius = CONFIG.SPAWN_RADIUS - separation
+    if usableRadius < 0.0 then
+        error("SPAWN_RADIUS is smaller than the required separation")
+    end
+    local fraction = (attempt - 0.5) / NAV_MAX_ATTEMPTS
+    local radius = separation + math.sqrt(fraction) * usableRadius
+    local angle = request.navSeed
+        + attempt * NAV_GOLDEN_ANGLE_RADIANS
+    return {
+        X = request.originLocation.X + math.cos(angle) * radius,
+        Y = request.originLocation.Y + math.sin(angle) * radius,
+        Z = request.originLocation.Z,
+    }
+end
+
 local function resolveNavigableSpawnPosition(request, worldContext)
-    local lastFailure = "navigation query rejected every candidate"
-    for _ = 1, NAV_QUERY_ATTEMPTS do
-        local outLocation = {}
-        local queryOk, reachable = pcall(function()
-            return navigationSystem:K2_GetRandomReachablePointInRadius(
+    local buildOk, building = pcall(function()
+        return navigationSystem:IsNavigationBeingBuiltOrLocked(worldContext)
+    end)
+    if not buildOk then
+        return nil, "IsNavigationBeingBuiltOrLocked failed: " ..
+            tostring(building), false
+    end
+    if building == true then
+        return nil, "NavMesh is still being built or locked", true
+    end
+
+    local firstAttempt = request.navAttempts + 1
+    local finalAttempt = math.min(
+        request.navAttempts + NAV_ATTEMPTS_PER_PASS,
+        NAV_MAX_ATTEMPTS
+    )
+    local lastFailure = "navigation rejected every candidate"
+    for attempt = firstAttempt, finalAttempt do
+        request.navAttempts = attempt
+        local candidate = pathCandidate(request, attempt)
+        local queryOk, path = pcall(function()
+            return navigationSystem:FindPathToLocationSynchronously(
                 worldContext,
                 request.originLocation,
-                outLocation,
-                CONFIG.SPAWN_RADIUS,
-                nil,
+                candidate,
+                worldContext,
                 nil
             )
         end)
         if not queryOk then
-            return nil, "K2_GetRandomReachablePointInRadius failed: " ..
-                tostring(reachable)
+            return nil, "FindPathToLocationSynchronously failed: " ..
+                tostring(path), false
         end
-        if reachable == true then
-            local position = vector(outLocation.RandomLocation)
-            if position == nil then
-                return nil,
-                    "K2_GetRandomReachablePointInRadius returned an invalid RandomLocation out parameter"
-            end
-            if spawnPositionIsSeparated(position) then return position, nil end
-            lastFailure = string.format(
-                "no candidate respected %.0f cm minimum separation",
-                math.min(
-                    NAV_MIN_SEPARATION_CM,
-                    math.max(50.0, CONFIG.SPAWN_RADIUS * 0.35)
+        if isValid(path) then
+            local position, pathError = readLastPathPoint(path)
+            if position ~= nil then
+                local maxRadius = CONFIG.SPAWN_RADIUS + 25.0
+                if planarDistanceSquared(position, request.originLocation)
+                    <= maxRadius * maxRadius
+                    and spawnPositionIsSeparated(position) then
+                    return position, nil, false
+                end
+                lastFailure = string.format(
+                    "path endpoint violated radius or %.0f cm separation",
+                    minimumSpawnSeparation()
                 )
-            )
+            else
+                lastFailure = pathError
+            end
+        else
+            lastFailure = "FindPathToLocationSynchronously returned no path"
         end
     end
-    return nil, lastFailure .. " after " .. NAV_QUERY_ATTEMPTS .. " attempts"
+    if request.navAttempts < NAV_MAX_ATTEMPTS then
+        return nil, lastFailure .. string.format(
+            " after %d/%d attempts",
+            request.navAttempts,
+            NAV_MAX_ATTEMPTS
+        ), true
+    end
+    return nil, lastFailure .. " after " .. NAV_MAX_ATTEMPTS ..
+        " attempts", false
 end
 
 local function queueExtra(origin, slot)
@@ -1197,6 +1283,8 @@ local function queueExtra(origin, slot)
             Y = origin.location.Y,
             Z = origin.location.Z,
         },
+        navAttempts = 0,
+        navSeed = math.random() * math.pi * 2.0,
         spawnEligible = true,
     }
     origin.issued = slot
@@ -1487,9 +1575,20 @@ local function processSpawnRequest()
         return
     end
 
-    local position, navigationError =
+    local position, navigationError, navigationRetryable =
         resolveNavigableSpawnPosition(request, originState.object)
     if position == nil then
+        if navigationRetryable then
+            spawnQueue[#spawnQueue + 1] = request
+            dbg(string.format(
+                "SPAWN NAV RETRY | origin=%s slot=%d class=%s | %s",
+                request.originKey,
+                request.slot,
+                request.classKey,
+                tostring(navigationError)
+            ))
+            return
+        end
         log(string.format(
             "SPAWN ERROR | no navigable position origin=%s slot=%d class=%s | %s",
             request.originKey,

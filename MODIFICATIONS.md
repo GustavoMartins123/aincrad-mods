@@ -470,7 +470,7 @@ menu restoration, and equipment workflow were retained.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v1.4.0
+**Current script version:** v1.4.1
 
 ### Added
 
@@ -484,8 +484,12 @@ menu restoration, and equipment workflow were retained.
 
 - Replaced raw deferred `GameplayStatics` actor construction with the game's
   reflected `RODGameState.RODSpawnActor` population contract.
-- Requires a reachable point from
-  `NavigationSystemV1.K2_GetRandomReachablePointInRadius`.
+- Replaced the unsupported reflected `FVector&` output from
+  `K2_GetRandomReachablePointInRadius` with complete
+  `UNavigationPath` validation through
+  `FindPathToLocationSynchronously`.
+- Tests up to 36 golden-angle candidates over multiple director cycles,
+  retaining the request while the NavMesh is building or candidates remain.
 - Requires 50-150 cm separation from natural, pending, and owned enemies and
   uses `AdjustIfPossibleButDontSpawnIfColliding`.
 - Supplies `FRODSpawnActorOption` with server spawn, source level, `Prowl`
@@ -509,17 +513,19 @@ actor-root-scale compatibility path.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v1.0.0
+**Current script version:** v1.1.0
 
 ### Added
 
 - A live ModMenu toggle for native EXP notifications.
 - Exact correlation between `NotifyEnemyConfirmedDeath` and the host player's
-  next `CalcHeroLevelUp(AddExp)` call.
+  matching `CalcHeroLevelUp(AddExp)` call in either native callback order.
 - An `EXP +N` entry built with the game's `URODEventMessageWidget`, inserted in
   the active `URODInfoMessageLogWidget.Information` stack.
 - Native timer ownership through `SetMessageTimer`, avoiding Lua references to
   enemy, player, widget, or world objects across travel.
+- Immediate read-back validation of the written native rich text, with
+  transactional widget removal when the game rejects or replaces `EXP +N`.
 
 The game's `DT_InfoMessageDataTable` contains no EXP row; `1014` and `1015` are
 explicitly stealing/collection messages. The component therefore does not

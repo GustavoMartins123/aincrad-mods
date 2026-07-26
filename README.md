@@ -342,12 +342,14 @@ restart the game after turning it on.
 
 World Enemy Director preserves the game's natural enemy actors and can create
 up to seven additional enemies per natural spawn through
-`RODGameState.RODSpawnActor`. Each candidate must first be reachable on the
-active NavMesh and separated from other enemies. The spawn option starts the
-native Behavior Tree, leaves perception enabled, and rejects unresolved
-collisions. Additional species can be randomised from classes that the current
-world has already loaded. Every extra is owned by the exact server actor
-returned by the game's population API.
+`RODGameState.RODSpawnActor`. Each candidate must first produce a complete
+`UNavigationPath` on the active NavMesh and remain separated from other
+enemies. A request tests up to 36 spiral-distributed candidates over multiple
+director cycles. The spawn option starts the native Behavior Tree, leaves
+perception enabled, and rejects unresolved collisions. Additional species can
+be randomised from classes that the current world has already loaded. Every
+extra is owned by the exact server actor returned by the game's population
+API.
 
 The Mods panel exposes the spawn multiplier and cap, spawn radius, natural-boss
 mutation, scale range, fixed or random colour, health, attack, defence,
@@ -390,8 +392,8 @@ known limitations.
 Experience Notifications shows `EXP +N` in the game's native side-message
 stack after a confirmed enemy death. It correlates
 `NotifyEnemyConfirmedDeath` with the host player's exact
-`CalcHeroLevelUp(AddExp)` call, so the displayed number is the reward actually
-applied after the game's own calculations.
+`CalcHeroLevelUp(AddExp)` call in either callback order, so the displayed
+number is the reward actually applied after the game's own calculations.
 
 The feature creates the game's `URODEventMessageWidget` inside the active
 `URODInfoMessageLogWidget.Information` panel and hands its lifetime to the

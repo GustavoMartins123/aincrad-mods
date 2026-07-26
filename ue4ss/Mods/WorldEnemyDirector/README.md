@@ -51,11 +51,16 @@ through the game's own `RODGameState.RODSpawnActor` population path. The exact
 the source enemy's level, selects the ordinary `Prowl` initial state, and uses
 the chosen NavMesh point as `InitialStateLoc`.
 
-Before that call, `NavigationSystemV1.K2_GetRandomReachablePointInRadius` must
-return a reachable point. The point must also remain at least 50-150 cm from
-natural and already issued enemies, depending on the configured radius.
-Creation uses `AdjustIfPossibleButDontSpawnIfColliding`, so an occupied point
-is rejected instead of stacking actors. The returned
+Before that call, the director tests up to 36 points distributed in a
+golden-angle spiral through
+`NavigationSystemV1.FindPathToLocationSynchronously`. Four candidates are
+tested per director cycle so a difficult area does not stall one game frame.
+Only the final point of a complete, non-partial `UNavigationPath` is accepted.
+The point must also remain at least 50-150 cm from natural and already issued
+enemies, depending on the configured radius. A request returns to the queue
+while untested candidates remain. Creation uses
+`AdjustIfPossibleButDontSpawnIfColliding`, so an occupied point is rejected
+instead of stacking actors. The returned
 `FRODSpawnActorResult.ServerSpawnActor` weak pointer is the sole ownership
 contract; proximity is never used to claim an actor. Natural actors remain
 unowned and are never destroyed by this mod.
@@ -147,8 +152,9 @@ logging.
   begins collection. Unreal remains the authoritative owner of actor teardown.
 - A material that lacks the exact configured colour parameter will keep its
   original appearance and produce an explicit error.
-- A spawn is skipped with an explicit error when the active world has no
-  reachable, separated NavMesh point within the configured radius.
+- A spawn is skipped with an explicit error only after all 36 NavMesh path
+  candidates fail. A NavMesh that is still building or locked keeps the
+  request queued without consuming its candidate budget.
 - Actor creation or initialization failures are reported and are not retried
   silently.
 
@@ -157,9 +163,9 @@ logging.
 Implementation contracts were checked against the public
 [`toeofcharmander/mod_template`](https://github.com/toeofcharmander/mod_template)
 headers, enemy curve tables, navigation declarations, and
-`FRODSpawnActorOption` schema for Echoes of Aincrad. The UE4SS out-parameter
-contract used for both NavMesh output and `FGameplayAttribute` enumeration was
-also checked against the official
+`FRODSpawnActorOption` schema for Echoes of Aincrad. The UE4SS parameter
+contract used for `FGameplayAttribute` enumeration was also checked against the
+official
 [`UE4SS-RE/RE-UE4SS`](https://github.com/UE4SS-RE/RE-UE4SS) Lua binding source
 and documentation. Every returned struct element is read once through its
 canonical parameter wrapper's `get()`.
