@@ -577,7 +577,7 @@ Changed above.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v1.4.10
+**Current script version:** v1.4.13
 
 ### Added
 
@@ -630,6 +630,38 @@ Changed above.
 - Classifies `ServerDecideFastTravel` as a same-world quarantine. Existing
   ownership is retained and processing resumes after eight seconds instead of
   waiting forever for a `ClientRestart` that checkpoint travel does not emit.
+
+### Fixed
+
+- Fixed every spawn failing and pausing the director on the first attempt in each
+  world. Two regressions had been introduced together by a refactor that read as
+  a simplification, and each produced a different error:
+  1. `[UFunction::call_ufunction_from_lua] Tried calling function without both
+     UFunction and calling context`. `RODSpawnActor` had been cached by indexing
+     the game state (`rodGameState.RODSpawnActor`) instead of resolving it with
+     `StaticFindObject("/Script/ROD.RODGameState:RODSpawnActor")`. Indexing a
+     UObject with a function name returns a callable already bound to that
+     object, not a `UFunction`, so it cannot be handed to `UObject:CallFunction`.
+     It answers `IsValid()` truthily, so the contract logged itself as acquired
+     and could never be used.
+  2. `[push_objectproperty] Error: ... :InInstigator`. The six arguments had been
+     rebuilt positionally from the order the header prints. A UFunction's
+     parameter properties do not necessarily enumerate in declaration order, and
+     here they do not: passing them in header order landed the
+     collision-handling enum on `InInstigator`.
+
+  The first is fixed: `RODSpawnActor` is called on the game state directly. The
+  second is not yet, and the pre-refactor design cannot be restored to fix it —
+  it read the parameter order with `ForEachProperty`, which is a `UStruct` method
+  that this build's Lua binding does not expose on a `UFunction` (the call is
+  nil). So that older code never ran either; replacing it with a positional list
+  swapped one failure for another.
+
+  Two read-only diagnostics were added instead of a third guess. `SPAWN PROBE`
+  registers a hook on `RODSpawnActor` and reports, once, what the engine itself
+  passes when the game spawns something naturally. `SPAWN ARGS` logs, once, what
+  this mod passes. Lining the two up names the misplaced argument directly rather
+  than inferring it from a marshaling error.
 
 ### Failure behavior
 

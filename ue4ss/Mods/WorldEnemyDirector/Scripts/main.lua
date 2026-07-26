@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.4.10"
+local MOD_VERSION = "1.4.13"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -357,7 +357,10 @@ local materialLibrary = nil
 local materialInterface = nil
 local rodGameState = nil
 local navigationSystem = nil
-local rodSpawnActorFunction = nil
+local spawnContractVerified = false
+local spawnOrderProbeIds = nil
+local spawnOrderProbeReported = false
+local spawnArgumentsReported = false
 local disableWorld
 local releaseWorldForTravel
 local gcScheduled = false
@@ -385,7 +388,7 @@ local function clearWorldReferences()
     worldFault = nil
     rodGameState = nil
     navigationSystem = nil
-    rodSpawnActorFunction = nil
+    spawnContractVerified = false
 end
 
 local function beginTravel(reason)
@@ -476,6 +479,73 @@ local function resolveMaterialApi()
     return true, nil
 end
 
+-- Reports, once per session, what the engine itself passes to RODSpawnActor.
+--
+-- This exists because the argument layout cannot be read back on this build:
+-- ForEachProperty is not exposed on a UFunction here, and passing the six values
+-- in the order the header declares them lands the collision-handling enum on
+-- InInstigator. Watching a real call is the remaining source of truth. The game
+-- spawns constantly, so this costs one natural spawn to answer.
+--
+-- Strictly read-only: it observes, logs one line, and unregisters itself. It
+-- never alters the call it is watching.
+local function describeSpawnArgument(value)
+    if value == nil then return "nil" end
+    local unwrapped = value
+    local unwrapOk, inner = pcall(function() return value:get() end)
+    if unwrapOk and inner ~= nil then unwrapped = inner end
+
+    local kind = type(unwrapped)
+    if kind ~= "userdata" and kind ~= "table" then
+        return kind .. "(" .. tostring(unwrapped) .. ")"
+    end
+
+    local nameOk, fullName = pcall(function() return unwrapped:GetFullName() end)
+    if nameOk and type(fullName) == "string" and fullName ~= "" then
+        return "object[" .. fullName .. "]"
+    end
+    -- Structs have no GetFullName. Name them by a field only they carry.
+    for field, label in pairs({
+        Translation = "FTransform",
+        DefaultSpawnOn = "FRODSpawnActorOption",
+    }) do
+        local fieldOk, fieldValue = pcall(function() return unwrapped[field] end)
+        if fieldOk and fieldValue ~= nil then return "struct[" .. label .. "]" end
+    end
+    return kind .. "[unidentified]"
+end
+
+local function armSpawnOrderProbe()
+    if spawnOrderProbeIds ~= nil or spawnOrderProbeReported then return end
+
+    local ok, idsOrError = pcall(function()
+        local preId, postId = RegisterHook(
+            "/Script/ROD.RODGameState:RODSpawnActor",
+            function(_self, a, b, c, d, e, f)
+                if spawnOrderProbeReported then return end
+                spawnOrderProbeReported = true
+                log("SPAWN PROBE | engine call arguments:"
+                    .. " 1=" .. describeSpawnArgument(a)
+                    .. " 2=" .. describeSpawnArgument(b)
+                    .. " 3=" .. describeSpawnArgument(c)
+                    .. " 4=" .. describeSpawnArgument(d)
+                    .. " 5=" .. describeSpawnArgument(e)
+                    .. " 6=" .. describeSpawnArgument(f))
+                -- Unregistering from inside the callback is not safe; the flag
+                -- above makes every later call a single comparison, and the
+                -- next world teardown releases the hook.
+            end
+        )
+        return { pre = preId, post = postId }
+    end)
+    if not ok then
+        log("SPAWN PROBE | could not watch RODSpawnActor: " .. tostring(idsOrError))
+        return
+    end
+    spawnOrderProbeIds = idsOrError
+    log("SPAWN PROBE | watching the next engine RODSpawnActor call")
+end
+
 local function resolveSpawnApi()
     if not isValid(rodGameState) then
         rodGameState = nil
@@ -504,23 +574,42 @@ local function resolveSpawnApi()
         navigationSystem = nav
     end
 
-    if not isValid(rodSpawnActorFunction) then
-        rodSpawnActorFunction = nil
-
-        local functionOk, functionObject = pcall(function()
-            return rodGameState.RODSpawnActor
+    -- RODSpawnActor is called on the game state as rodGameState:RODSpawnActor(...).
+    --
+    -- Two other shapes were tried on this build and neither works:
+    --
+    --   * Caching rodGameState.RODSpawnActor and handing it to
+    --     UObject:CallFunction. Indexing a UObject with a function name returns a
+    --     callable already bound to that object, not a UFunction, so
+    --     CallFunction rejects it with "Tried calling function without both
+    --     UFunction and calling context". It answers IsValid() truthily, so the
+    --     contract logged itself as acquired and could never be used.
+    --   * Resolving the UFunction with StaticFindObject and reading its parameter
+    --     order with ForEachProperty. ForEachProperty is a UStruct method and
+    --     this build's Lua binding types a UFunction as a plain UObject, so the
+    --     call is nil: "attempt to call a nil value".
+    --
+    -- What remains unresolved is the argument layout. Passing the six values in
+    -- the order the header declares them lands the collision-handling enum on
+    -- InInstigator, which UE4SS reports as
+    -- "[push_objectproperty] ... :InInstigator" — the arguments are off by one
+    -- somewhere before that parameter. Since the order cannot be read back on
+    -- this build, armSpawnOrderProbe below watches the game make its own spawn
+    -- call and reports what the engine passes, which is the only source of truth
+    -- left. It is read-only and unregisters itself after one report.
+    if not spawnContractVerified then
+        local presentOk, present = pcall(function()
+            return rodGameState.RODSpawnActor ~= nil
         end)
-        if not functionOk then
-            return false, "bound RODSpawnActor UFunction lookup failed: " ..
-                tostring(functionObject)
+        if not presentOk then
+            return false, "RODSpawnActor lookup failed: " .. tostring(present)
         end
-        if not isValid(functionObject) then
-            return false, "bound RODSpawnActor UFunction is unavailable"
+        if present ~= true then
+            return false, "RODGameState does not expose RODSpawnActor"
         end
-        rodSpawnActorFunction = functionObject
-        log(
-            "SPAWN CONTRACT | bound RODSpawnActor CallFunction contract acquired"
-        )
+        spawnContractVerified = true
+        log("SPAWN CONTRACT | RODGameState:RODSpawnActor is available")
+        armSpawnOrderProbe()
     end
     return true, nil
 end
@@ -1738,8 +1827,21 @@ local function processSpawnRequest()
     local spawned = nil
     local insertedPending = false
     local okSpawn, spawnError = pcall(function()
-        local result = rodGameState:CallFunction(
-            rodSpawnActorFunction,
+        -- Logged once, immediately before the call, so this mod's own arguments
+        -- can be lined up against what SPAWN PROBE reports the engine passing.
+        -- Between the two, an argument that lands on the wrong parameter is
+        -- visible rather than inferred from a marshaling error.
+        if not spawnArgumentsReported then
+            spawnArgumentsReported = true
+            log("SPAWN ARGS | 1=" .. describeSpawnArgument(spawnClass)
+                .. " 2=" .. describeSpawnArgument(transform)
+                .. " 3=" .. describeSpawnArgument(option)
+                .. " 4=" .. describeSpawnArgument(owner)
+                .. " 5=" .. describeSpawnArgument(instigator)
+                .. " 6=" .. describeSpawnArgument(
+                    SPAWN_COLLISION_ADJUST_OR_REJECT))
+        end
+        local result = rodGameState:RODSpawnActor(
             spawnClass,
             transform,
             option,
