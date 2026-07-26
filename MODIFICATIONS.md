@@ -1,0 +1,472 @@
+# Modifications from the Original Nexus Releases
+
+This document records the intentional differences between this integrated
+Echoes of Aincrad mod suite and the exact original packages downloaded from
+Nexus Mods.
+
+It is named `MODIFICATIONS.md` rather than `CHANGELOG.md` because its primary
+purpose is upstream provenance and patch disclosure, not a chronological
+history of this suite's own releases. If the suite receives independently
+versioned releases in the future, notable suite-level changes should also be
+maintained in a separate `CHANGELOG.md`.
+
+## Document status
+
+| Field | Value |
+|---|---|
+| Last verified | 2026-07-26 |
+| Comparison scope | Six original Nexus packages versus the installed integrated files |
+| Comparison method | Relative-path inventory, SHA-256 file comparison, and textual diff of changed source/configuration files |
+| Intended audience | Players, reviewers, maintainers, and original mod authors |
+| Upstream status | Local integration changes; no claim is made that they were submitted to or accepted by the original authors |
+
+## Documentation method
+
+This document follows three established practices:
+
+1. Changes are written for humans and grouped under consistent categories such
+   as **Added**, **Changed**, **Fixed**, **Unchanged**, and **Known
+   limitations**, following the principles of [Keep a
+   Changelog](https://keepachangelog.com/en/1.1.0/).
+2. Each component identifies its exact origin and baseline archive. This is
+   adapted from the provenance fields recommended by the Debian [DEP-3 Patch
+   Tagging Guidelines](https://dep-team.pages.debian.net/deps/dep3/).
+3. Original release numbers are not silently rewritten. If this integrated
+   suite adopts its own version later, version changes should communicate API
+   compatibility according to [Semantic Versioning](https://semver.org/).
+
+Only notable technical changes are included. Whitespace-only differences,
+timestamps, logs, and transient UI state are excluded unless they change
+runtime behavior.
+
+## Permissions and attribution
+
+The Nexus Mods pages remain the authoritative source for authorship, credits,
+permissions, downloads, and support:
+
+- [UE4SS for Echoes of Aincrad](https://www.nexusmods.com/echoesofaincrad/mods/7)
+- [Terrain Runner SpeedMod](https://www.nexusmods.com/echoesofaincrad/mods/45)
+- [Auto Pickup Mod](https://www.nexusmods.com/echoesofaincrad/mods/19)
+- [No Rescue — Real Falls](https://www.nexusmods.com/echoesofaincrad/mods/35)
+- [Aincrad Open World](https://www.nexusmods.com/echoesofaincrad/mods/55)
+- [Field Equipment Mod](https://www.nexusmods.com/echoesofaincrad/mods/64)
+
+This document describes technical differences; it does not grant permission to
+redistribute any original or modified file. Consult the permissions on each
+Nexus Mods page before distributing a modified package.
+
+## Exact comparison baselines
+
+| Component | Original archive | Original version evidence | Integrated state |
+|---|---|---|---|
+| UE4SS | `UE4SS_1012_EOA 7 1.2.1 2026-07-24T10-03Z V4y6UZcT5.zip` | Nexus package 1.2.1 | Loader binaries unchanged; settings configured |
+| Terrain Runner | `SpeedMod v8 Stablized 45 8 2026-07-20T00-09Z 3CxMATjay.zip` | Archive label v8; `main.lua` identifies v7.11 | `main.lua` identifies v7.14 |
+| Auto Pickup | `AutoPickupMod 19 1.4 2026-07-23T15-17Z cLQPyYq9t.zip` | Archive label 1.4; `main.lua` identifies v1.3 | `main.lua` identifies v1.4 |
+| No Rescue | `Norescue 0.5.0 35 1 2026-07-13T13-48Z 3CxMATjJt.zip` | README identifies 0.5.0 | 0.5.0 plus integration changes |
+| Aincrad Open World | `AincradOpenWorld V1.0 55 1 2026-07-18T12-32Z V4y6UZc0K.zip` | Archive identifies V1.0 | V1.0 plus runtime bridge |
+| Field Equipment | `FieldEquipmentMod 64 1 2026-07-21T11-45Z 8WdQj6lM4.7z` | `main.lua` identifies v1.14.3-release | `main.lua` identifies v1.14.5 |
+
+## UE4SS 1.2.1
+
+**Origin:** [UE4SS for Echoes of Aincrad on Nexus
+Mods](https://www.nexusmods.com/echoesofaincrad/mods/7)  
+**Baseline:** `UE4SS_1012_EOA 7 1.2.1
+2026-07-24T10-03Z V4y6UZcT5.zip`
+
+### Changed
+
+- Changed `DefaultExecuteInGameThreadMethod` in `UE4SS-settings.ini` from
+  `EngineTick` to `ProcessEvent`.
+- Enabled and made visible the interactive UE4SS GUI console by changing
+  `GuiConsoleEnabled` and `GuiConsoleVisible` from `0` to `1`.
+- Kept the plain external console disabled because the GUI console exposes the
+  output and accepts commands.
+- Added comments beside these settings explaining why they are intentional.
+
+### Reason
+
+The `ProcessEvent` execution method avoids making every mod dependent on one
+shared EngineTick Lua callback. If that callback is removed after an error,
+`ExecuteInGameThread` work can otherwise stop across the entire mod stack.
+
+The GUI console is enabled to make live diagnostics and read-only mod commands
+available without editing the loader again.
+
+### Unchanged
+
+SHA-256 comparison confirmed that these files are byte-for-byte identical to
+the original Nexus archive:
+
+- `dwmapi.dll`
+- `ue4ss\UE4SS.dll`
+- `ue4ss\UE4SS_Signatures\GNatives.lua`
+- `ue4ss\UE4SS_Signatures\GUObjectArray.lua`
+- `ue4ss\UE4SS_Signatures\GUObjectHashTables.lua`
+- The bundled `BPML_GenericFunctions`, `BPModLoaderMod`, and `Keybinds` mods
+- `mods.txt` and `mods.json`
+- `Types.lua`, `UEHelpers.lua`, and `jsbProfi.lua`
+
+The gameplay mods, ModMenu, and `ModMenuBridge.lua` were added around the
+unchanged loader. They are not modifications to the UE4SS binaries.
+
+## Terrain Runner SpeedMod
+
+**Origin:** [Terrain Runner SpeedMod on Nexus
+Mods](https://www.nexusmods.com/echoesofaincrad/mods/45)  
+**Baseline:** `SpeedMod v8 Stablized 45 8
+2026-07-20T00-09Z 3CxMATjay.zip`  
+**Original script version:** v7.11  
+**Integrated script version:** v7.14
+
+### Added
+
+- Physical jump-height control through
+  `CharacterMovement.JumpZVelocity`.
+- `JUMP_HEIGHT_MULTIPLIER` in `Scripts\config.lua`.
+- A validated jump-height range from 0.25× to 6.00×.
+- Persistent hero and movement-component acquisition.
+- Native jump-velocity capture and restoration when the mod is disabled.
+- Stable movement-component identity through Unreal `GetFullName()`.
+- Deduplicated waiting, ready, disabled, jump, and boost diagnostics.
+- Live settings integration through the canonical shared
+  `ModMenuBridge.lua`.
+- `Scripts\runtime.lua` for settings written by ModMenu.
+
+### Changed
+
+- Replaced the legacy setting aliases with the exact public keys used by
+  `config.lua`: `START_SPEED`, `MAX_SPEED`, `SECONDS_TO_MAX_SPEED`, and
+  `JUMP_HEIGHT_MULTIPLIER`.
+- Replaced silent defaults and numeric clamping with strict transactional
+  validation. Missing, mistyped, non-finite, or out-of-range values now produce
+  an explicit error and disable the mod.
+- Raised the validated top-speed limit from 4.50× to 8.00×.
+- Replaced the exposed `hero.CharacterMovement` field with the canonical
+  `hero:GetMovementComponent()` call.
+- Restricted player discovery to the canonical local host
+  `RODWorldHeroCharacter`.
+- Reduced hero/movement retry frequency to the loading interval while those
+  objects are unavailable.
+- Reset the current acceleration ramp after a live speed change so a multiplier
+  from the previous configuration cannot remain active.
+- Made the `speedmod` console command read-only. Persistent configuration now
+  has one path through `config.lua` or ModMenu.
+
+### Fixed
+
+- Fixed permanent-looking startup failure when the hero or movement component
+  did not exist yet. The poll now remains active until both become valid.
+- Fixed per-frame `JUMP READY` log flooding caused by UE4SS returning different
+  Lua wrappers for the same Unreal movement component.
+- Fixed stacked jump changes by retaining the native baseline for one real
+  Unreal component and restoring it when disabled.
+- Fixed partial configuration mutation by validating every field before
+  committing any live change.
+
+### Current integrated defaults
+
+The current `runtime.lua` sets:
+
+- Starting speed: 2.50×
+- Top speed: 8.00×
+- Time to top speed: 1.80 seconds
+- Jump height: 6.00×
+- Combat protection: inherited from `config.lua` and enabled
+
+### Unchanged
+
+The original terrain grading, swept collision, sprint detection, combat lock,
+travel quarantine, teleport protection, and rest/quest transition systems were
+retained.
+
+### Known limitations
+
+- Extreme speed and jump values can expose streaming, geometry, collision, or
+  scripted-sequence behavior that the game was not designed to handle.
+- A full game restart is safer than restarting every Lua mod in an active
+  session.
+
+## Auto Pickup Mod
+
+**Origin:** [Auto Pickup Mod on Nexus
+Mods](https://www.nexusmods.com/echoesofaincrad/mods/19)  
+**Baseline:** `AutoPickupMod 19 1.4
+2026-07-23T15-17Z cLQPyYq9t.zip`  
+**Original script version:** v1.3, despite the archive's 1.4 label  
+**Integrated script version:** v1.4
+
+### Added
+
+- A separate documented `Scripts\config.lua`.
+- ModMenu settings for enabled state, pickup range, icon range, pickup
+  interval, notification display, icon-distance patching, prompt-area
+  expansion, and debug logging.
+- Live settings reload through `ModMenuBridge.lua`.
+- `Scripts\runtime.lua` for menu-written settings.
+- Persistent hero acquisition with one waiting and one ready transition per
+  world lifecycle.
+
+### Changed
+
+- Moved user-facing values that were hard-coded in `main.lua` into the
+  documented configuration file.
+- Restricted hero discovery to the canonical local host
+  `RODWorldHeroCharacter`.
+- Made host validation fail closed when `IsHostHero()` cannot be confirmed.
+- When pickup distance changes, clears expanded-item caches and previously
+  applied range state before applying the new value.
+
+### Fixed
+
+- Fixed early startup behavior that appeared to stop when the playable hero had
+  not spawned yet. The pickup poll now remains scheduled.
+- Removed repeated post-travel `no hero yet` messages.
+- Prevented stale range caches from delaying a live pickup-distance change.
+
+### Unchanged
+
+The original pickup scanning, item operation, range expansion, notification,
+travel protection, cooldown, and console-command behavior was otherwise
+retained.
+
+### Known limitations
+
+- The game's reliable pickup limit remains around 1000 Unreal units.
+- Large ranges increase the number of nearby objects examined and can affect
+  performance or stability.
+
+## No Rescue — Real Falls
+
+**Origin:** [No Rescue — Real Falls on Nexus
+Mods](https://www.nexusmods.com/echoesofaincrad/mods/35)  
+**Baseline:** `Norescue 0.5.0 35 1
+2026-07-13T13-48Z 3CxMATjJt.zip`  
+**Original version:** 0.5.0
+
+### Added
+
+- Live settings integration through `ModMenuBridge.lua`.
+- `Scripts\runtime.lua` for enabled state, landing behavior, debug logging, and
+  the safety interval.
+- Persistent hero acquisition through the existing safety timer.
+- Stable hero identity through Unreal `GetFullName()`.
+- Deduplicated waiting, ready, lookup, identity, and switch-error diagnostics.
+- Native `DeathLandingHeight` capture before modification.
+- A reversible live-disable operation.
+
+### Changed
+
+- Reused the original typed configuration filter for both startup and live
+  settings reload.
+- Restricted hero discovery to the canonical local host
+  `RODWorldHeroCharacter`.
+- Reset hero identity and diagnostics on map load, respawn, and
+  `ClientRestart`.
+
+### Fixed
+
+- Fixed the need to manually re-enable the mod when the hero was unavailable
+  during the first application attempt; the safety timer now keeps retrying.
+- Fixed live disable so it restores both the game's original landing threshold
+  and edge-rescue behavior.
+- Fixed repeated application caused by temporary wrapper identity by comparing
+  the stable Unreal object name.
+
+### Unchanged
+
+- The original `README.txt` is byte-for-byte unchanged.
+- The original `Scripts\config.lua` is byte-for-byte unchanged.
+- Water, drowning, deep-water recovery, pit recovery, out-of-bounds recovery,
+  and quest-area teleports remain outside the mod's scope.
+
+## Aincrad Open World
+
+**Origin:** [Aincrad Open World on Nexus
+Mods](https://www.nexusmods.com/echoesofaincrad/mods/55)  
+**Baseline:** `AincradOpenWorld V1.0 55 1
+2026-07-18T12-32Z V4y6UZc0K.zip`  
+**Original version:** V1.0
+
+### Added
+
+- A 41-line runtime integration block in `main.lua`.
+- `ModMenuBridge.lua` support for `ENABLED`, `DEBUG_LOGS`, and `PROBE_MODE`.
+- `Scripts\runtime.lua` for ModMenu-written settings.
+
+### Changed
+
+- The existing `CONFIG` table is refreshed in place so closures registered by
+  the original script observe new values.
+- The ModMenu marks this component as affecting newly constructed manifests and
+  requiring restart for a reliable clean application.
+
+### Unchanged
+
+Direct comparison confirmed that these original files are byte-for-byte
+unchanged:
+
+- `README.md`
+- `Scripts\config.lua`
+- `Scripts\probe.lua`
+- `Scripts\wl01_pieces.lua`
+- `Scripts\wl02_pieces.lua`
+- `Scripts\wl01_barriers.lua`
+- `Scripts\wl02_barriers.lua`
+
+The original quest hooks, Free Roam labeling, manifest expansion, floor-piece
+tables, barrier tables, and save-safe runtime design are unchanged.
+
+### Known limitations
+
+- Fresh-launch activation is not yet reliable in every session.
+- If Open World is already loaded, toggling it OFF and ON makes new manifests
+  observe the current setting.
+- If it was disabled before game launch, turning it ON only creates the
+  next-launch marker; the game must then be fully restarted.
+- A setting change cannot retract or rebuild a floor whose manifest is already
+  active.
+
+### Local state note
+
+The original archive contains `enabled.txt`. At the time of comparison, this
+installation contained `enabled.txt.off` because Open World had been disabled
+through ModMenu. That is local state, not a source-code modification.
+
+## Field Equipment Mod
+
+**Origin:** [Field Equipment Mod on Nexus
+Mods](https://www.nexusmods.com/echoesofaincrad/mods/64)  
+**Baseline:** `FieldEquipmentMod 64 1
+2026-07-21T11-45Z 8WdQj6lM4.7z`  
+**Original script version:** v1.14.3-release  
+**Integrated script version:** v1.14.5
+
+### Added
+
+- A documented `Scripts\config.lua` with `ENABLED` and `DEBUG_LOGS`.
+- Runtime settings reload through `ModMenuBridge.lua`.
+- `Scripts\runtime.lua` for menu-controlled enabled state and logging.
+- Shared-rail discovery for rows appended below Equipment.
+- Explicit focus transfer between the native menu, Equipment, and Mods in both
+  directions.
+- Foreign injected-row detection.
+
+### Changed
+
+- Restricted local-controller lookup to the canonical
+  `RODInGamePlayerController`.
+- Added an enable guard when the Start Menu is constructed.
+- Guarded native `CurrentIndex` writes so an injected row index is never written
+  outside the authored native array.
+- Clears selection animation from native and injected rows before transferring
+  focus.
+- Reasserts Equipment's label, texture, and selected presentation without
+  moving focus a second time.
+- Preserves the standalone wrap behavior when no other injected row exists.
+
+### Fixed
+
+- Fixed navigation disappearing when moving upward from Mods to Equipment.
+- Fixed focus skipping directly to Settings or requiring an extra directional
+  input after returning to Equipment.
+- Fixed two menu icons appearing selected simultaneously.
+- Fixed Field Equipment stealing focus back from another injected rail row.
+- Fixed custom injected indexes being written into the native list's
+  `CurrentIndex`.
+
+### Unchanged
+
+The original native Equipment screen, stat-overlay lifecycle, back handling,
+menu restoration, and equipment workflow were retained.
+
+## New integrated ModMenu layer
+
+**Origin:** Added for this integrated suite  
+**Original archive:** None of the six Nexus baselines contains ModMenu or
+`ModMenuBridge.lua`
+
+### Added
+
+- A **Mods** row below the native Start Menu entries.
+- A calibrated `M` row icon.
+- A settings panel rendered inside the existing menu.
+- Keyboard and controller navigation.
+- Modal input isolation so the outer Start Menu does not react while the Mods
+  panel is open.
+- Bidirectional and idempotent focus coordination with Field Equipment.
+- A per-mod registry with setting types, ranges, application timing, and
+  display formats.
+- Persistent values in each mod's `Scripts\runtime.lua`.
+- Transactional enable/disable behavior that updates live `ENABLED` state and
+  the next-launch `enabled.txt` marker together.
+- Rollback to the previous runtime and marker state if either filesystem
+  operation fails.
+- The shared `ue4ss\Mods\shared\ModMenuBridge.lua` used by isolated Lua states.
+
+### Changed
+
+- Field Equipment is marked `+` because its row is rebuilt when the Start Menu
+  is reopened.
+- Open World is marked `*` because its effect depends on newly constructed
+  quest manifests and may require a restart.
+- UE4SS's built-in `mods.txt` and `mods.json` remain unchanged; gameplay Lua
+  mods continue to use only their `enabled.txt` markers.
+
+### Fixed
+
+- Fixed controller Left/Right handling inside the Mods panel.
+- Fixed Back/B closing behavior for the panel.
+- Fixed the outer Start Menu receiving the panel's navigation input.
+- Fixed Equipment-to-Mods and Mods-to-Equipment focus asymmetry.
+- Fixed mod-header toggles changing the wrong mod's enable marker.
+- Fixed custom rows writing invalid native list indexes.
+
+## Generated and local-state files
+
+The following files are not upstream source modifications:
+
+| File | Meaning |
+|---|---|
+| `Scripts\runtime.lua` | Current overrides written by ModMenu |
+| `enabled.txt` | UE4SS loads the mod on the next launch |
+| `enabled.txt.off` | Local disabled-state marker |
+| `ue4ss\UE4SS.log` | Runtime diagnostics |
+| `ue4ss\imgui.ini` | UE4SS GUI window state |
+
+The original Auto Pickup and Field Equipment archives store `1` in their
+`enabled.txt` files. ModMenu normalizes those markers to empty files. UE4SS uses
+the marker's presence, so this does not change enablement semantics.
+
+## Maintenance rules for future changes
+
+When this integrated suite changes again:
+
+1. Record the new comparison date in ISO `YYYY-MM-DD` format.
+2. Preserve the exact upstream archive filename and Nexus origin.
+3. Compare full relative-path inventories before comparing individual files.
+4. Verify unchanged files by hash and changed text files by semantic diff.
+5. Document the reason and user-visible effect, not only the implementation.
+6. Use only the categories that contain notable changes; omit empty headings.
+7. Keep generated files and local enablement state separate from source
+   modifications.
+8. State what remained unchanged so reviewers can see the patch boundary.
+9. Keep known limitations beside the component they affect.
+10. Do not change an original release's contents while retaining its upstream
+    version number. Give the integrated suite its own version when it begins
+    publishing independent releases.
+11. Maintain a separate chronological `CHANGELOG.md` once this suite has its own
+    releases.
+12. Recheck each Nexus page's current permissions before distributing modified
+    files.
+
+## Methodology references
+
+- [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/) — human-readable
+  notable changes, consistent categories, ISO dates, and omission of empty
+  sections.
+- [DEP-3 Patch Tagging
+  Guidelines](https://dep-team.pages.debian.net/deps/dep3/) — patch origin,
+  description, author/status metadata, and last-update traceability.
+- [Semantic Versioning 2.0.0](https://semver.org/) — version numbers that
+  communicate incompatible changes, compatible features, and fixes once a
+  public API/versioned suite exists.

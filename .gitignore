@@ -7,6 +7,7 @@
 # ...except this file, the setup guide, and the UE4SS tree.
 !/.gitignore
 !/README.md
+!/MODIFICATIONS.md
 !/ue4ss/
 
 # Inside ue4ss, keep the settings file and the mods. UE4SS itself is a

@@ -14,6 +14,9 @@ release-reference pages for their respective projects:
 - [Aincrad Open World](https://www.nexusmods.com/echoesofaincrad/mods/55)
 - [Field Equipment Mod](https://www.nexusmods.com/echoesofaincrad/mods/64)
 
+For an exact source-by-source comparison against the original Nexus archives,
+see [Modifications from the Original Nexus Releases](MODIFICATIONS.md).
+
 The Nexus Mods UE4SS package is a modified build adapted specifically for
 Echoes of Aincrad. Its primary purpose is loading Lua and Blueprint mods. This
 suite does not claim authorship of UE4SS; use the Nexus Mods page above for its
@@ -486,4 +489,3 @@ on the corresponding Nexus Mods pages:
 - [No Rescue — Real Falls](https://www.nexusmods.com/echoesofaincrad/mods/35)
 - [Aincrad Open World](https://www.nexusmods.com/echoesofaincrad/mods/55)
 - [Field Equipment Mod](https://www.nexusmods.com/echoesofaincrad/mods/64)
-
