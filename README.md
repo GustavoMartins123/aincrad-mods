@@ -327,20 +327,23 @@ restart the game after turning it on.
 ### World Enemy Director
 
 World Enemy Director preserves the game's natural enemy actors and can create
-up to seven additional enemies per natural spawn through the reflected
-`ServerDebugEnemySpawn` RPC. Additional species can be randomised from classes
-that the current world has already loaded.
+up to seven additional enemies per natural spawn through Unreal's deferred
+actor-spawn API. Additional species can be randomised from classes that the
+current world has already loaded. Every extra is owned by its exact returned
+actor object.
 
 The Mods panel exposes the spawn multiplier and cap, spawn radius, boss
 inclusion, scale range, fixed or random colour, health, attack, defence,
 movement speed, and experience multipliers. Natural quest actors are never
-replaced; only actors matched to this mod's spawn tickets may be destroyed when
+replaced; only exact actors created and owned by this mod may be destroyed when
 the multiplier is reduced or the mod is disabled.
 
 Combat multipliers are applied after the enemy's native initialization through
-its exact `Health`, `MaxHealth`, `ATK`, and `Def` Gameplay Ability System
-attributes. Live maximum-health changes preserve the enemy's current HP
-percentage, and disabling the director reverses only the deltas it applied.
+its exact Gameplay Ability System attributes. Health targets `Health` and
+`MaxHealth`; attack and defence change `BaseATK` and `BaseDEF` and verify the
+calculated `ATK` and `Def` outputs. Live maximum-health changes preserve the
+enemy's current HP percentage, and disabling the director reverses only the
+deltas it applied.
 
 See
 [`ue4ss\Mods\WorldEnemyDirector\README.md`](ue4ss/Mods/WorldEnemyDirector/README.md)

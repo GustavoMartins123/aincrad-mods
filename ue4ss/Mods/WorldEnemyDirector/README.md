@@ -45,10 +45,12 @@ extras are destroyed when a live configuration is rejected.
 ## Spawn and randomisation model
 
 The director listens for `RODEnemyCharacter` construction and pool reuse. For
-each eligible natural enemy, it issues up to `SPAWN_MULTIPLIER - 1` calls to the
-game's native `ServerDebugEnemySpawn` RPC. A spawn ticket must match the exact
-loaded `UClass` and nearby position before the new actor is considered owned.
-Unmatched actors remain natural and are never destroyed by this mod.
+each eligible natural enemy, it creates up to `SPAWN_MULTIPLIER - 1` actors
+through `GameplayStatics.BeginDeferredActorSpawnFromClass` and
+`FinishSpawningActor`, then applies the source enemy's level through
+`SetEnemyLevel`. Ownership is tied to the exact returned actor object; proximity
+is never used to claim an actor. Natural actors remain unowned and are never
+destroyed by this mod.
 
 Random species are selected only from natural enemy classes already loaded in
 the active world. The mod does not synchronously load arbitrary Blueprint
@@ -65,10 +67,13 @@ the fixed settlement period.
 The director waits for the enemy's native `OnFinishedInitialize` lifecycle
 event before accessing combat state. It then asks that enemy's `AbilitySystem`
 for its reflected attributes and requires the exact `Health`, `MaxHealth`,
-`ATK`, and `Def` contracts. Missing or rejected attributes produce an explicit
-per-enemy error; the mod does not substitute a display-only property.
+`ATK`, `BaseATK`, `Def`, and `BaseDEF` contracts. Missing or rejected attributes
+produce an explicit per-enemy error; the mod does not substitute a display-only
+property.
 
-HP, ATK, and DEF changes are sent through
+HP changes target `MaxHealth` and `Health`. Attack and defence changes target
+the mutable `BaseATK` and `BaseDEF` inputs, then verify the calculated `ATK` and
+`Def` outputs. All changes go through
 `ARODCharacterBase.ApplyInstantGameplayEffect` as additive GAS deltas. The
 director also keeps the enemy's source fields synchronized because the game
 uses those fields for enemy parameter and reward calculations. Live health
@@ -93,19 +98,18 @@ enemy_director_status
 ```
 
 It reports configuration health, world pause/fault state, natural and owned
-enemy counts, queued requests, pending spawn tickets, and loaded enemy classes.
+enemy counts, queued creations, actors pending initialization, and loaded enemy
+classes.
 Enable `DEBUG_LOGS` only while diagnosing; normal operation avoids per-tick
 logging.
 
 ## Known limitations
 
-- This first implementation is validated offline against dumped game headers;
-  each native behaviour still needs an in-game test on the current game build.
 - Only classes already loaded naturally in the current world can be randomised.
 - Natural quest actors are intentionally not replaced.
 - A material that lacks the exact configured colour parameter will keep its
   original appearance and produce an explicit error.
-- Spawn RPC requests that fail or expire are reported and are not retried
+- Actor creation or initialization failures are reported and are not retried
   silently.
 
 ## Reverse-engineering references

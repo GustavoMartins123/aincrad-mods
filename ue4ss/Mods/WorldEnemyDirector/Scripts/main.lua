@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.1.1"
+local MOD_VERSION = "1.2.1"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -22,18 +22,21 @@ local RUNTIME_PATH = SCRIPT_DIR .. "runtime.lua"
 local STARTUP_SETTLE_MS = 8000
 local RESTART_SETTLE_MS = 5000
 local SETTINGS_POLL_MS = 1000
-local SPAWN_TICKET_MS = 8000
-local SPAWN_MATCH_DISTANCE_CM = 650.0
+local SPAWN_INITIALIZE_MS = 8000
 local SPAWN_Z_OFFSET_CM = 40.0
 local MAX_DISCOVERY_PER_TICK = 8
 local GAMEPLAY_MOD_ADDITIVE = 0
+local SPAWN_COLLISION_ALWAYS = 1
+local SPAWN_SCALE_MULTIPLY_ROOT = 1
 local GAS_VALUE_EPSILON = 0.01
 
 local GAS_ATTRIBUTE_NAMES = {
     health = "Health",
     maxHealth = "MaxHealth",
     attack = "ATK",
+    baseAttack = "BaseATK",
     defence = "Def",
+    baseDefence = "BaseDEF",
 }
 
 local PALETTE = {
@@ -247,11 +250,6 @@ local function actorLocation(actor)
     return parsed, nil
 end
 
-local function squaredDistance(a, b)
-    local dx, dy, dz = a.X - b.X, a.Y - b.Y, a.Z - b.Z
-    return dx * dx + dy * dy + dz * dz
-end
-
 local states = {}
 local origins = {}
 local classCatalog = {}
@@ -259,7 +257,6 @@ local classOrder = {}
 local objectQueue = {}
 local spawnQueue = {}
 local pendingSpawns = {}
-local discardSpawns = {}
 local discoveryBatch = false
 local generation = 1
 local worldPaused = true
@@ -269,6 +266,7 @@ local worldFault = nil
 
 local materialLibrary = nil
 local materialInterface = nil
+local gameplayStatics = nil
 
 local function clearWorldReferences()
     states = {}
@@ -278,7 +276,6 @@ local function clearWorldReferences()
     objectQueue = {}
     spawnQueue = {}
     pendingSpawns = {}
-    discardSpawns = {}
     discoveryBatch = false
     worldFault = nil
 end
@@ -310,6 +307,19 @@ local function resolveMaterialApi()
     end
     materialLibrary = library
     materialInterface = interface
+    return true, nil
+end
+
+local function resolveSpawnApi()
+    if isValid(gameplayStatics) then return true, nil end
+    local ok, library = pcall(
+        StaticFindObject,
+        "/Script/Engine.Default__GameplayStatics"
+    )
+    if not ok or not isValid(library) then
+        return false, "canonical GameplayStatics spawn API is unavailable"
+    end
+    gameplayStatics = library
     return true, nil
 end
 
@@ -394,7 +404,7 @@ local function snapshotGas(enemy)
         abilitySystem = abilitySystem,
         attributes = attributes,
         baseline = {},
-        applied = { maxHealth = 0.0, attack = 0.0, defence = 0.0 },
+        applied = { maxHealth = 0.0, baseAttack = 0.0, baseDefence = 0.0 },
     }
     for key, _ in pairs(GAS_ATTRIBUTE_NAMES) do
         local value, valueError = readGasValue(gas, key)
@@ -498,10 +508,57 @@ local function applyGasDelta(state, key, delta)
 end
 
 local function setGasValue(state, key, target)
+    if key == "health" then target = math.max(0.0, target) end
     local gas = state.baseline.gas
     local current, currentError = readGasValue(gas, key)
     if current == nil then error(currentError) end
     applyGasDelta(state, key, target - current)
+end
+
+local function retargetDerivedGasStat(state, finalKey, baseKey, multiplier, appliedKey)
+    local gas = state.baseline.gas
+    local current, currentError = readGasValue(gas, finalKey)
+    if current == nil then error(currentError) end
+    local desired = gas.baseline[finalKey] * multiplier
+    local firstDelta = desired - current
+    if math.abs(firstDelta) <= GAS_VALUE_EPSILON then return end
+    applyGasDelta(state, baseKey, firstDelta)
+    local actual, actualError = readGasValue(gas, finalKey)
+    if actual == nil then error(actualError) end
+    local tolerance = math.max(GAS_VALUE_EPSILON, math.abs(desired) * 0.0001)
+
+    local totalBaseDelta = firstDelta
+    if math.abs(actual - desired) > tolerance then
+        local response = actual - current
+        if math.abs(response) <= GAS_VALUE_EPSILON then
+            error(string.format(
+                "%s did not respond to %s",
+                GAS_ATTRIBUTE_NAMES[finalKey],
+                GAS_ATTRIBUTE_NAMES[baseKey]
+            ))
+        end
+        local slope = response / firstDelta
+        if not finiteNumber(slope) or math.abs(slope) <= GAS_VALUE_EPSILON then
+            error(GAS_ATTRIBUTE_NAMES[finalKey] ..
+                " returned an invalid base-attribute coefficient")
+        end
+        local correction = (desired - actual) / slope
+        applyGasDelta(state, baseKey, correction)
+        totalBaseDelta = totalBaseDelta + correction
+        actual, actualError = readGasValue(gas, finalKey)
+        if actual == nil then error(actualError) end
+    end
+
+    if math.abs(actual - desired) > tolerance then
+        error(string.format(
+            "%s did not follow %s (expected %.3f, received %.3f)",
+            GAS_ATTRIBUTE_NAMES[finalKey],
+            GAS_ATTRIBUTE_NAMES[baseKey],
+            desired,
+            actual
+        ))
+    end
+    gas.applied[appliedKey] = gas.applied[appliedKey] + totalBaseDelta
 end
 
 local function retargetGas(state, healthMultiplier, attackMultiplier, defenceMultiplier)
@@ -525,13 +582,20 @@ local function retargetGas(state, healthMultiplier, attackMultiplier, defenceMul
     if adjustedMaxHealth == nil then error(adjustedMaxError) end
     setGasValue(state, "health", adjustedMaxHealth * healthRatio)
 
-    local desiredAttackDelta = gas.baseline.attack * (attackMultiplier - 1.0)
-    applyGasDelta(state, "attack", desiredAttackDelta - gas.applied.attack)
-    gas.applied.attack = desiredAttackDelta
-
-    local desiredDefenceDelta = gas.baseline.defence * (defenceMultiplier - 1.0)
-    applyGasDelta(state, "defence", desiredDefenceDelta - gas.applied.defence)
-    gas.applied.defence = desiredDefenceDelta
+    retargetDerivedGasStat(
+        state,
+        "attack",
+        "baseAttack",
+        attackMultiplier,
+        "baseAttack"
+    )
+    retargetDerivedGasStat(
+        state,
+        "defence",
+        "baseDefence",
+        defenceMultiplier,
+        "baseDefence"
+    )
 end
 
 local function captureMutationState(state)
@@ -540,8 +604,8 @@ local function captureMutationState(state)
         gasValues = gasValues(state.baseline.gas),
         gasApplied = {
             maxHealth = state.baseline.gas.applied.maxHealth,
-            attack = state.baseline.gas.applied.attack,
-            defence = state.baseline.gas.applied.defence,
+            baseAttack = state.baseline.gas.applied.baseAttack,
+            baseDefence = state.baseline.gas.applied.baseDefence,
         },
         applied = state.applied,
         colorParameter = state.colorParameter,
@@ -571,8 +635,8 @@ local function rollbackMutation(state, previous)
     local ok, rollbackError = pcall(function()
         setGasValue(state, "maxHealth", previous.gasValues.maxHealth)
         setGasValue(state, "health", previous.gasValues.health)
-        setGasValue(state, "attack", previous.gasValues.attack)
-        setGasValue(state, "defence", previous.gasValues.defence)
+        setGasValue(state, "baseAttack", previous.gasValues.baseAttack)
+        setGasValue(state, "baseDefence", previous.gasValues.baseDefence)
         object:SetActorScale3D(previous.scale)
         object.MaxHelth = previous.MaxHelth
         object.AttackPower = previous.AttackPower
@@ -596,8 +660,8 @@ local function rollbackMutation(state, previous)
     end
     local gas = state.baseline.gas
     gas.applied.maxHealth = previous.gasApplied.maxHealth
-    gas.applied.attack = previous.gasApplied.attack
-    gas.applied.defence = previous.gasApplied.defence
+    gas.applied.baseAttack = previous.gasApplied.baseAttack
+    gas.applied.baseDefence = previous.gasApplied.baseDefence
     state.applied = previous.applied
     state.colorParameter = previous.colorParameter
     state.appliedColor = copyColor(previous.appliedColor)
@@ -761,6 +825,19 @@ local function destroyOwned(state, reason)
     return true
 end
 
+local function destroyPending(request, reason)
+    if isValid(request.object) then
+        local ok, destroyError = pcall(function() request.object:K2_DestroyActor() end)
+        if not ok then
+            log("DESTROY ERROR | pending " .. request.actorKey ..
+                " | " .. tostring(destroyError))
+            return false
+        end
+    end
+    dbg("PENDING EXTRA REMOVED | " .. request.actorKey .. " | " .. reason)
+    return true
+end
+
 local function removeOrigin(originKey, destroyActors)
     origins[originKey] = nil
     for index = #spawnQueue, 1, -1 do
@@ -768,7 +845,8 @@ local function removeOrigin(originKey, destroyActors)
     end
     for index = #pendingSpawns, 1, -1 do
         if pendingSpawns[index].originKey == originKey then
-            discardSpawns[#discardSpawns + 1] = table.remove(pendingSpawns, index)
+            local request = table.remove(pendingSpawns, index)
+            destroyPending(request, "origin removed")
         end
     end
     if destroyActors then
@@ -798,6 +876,12 @@ local function enforceGlobalCap()
         ))
     end
 
+    while activeExtraCount() > CONFIG.MAX_ACTIVE_EXTRAS
+        and #pendingSpawns > 0 do
+        local request = table.remove(pendingSpawns)
+        destroyPending(request, "global cap reduced")
+    end
+
     if activeExtraCount() <= CONFIG.MAX_ACTIVE_EXTRAS then return end
     local owned = {}
     for _, state in pairs(states) do
@@ -810,9 +894,6 @@ local function enforceGlobalCap()
     for _, state in ipairs(owned) do
         if activeExtraCount() <= CONFIG.MAX_ACTIVE_EXTRAS then break end
         destroyOwned(state, "global cap reduced")
-    end
-    if activeExtraCount() > CONFIG.MAX_ACTIVE_EXTRAS then
-        log("SPAWN CAP | pending native requests temporarily exceed the new cap")
     end
 end
 
@@ -868,9 +949,10 @@ local function reconcileOrigin(origin)
             end
         end
         for index = #pendingSpawns, 1, -1 do
-            local ticket = pendingSpawns[index]
-            if ticket.originKey == origin.key and ticket.slot > desired then
-                discardSpawns[#discardSpawns + 1] = table.remove(pendingSpawns, index)
+            local request = pendingSpawns[index]
+            if request.originKey == origin.key and request.slot > desired then
+                table.remove(pendingSpawns, index)
+                destroyPending(request, "multiplier reduced")
             end
         end
         local removals = {}
@@ -894,28 +976,36 @@ local function addClass(classObject, classKey)
     dbg("CLASS DISCOVERED | " .. classKey)
 end
 
-local function matchTicket(tickets, classKey, location)
-    local maximumSquared = SPAWN_MATCH_DISTANCE_CM * SPAWN_MATCH_DISTANCE_CM
-    for index, ticket in ipairs(tickets) do
-        if ticket.generation == generation
-            and ticket.classKey == classKey
-            and squaredDistance(ticket.position, location) <= maximumSquared then
-            table.remove(tickets, index)
-            return ticket
+local function takePendingSpawn(actorKey)
+    for index, request in ipairs(pendingSpawns) do
+        if request.generation == generation and request.actorKey == actorKey then
+            table.remove(pendingSpawns, index)
+            return request
         end
     end
     return nil
 end
 
-local function registerEnemy(enemy, reused, discardOnly)
+local function registerEnemy(enemy, reused)
     if not isValid(enemy) then return end
     local key = objectKey(enemy)
     if key == nil or key:find("Default__", 1, true) ~= nil then return end
 
+    local request = takePendingSpawn(key)
     local previous = states[key]
     if previous ~= nil and not reused then return end
     if previous ~= nil then
         if previous.owned then
+            if request == nil then
+                request = {
+                    generation = generation,
+                    originKey = previous.originKey,
+                    slot = previous.slot,
+                    classKey = previous.classKey,
+                    actorKey = previous.key,
+                    object = previous.object,
+                }
+            end
             states[key] = nil
         else
             removeOrigin(key, true)
@@ -933,33 +1023,23 @@ local function registerEnemy(enemy, reused, discardOnly)
         log("ENEMY ERROR | " .. key .. " | " .. locationError)
         return
     end
-    local discardedTicket = matchTicket(discardSpawns, classKey, location)
-    if discardedTicket ~= nil then
-        local okDestroy, destroyError =
-            pcall(function() enemy:K2_DestroyActor() end)
-        if not okDestroy then
-            log("DESTROY ERROR | retired spawn request | " .. tostring(destroyError))
-        else
-            dbg("SPAWN RETIRED | destroyed completed request for " .. classKey)
-        end
+    if request ~= nil and request.classKey ~= classKey then
+        destroyPending(request, "spawned class did not match the requested class")
+        log("SPAWN ERROR | created class " .. classKey ..
+            " does not match requested class " .. request.classKey)
         return
     end
-    if discardOnly then return end
     local baseline, snapshotError = snapshotEnemy(enemy)
     if baseline == nil then
         log("ENEMY ERROR | " .. key .. " | " .. snapshotError)
+        if request ~= nil then
+            destroyPending(request, "required enemy state was unavailable")
+        end
         return
     end
 
-    local ticket = matchTicket(pendingSpawns, classKey, location)
-    if ticket ~= nil and activeExtraCount() >= CONFIG.MAX_ACTIVE_EXTRAS then
-        local okDestroy, destroyError =
-            pcall(function() enemy:K2_DestroyActor() end)
-        if not okDestroy then
-            log("DESTROY ERROR | unmatched cap overflow | " .. tostring(destroyError))
-        else
-            dbg("SPAWN CAP | destroyed completed request above the current cap")
-        end
+    if request ~= nil and activeExtraCount() >= CONFIG.MAX_ACTIVE_EXTRAS then
+        destroyPending(request, "completed above the current cap")
         return
     end
     local state = {
@@ -968,9 +1048,9 @@ local function registerEnemy(enemy, reused, discardOnly)
         classObject = classObject,
         classKey = classKey,
         baseline = baseline,
-        owned = ticket ~= nil,
-        originKey = ticket and ticket.originKey or nil,
-        slot = ticket and ticket.slot or nil,
+        owned = request ~= nil,
+        originKey = request and request.originKey or nil,
+        slot = request and request.slot or nil,
         applied = false,
     }
     states[key] = state
@@ -1010,33 +1090,20 @@ local function cleanupInvalidStates()
     for _, key in ipairs(invalidNatural) do removeOrigin(key, true) end
 end
 
-local function expireSpawnTickets()
+local function expirePendingSpawns()
     for index = #pendingSpawns, 1, -1 do
-        local ticket = pendingSpawns[index]
-        if ticket.generation ~= generation or elapsedMs >= ticket.expiresAtMs then
-            if ticket.generation == generation then
-                log(string.format(
-                    "SPAWN ERROR | no enemy matched origin=%s slot=%d class=%s",
-                    ticket.originKey,
-                    ticket.slot,
-                    ticket.classKey
-                ))
-            end
+        local request = pendingSpawns[index]
+        if request.generation ~= generation or elapsedMs >= request.expiresAtMs then
             table.remove(pendingSpawns, index)
-        end
-    end
-    for index = #discardSpawns, 1, -1 do
-        local ticket = discardSpawns[index]
-        if ticket.generation ~= generation or elapsedMs >= ticket.expiresAtMs then
-            if ticket.generation == generation then
+            if request.generation == generation then
                 log(string.format(
-                    "SPAWN RETIRE ERROR | no enemy matched origin=%s slot=%d class=%s",
-                    ticket.originKey,
-                    ticket.slot,
-                    ticket.classKey
+                    "SPAWN ERROR | created enemy did not finish initialization origin=%s slot=%d class=%s",
+                    request.originKey,
+                    request.slot,
+                    request.classKey
                 ))
+                destroyPending(request, "initialization timeout")
             end
-            table.remove(discardSpawns, index)
         end
     end
 end
@@ -1048,29 +1115,77 @@ local function processSpawnRequest()
         log("SPAWN ERROR | requested UClass is no longer valid: " .. request.classKey)
         return
     end
-    local okController, controller = pcall(FindFirstOf, "RODInGamePlayerController")
-    if not okController or not isValid(controller) then
-        log("SPAWN ERROR | RODInGamePlayerController is unavailable")
+    local originState = states[request.originKey]
+    if originState == nil or originState.owned or not isValid(originState.object) then
+        log("SPAWN ERROR | natural origin is unavailable: " .. request.originKey)
         return
     end
+    local apiReady, apiError = resolveSpawnApi()
+    if not apiReady then
+        log("SPAWN ERROR | " .. apiError)
+        return
+    end
+
+    local transform = {
+        Rotation = { X = 0.0, Y = 0.0, Z = 0.0, W = 1.0 },
+        Translation = request.position,
+        Scale3D = { X = 1.0, Y = 1.0, Z = 1.0 },
+    }
+    local spawned = nil
+    local insertedPending = false
     local okSpawn, spawnError = pcall(function()
-        controller:ServerDebugEnemySpawn(
+        spawned = gameplayStatics:BeginDeferredActorSpawnFromClass(
+            originState.object,
             request.classObject,
-            request.level,
-            request.position
+            transform,
+            SPAWN_COLLISION_ALWAYS,
+            nil,
+            SPAWN_SCALE_MULTIPLY_ROOT
         )
+        if not isValid(spawned) then
+            error("BeginDeferredActorSpawnFromClass returned no actor")
+        end
+        request.actorKey = objectKey(spawned)
+        if request.actorKey == nil then error("created actor has no canonical object key") end
+        request.object = spawned
+        request.expiresAtMs = elapsedMs + SPAWN_INITIALIZE_MS
+        pendingSpawns[#pendingSpawns + 1] = request
+        insertedPending = true
+
+        local finished = gameplayStatics:FinishSpawningActor(
+            spawned,
+            transform,
+            SPAWN_SCALE_MULTIPLY_ROOT
+        )
+        if not isValid(finished) then error("FinishSpawningActor returned no actor") end
+        local finishedKey = objectKey(finished)
+        if finishedKey ~= request.actorKey then
+            error("FinishSpawningActor returned a different actor")
+        end
+        request.object = finished
+        finished:SetEnemyLevel(request.level, false)
     end)
     if not okSpawn then
-        log("SPAWN ERROR | ServerDebugEnemySpawn failed: " .. tostring(spawnError))
+        if insertedPending then
+            for index = #pendingSpawns, 1, -1 do
+                if pendingSpawns[index] == request then
+                    table.remove(pendingSpawns, index)
+                    break
+                end
+            end
+        end
+        if isValid(spawned) then
+            pcall(function() spawned:K2_DestroyActor() end)
+        end
+        log("SPAWN ERROR | canonical actor creation failed: " .. tostring(spawnError))
         return
     end
-    request.expiresAtMs = elapsedMs + SPAWN_TICKET_MS
-    pendingSpawns[#pendingSpawns + 1] = request
     dbg(string.format(
-        "SPAWN REQUEST | origin=%s slot=%d class=%s",
+        "SPAWN CREATED | origin=%s slot=%d class=%s actor=%s",
         request.originKey,
         request.slot,
-        request.classKey
+        request.classKey,
+        request.actorKey
     ))
 end
 
@@ -1094,7 +1209,8 @@ end
 local function disableWorld(reason)
     spawnQueue = {}
     for index = #pendingSpawns, 1, -1 do
-        discardSpawns[#discardSpawns + 1] = table.remove(pendingSpawns, index)
+        local request = table.remove(pendingSpawns, index)
+        destroyPending(request, reason)
     end
     local owned = {}
     for _, state in pairs(states) do
@@ -1189,21 +1305,13 @@ local function tick(stepMs)
     end
     if worldFault ~= nil then return end
     if not configHealthy or not CONFIG.ENABLED then
-        expireSpawnTickets()
-        if #discardSpawns > 0 then
-            for _ = 1, MAX_DISCOVERY_PER_TICK do
-                local queued = table.remove(objectQueue, 1)
-                if queued == nil then break end
-                registerEnemy(queued.object, queued.reused, true)
-            end
-        else
-            objectQueue = {}
-        end
+        expirePendingSpawns()
+        objectQueue = {}
         return
     end
 
     cleanupInvalidStates()
-    expireSpawnTickets()
+    expirePendingSpawns()
     if rescanRequested then
         rescanRequested = false
         if not requestWorldScan() then return end
@@ -1212,7 +1320,7 @@ local function tick(stepMs)
     for _ = 1, MAX_DISCOVERY_PER_TICK do
         local queued = table.remove(objectQueue, 1)
         if queued == nil then break end
-        registerEnemy(queued.object, queued.reused, false)
+        registerEnemy(queued.object, queued.reused)
     end
     if discoveryBatch and #objectQueue == 0 then
         discoveryBatch = false
@@ -1255,8 +1363,7 @@ end
 
 local function queueLifecycleEnemy(object, reused)
     if worldPaused and resumeAtMs == nil then return end
-    if CONFIG ~= nil and (not configHealthy or not CONFIG.ENABLED)
-        and #discardSpawns == 0 then return end
+    if CONFIG ~= nil and (not configHealthy or not CONFIG.ENABLED) then return end
     if worldFault ~= nil then return end
     objectQueue[#objectQueue + 1] = { object = object, reused = reused }
 end
@@ -1300,7 +1407,7 @@ RegisterConsoleCommandGlobalHandler(
                 if state.owned then owned = owned + 1 else natural = natural + 1 end
             end
             log(string.format(
-                "STATUS | healthy=%s enabled=%s paused=%s fault=%s natural=%d extras=%d queued=%d pending=%d retiring=%d classes=%d",
+                "STATUS | healthy=%s enabled=%s paused=%s fault=%s natural=%d extras=%d queued=%d pending=%d classes=%d",
                 tostring(configHealthy),
                 tostring(CONFIG ~= nil and CONFIG.ENABLED),
                 tostring(worldPaused),
@@ -1309,7 +1416,6 @@ RegisterConsoleCommandGlobalHandler(
                 owned,
                 #spawnQueue,
                 #pendingSpawns,
-                #discardSpawns,
                 #classOrder
             ))
         end)

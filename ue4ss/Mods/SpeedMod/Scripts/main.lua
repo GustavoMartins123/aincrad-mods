@@ -1,4 +1,4 @@
-print("[SpeedMod] Loading TERRAIN RUNNER v7.14 - PERSISTENT HERO + STABLE JUMP STATE...")
+print("[SpeedMod] Loading TERRAIN RUNNER v7.15 - CDO-STABLE JUMP BASELINE...")
 print("[SpeedMod] Startup is passive; lifecycle hooks arm only after the initial world settles.")
 print("[SpeedMod] Quest/map travel uses an extended post-load guard; ClientRestart uses tick-safe quarantine.")
 
@@ -237,6 +237,7 @@ local movementReadyReported = false
 local movementErrorReported = false
 local jumpReadySignature = nil
 local jumpIdentityErrorReported = false
+local jumpBaselineErrorReported = false
 local heroWaitingReported = false
 local disabledStateReported = false
 local boostReadyReported = false
@@ -483,6 +484,7 @@ local function clearJumpTracking()
     jumpWriteSupported = nil
     jumpReadySignature = nil
     jumpIdentityErrorReported = false
+    jumpBaselineErrorReported = false
 end
 
 local function restoreJumpVelocity()
@@ -516,8 +518,57 @@ end
 -- CharacterMovement.JumpZVelocity is the canonical Unreal vertical launch
 -- property. Ballistic apex height is proportional to velocity squared, so the
 -- square root converts a requested height multiplier into launch velocity.
-local function applyJumpHeight(movement)
-    if not isValidObj(movement) then return false end
+local function resolveCanonicalJumpBaseline(hero, movement)
+    local resolved, valueOrError = pcall(function()
+        local heroClass = hero:GetClass()
+        if not isValidObj(heroClass) then
+            error("hero class is unavailable")
+        end
+
+        local heroCDO = heroClass:GetCDO()
+        if not isValidObj(heroCDO) then
+            error("hero class default object is unavailable")
+        end
+
+        -- ACharacter.CharacterMovement on the concrete hero CDO is the
+        -- authoritative Blueprint-configured default subobject. Reading the
+        -- live component here would compound our own write after UE4SS's
+        -- "Restart All Mods".
+        local defaultMovement = heroCDO.CharacterMovement
+        if not isValidObj(defaultMovement) then
+            error("hero CDO CharacterMovement is unavailable")
+        end
+
+        local liveClass = movement:GetClass()
+        local defaultClass = defaultMovement:GetClass()
+        if not isValidObj(liveClass) or not isValidObj(defaultClass) then
+            error("movement component class identity is unavailable")
+        end
+
+        local liveClassName = liveClass:GetFullName()
+        local defaultClassName = defaultClass:GetFullName()
+        if type(liveClassName) ~= "string"
+            or type(defaultClassName) ~= "string"
+            or liveClassName ~= defaultClassName then
+            error("live movement class does not match the hero CDO")
+        end
+
+        local nativeVelocity = readNumber(defaultMovement, "JumpZVelocity")
+        if nativeVelocity == nil or nativeVelocity <= 0.0 then
+            error("hero CDO JumpZVelocity is unavailable")
+        end
+
+        return nativeVelocity
+    end)
+
+    if not resolved then
+        return nil, tostring(valueOrError)
+    end
+    return valueOrError, nil
+end
+
+local function applyJumpHeight(hero, movement)
+    if not isValidObj(hero) or not isValidObj(movement) then return false end
 
     local identityOk, movementIdentity = pcall(function()
         return movement:GetFullName()
@@ -536,14 +587,21 @@ local function applyJumpHeight(movement)
         if not restoreJumpVelocity() then return false end
         jumpMovement = movement
         jumpMovementKey = movementIdentity
-        nativeJumpZVelocity = readNumber(movement, "JumpZVelocity")
+        local baseline, baselineError =
+            resolveCanonicalJumpBaseline(hero, movement)
+        nativeJumpZVelocity = baseline
         jumpWriteSupported = nil
 
         if nativeJumpZVelocity == nil or nativeJumpZVelocity <= 0.0 then
             jumpWriteSupported = false
-            warn("JUMP HEIGHT ERROR | CharacterMovement.JumpZVelocity is unavailable")
+            if not jumpBaselineErrorReported then
+                jumpBaselineErrorReported = true
+                warn("JUMP HEIGHT ERROR | canonical CDO baseline unavailable: " ..
+                    tostring(baselineError))
+            end
             return false
         end
+        jumpBaselineErrorReported = false
     else
         -- UE4SS may expose a new Lua wrapper for the same Unreal object on each
         -- call. Refresh the wrapper but retain the native baseline and log state.
@@ -629,7 +687,7 @@ local function applyLiveJumpSetting()
     end
     movementErrorReported = false
 
-    applyJumpHeight(movement)
+    applyJumpHeight(hero, movement)
 end
 
 -- Combat lock intentionally ignores generic "current target" proximity.
@@ -1383,7 +1441,7 @@ local function tick(stepMs)
 
     -- Jump height is independent of the sprint boost and remains active during
     -- combat lock. It is still restored when the Speed mod itself is disabled.
-    applyJumpHeight(movement)
+    applyJumpHeight(hero, movement)
 
     local combatSignal, combatReason = getCombatEngagementSignal(hero)
 
