@@ -358,9 +358,15 @@ deltas it applied.
 Bosses are never spawn candidates. The director checks both the reflected
 `EnemyRole_Boss` value and `GoldenGateBoss`; the boss option permits mutation
 of the natural actor only. A Blueprint class reused by a mission boss is
-quarantined for that whole world, including queued and existing extras.
-Quest-end events destroy extras and release all references before Unreal
-collects the outgoing mission world.
+quarantined for that whole world. Initial discovery must remain stable for two
+seconds before any extras are issued. If boss classification nevertheless
+arrives after an owned actor was issued, spawning fails closed and requires a
+mission restart rather than destroying an initializing actor.
+
+Confirmed travel releases outgoing-world references before Unreal collects the
+mission. A standalone `ClientRestart` or quest teleport within the same world
+preserves ownership and temporarily quarantines processing, preventing the
+director from rediscovering and multiplying its own extras.
 
 See
 [`ue4ss\Mods\WorldEnemyDirector\README.md`](ue4ss/Mods/WorldEnemyDirector/README.md)

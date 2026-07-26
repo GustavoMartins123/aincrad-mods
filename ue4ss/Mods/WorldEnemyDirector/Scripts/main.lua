@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.3.1"
+local MOD_VERSION = "1.3.2"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -22,6 +22,8 @@ local RUNTIME_LOCK_PATH = RUNTIME_PATH .. ".lock"
 
 local STARTUP_SETTLE_MS = 8000
 local RESTART_SETTLE_MS = 5000
+local QUEST_TELEPORT_SETTLE_MS = 8000
+local DISCOVERY_STABILIZE_MS = 2000
 local SETTINGS_POLL_MS = 1000
 local SPAWN_INITIALIZE_MS = 8000
 local SPAWN_Z_OFFSET_CM = 40.0
@@ -287,11 +289,13 @@ local objectQueue = {}
 local spawnQueue = {}
 local pendingSpawns = {}
 local discoveryBatch = false
+local discoveryReadyAtMs = nil
 local generation = 1
 local worldPaused = true
 local resumeAtMs = STARTUP_SETTLE_MS
 local rescanRequested = false
 local worldFault = nil
+local awaitingTravelRestart = false
 
 local materialLibrary = nil
 local materialInterface = nil
@@ -319,12 +323,14 @@ local function clearWorldReferences()
     spawnQueue = {}
     pendingSpawns = {}
     discoveryBatch = false
+    discoveryReadyAtMs = nil
     worldFault = nil
 end
 
 local function beginTravel(reason)
-    if worldPaused and resumeAtMs == nil then return end
+    if awaitingTravelRestart and worldPaused and resumeAtMs == nil then return end
     generation = generation + 1
+    awaitingTravelRestart = true
     worldPaused = true
     resumeAtMs = nil
     local released, releaseFailures = 0, 0
@@ -343,19 +349,51 @@ local function beginTravel(reason)
         ))
     end
     log(string.format(
-        "TRAVEL START | %s | extras released=%d | native references cleared",
+        "TRAVEL START | %s | owned references released=%d | native references cleared",
         reason,
         released
     ))
 end
 
 local function beginRestartSettle()
-    generation = generation + 1
+    local followedTravel = awaitingTravelRestart
+    awaitingTravelRestart = false
     worldPaused = true
-    resumeAtMs = elapsedMs + RESTART_SETTLE_MS
-    clearWorldReferences()
-    scheduleReferenceCollection()
-    log("TRAVEL SETTLE | ClientRestart | waiting 5 seconds")
+    local requestedResumeAtMs = elapsedMs + RESTART_SETTLE_MS
+    if resumeAtMs == nil or resumeAtMs < requestedResumeAtMs then
+        resumeAtMs = requestedResumeAtMs
+    end
+
+    if followedTravel then
+        clearWorldReferences()
+        scheduleReferenceCollection()
+        log("TRAVEL SETTLE | ClientRestart after travel | waiting 5 seconds")
+        return
+    end
+
+    log(string.format(
+        "WORLD QUARANTINE | ClientRestart without travel | retained states=%d pending=%d queued=%d",
+        (function()
+            local count = 0
+            for _, _ in pairs(states) do count = count + 1 end
+            return count
+        end)(),
+        #pendingSpawns,
+        #spawnQueue
+    ))
+end
+
+local function beginQuestTeleportSettle()
+    if awaitingTravelRestart and worldPaused and resumeAtMs == nil then return end
+    worldPaused = true
+    local requestedResumeAtMs = elapsedMs + QUEST_TELEPORT_SETTLE_MS
+    if resumeAtMs == nil or resumeAtMs < requestedResumeAtMs then
+        resumeAtMs = requestedResumeAtMs
+    end
+    log(string.format(
+        "WORLD QUARANTINE | ServerNotifyQuestTeleportOut | retained states and waiting %d seconds",
+        QUEST_TELEPORT_SETTLE_MS / 1000
+    ))
 end
 
 local function resolveMaterialApi()
@@ -1104,36 +1142,49 @@ local function protectBossClass(classKey)
     for index = #classOrder, 1, -1 do
         if classOrder[index] == classKey then table.remove(classOrder, index) end
     end
+
+    local protectedOriginKeys = {}
+    for originKey, origin in pairs(origins) do
+        if origin.classKey == classKey then
+            protectedOriginKeys[originKey] = true
+            origins[originKey] = nil
+        end
+    end
+
     for index = #spawnQueue, 1, -1 do
-        if spawnQueue[index].classKey == classKey then
+        local request = spawnQueue[index]
+        if request.classKey == classKey
+            or protectedOriginKeys[request.originKey] == true then
             table.remove(spawnQueue, index)
         end
     end
-    for index = #pendingSpawns, 1, -1 do
-        local request = pendingSpawns[index]
-        if request.classKey == classKey then
-            table.remove(pendingSpawns, index)
-            destroyPending(request, "class identified as a boss class")
+
+    local unsafeActors = 0
+    for _, request in ipairs(pendingSpawns) do
+        if request.classKey == classKey
+            or protectedOriginKeys[request.originKey] == true then
+            unsafeActors = unsafeActors + 1
         end
     end
-
-    local originKeys = {}
-    for originKey, origin in pairs(origins) do
-        if origin.classKey == classKey then
-            originKeys[#originKeys + 1] = originKey
-        end
-    end
-    for _, originKey in ipairs(originKeys) do removeOrigin(originKey, true) end
-
-    local unsafeOwned = {}
     for _, state in pairs(states) do
-        if state.owned and state.classKey == classKey then
-            unsafeOwned[#unsafeOwned + 1] = state
+        if state.owned
+            and (state.classKey == classKey
+                or protectedOriginKeys[state.originKey] == true) then
+            unsafeActors = unsafeActors + 1
         end
     end
-    for _, state in ipairs(unsafeOwned) do
-        destroyOwned(state, "class identified as a boss class")
+
+    if unsafeActors > 0 then
+        spawnQueue = {}
+        worldFault = string.format(
+            "boss class %s was identified after %d owned actor(s) had been issued; mission restart required",
+            classKey,
+            unsafeActors
+        )
+        log("WORLD ERROR | " .. worldFault .. " | director paused")
+        return
     end
+
     log("BOSS CLASS PROTECTED | removed from spawn system: " .. classKey)
 end
 
@@ -1209,8 +1260,10 @@ local function registerEnemy(enemy, reused)
     if baseline.isBoss then
         protectBossClass(classKey)
         if request ~= nil then
-            destroyPending(request, "spawn initialized as a boss")
-            log("BOSS SPAWN REJECTED | destroyed owned actor: " .. key)
+            spawnQueue = {}
+            worldFault = "owned spawn initialized as protected boss " ..
+                key .. "; mission restart required"
+            log("WORLD ERROR | " .. worldFault .. " | director paused")
             return
         end
     end
@@ -1394,6 +1447,7 @@ local function requestWorldScan()
         return false
     end
     discoveryBatch = true
+    discoveryReadyAtMs = elapsedMs + DISCOVERY_STABILIZE_MS
     if enemies ~= nil then
         for _, enemy in pairs(enemies) do
             objectQueue[#objectQueue + 1] = { object = enemy, reused = false }
@@ -1421,33 +1475,24 @@ disableWorld = function(reason)
     for _, origin in pairs(origins) do origin.issued = 0 end
 end
 
--- The outgoing world is about to be destroyed, so natural actors do not need
--- their mutations rolled back. Destroy only actors owned by this mod, then let
--- beginTravel release every Lua reference immediately.
+-- The outgoing world is about to be destroyed. Calling K2_DestroyActor here
+-- races the game's asynchronous enemy teardown and can leave worker tasks with
+-- a dangling actor. Count the owned references for diagnostics and let
+-- beginTravel release every Lua reference; the world remains the authoritative
+-- owner of actor destruction.
 releaseWorldForTravel = function(reason)
     local released = 0
-    local failures = 0
     spawnQueue = {}
-    for index = #pendingSpawns, 1, -1 do
-        local request = table.remove(pendingSpawns, index)
-        if destroyPending(request, reason) then
-            released = released + 1
-        else
-            failures = failures + 1
-        end
-    end
-    local owned = {}
+    released = released + #pendingSpawns
     for _, state in pairs(states) do
-        if state.owned then owned[#owned + 1] = state end
+        if state.owned then released = released + 1 end
     end
-    for _, state in ipairs(owned) do
-        if destroyOwned(state, reason) then
-            released = released + 1
-        else
-            failures = failures + 1
-        end
-    end
-    return released, failures
+    dbg(string.format(
+        "TRAVEL RELEASE | %s | owned references=%d",
+        reason,
+        released
+    ))
+    return released, 0
 end
 
 local function applyNewSettings(settings, digest)
@@ -1550,12 +1595,17 @@ local function tick(stepMs)
         if queued == nil then break end
         registerEnemy(queued.object, queued.reused)
     end
-    if discoveryBatch and #objectQueue == 0 then
+    if discoveryBatch
+        and #objectQueue == 0
+        and discoveryReadyAtMs ~= nil
+        and elapsedMs >= discoveryReadyAtMs then
         discoveryBatch = false
+        discoveryReadyAtMs = nil
         for _, origin in pairs(origins) do reconcileOrigin(origin) end
         enforceGlobalCap()
         dbg("WORLD SCAN | discovery batch completed")
     end
+    if discoveryBatch then return end
     if #spawnQueue > 0 then processSpawnRequest() end
 end
 
@@ -1594,6 +1644,9 @@ local function queueLifecycleEnemy(object, reused)
     if CONFIG ~= nil and (not configHealthy or not CONFIG.ENABLED) then return end
     if worldFault ~= nil then return end
     objectQueue[#objectQueue + 1] = { object = object, reused = reused }
+    if discoveryBatch then
+        discoveryReadyAtMs = elapsedMs + DISCOVERY_STABILIZE_MS
+    end
 end
 
 requireHook(
@@ -1626,6 +1679,11 @@ for _, travelHook in ipairs({
     local hookLabel = travelHook[2]
     requireHook(hookPath, function() beginTravel(hookLabel) end)
 end
+
+requireHook(
+    "/Script/ROD.RODPlayerState:ServerNotifyQuestTeleportOut",
+    beginQuestTeleportSettle
+)
 
 requireHook("/Script/Engine.PlayerController:ClientRestart", beginRestartSettle)
 

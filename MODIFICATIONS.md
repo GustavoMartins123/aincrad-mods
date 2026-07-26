@@ -442,13 +442,20 @@ menu restoration, and equipment workflow were retained.
 - Fixed live numeric edits exposing a partially written `runtime.lua`, which
   could make SpeedMod reject a temporarily missing `START_SPEED`.
 - Fixed World Enemy Director retaining outgoing-mission enemy references until
-  `ClientRestart`; quest-end events now destroy owned extras and release
-  references before world collection.
+  `ClientRestart`; quest-end events now release references before world
+  collection and leave asynchronous actor teardown to Unreal.
+- Fixed standalone `ClientRestart` events discarding World Enemy Director
+  ownership inside the same mission. Existing extras are now retained instead
+  of being rediscovered as natural enemies and multiplied recursively.
+- Added a dedicated quarantine for `ServerNotifyQuestTeleportOut` and a
+  two-second stable-discovery barrier before the first extra spawn.
 - Boss detection now uses the reflected `EnemyRole_Boss` enum together with
   `GoldenGateBoss`. Bosses can be mutated explicitly but can never be
   multiplied or selected by species randomisation.
-- Blueprint classes reused by a mission boss are quarantined for that world;
-  queued, pending, and already-owned extras of the class are removed.
+- Blueprint classes reused by a mission boss are quarantined for that world.
+  A late classification after an owned actor was issued now pauses the director
+  with an explicit mission-restart error instead of destroying an actor while
+  Unreal may still be initializing it asynchronously.
 - Fixed a configuration read failure being replaced by registry defaults in the
   panel. Missing, malformed, or invalid canonical settings now fail closed and
   are reported explicitly.

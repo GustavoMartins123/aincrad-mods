@@ -58,15 +58,23 @@ assets during streaming, because native asset loads in that phase can crash the
 process.
 
 Reducing the multiplier removes only extras above the new target. Killed extras
-are not recreated indefinitely. Travel immediately clears all Lua object
-references; processing resumes only after the game's `ClientRestart` signal and
-the fixed settlement period.
+are not recreated indefinitely. A confirmed map-travel signal immediately
+releases all outgoing-world Lua references without racing Unreal's asynchronous
+actor teardown. Processing resumes only after the matching `ClientRestart`
+signal and the fixed settlement period.
 
-The safe lobby and a mission are separate worlds. `ClientRestart` preserves the
-configured `ENABLED` state, discards the previous world's references, and
-requests a fresh enemy scan after settlement. An enabled director therefore
-starts in each mission automatically; an OFF/ON toggle is not part of the
-activation flow.
+The safe lobby and a mission are separate worlds. A `ClientRestart` that follows
+confirmed travel starts a clean scan of the new world. A standalone
+`ClientRestart` inside the same mission instead retains ownership of all
+existing extras; forgetting that ownership would make the director rediscover
+its own actors as natural spawns and multiply them again. Quest teleports pause
+the director for eight seconds while retaining the same-world state. An enabled
+director therefore starts in each mission automatically; an OFF/ON toggle is
+not part of the activation flow.
+
+Before issuing any extra spawn, the initial discovery batch must remain stable
+for two seconds. This gives delayed boss initialization events time to remove
+their Blueprint classes from both the origin list and the randomisation catalog.
 
 ## Combat attributes
 
@@ -117,10 +125,12 @@ logging.
   the spawn catalog and multiplication origins. The boss setting affects
   mutations only.
 - If a mission promotes a normally common Blueprint class to boss role, that
-  entire class is quarantined from spawning for the current world. Queued,
-  initializing, or already-owned extras of that class are removed.
-- Quest-end hooks destroy owned extras and release all world references before
-  Unreal begins collecting the outgoing mission.
+  entire class is quarantined from spawning for the current world. Queued
+  requests are removed. If the class is identified only after an owned actor
+  has already been issued, the director fails closed and requires a mission
+  restart instead of destroying an actor during asynchronous initialization.
+- Quest-end hooks release all outgoing-world Lua references before Unreal
+  begins collection. Unreal remains the authoritative owner of actor teardown.
 - A material that lacks the exact configured colour parameter will keep its
   original appearance and produce an explicit error.
 - Actor creation or initialization failures are reported and are not retried
