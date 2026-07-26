@@ -18,8 +18,10 @@
 
 local Panel = {}
 
+-- ESlateVisibility
 local VISIBLE = 0
 local COLLAPSED = 1
+local HIDDEN = 2
 
 local TEXTBLOCK_CLASS = "/Script/UMG.TextBlock"
 local IMAGE_CLASS = "/Script/UMG.Image"
@@ -53,6 +55,10 @@ local styleSource = nil
 -- Every widget this panel put into the host, so closing can take out exactly
 -- what it added and nothing else.
 local addedWidgets = {}
+-- The canvas the panel borrows is the menu's own SubMenu area, which the game
+-- keeps hidden until a submenu opens. Its visibility is forced on while the
+-- panel is up and put back exactly as it was on close.
+local restoreVisibility = nil
 
 local expandedMod = nil
 local selectionIndex = 1
@@ -224,6 +230,10 @@ local function placeInCanvas(widget, x, y, width)
         return false
     end
     addedWidgets[#addedWidgets + 1] = widget
+    -- A freshly constructed widget does not reliably start visible, and the
+    -- container it lands in may have been hidden, so say so explicitly.
+    pcall(function() widget:SetVisibility(VISIBLE) end)
+    pcall(function() widget:SetRenderOpacity(1.0) end)
     pcall(function() slot:SetAutoSize(width == nil) end)
     pcall(function() slot:SetPosition({ X = x, Y = y }) end)
     if width ~= nil then
@@ -292,6 +302,58 @@ local function resolveCanvas(widget, probe)
     return nil, nil
 end
 
+-- Walks from the canvas up through its parents, forcing anything collapsed or
+-- hidden to be visible and recording enough to put it all back. Only COLLAPSED
+-- and HIDDEN are touched: HIT_TEST_INVISIBLE still draws, and overriding it
+-- would needlessly change how the menu handles the mouse.
+local function forceVisibleChain(startWidget)
+    local restore = {}
+    local current = startWidget
+    local level = 0
+
+    while isValid(current) and level < 6 do
+        local visibility = nil
+        local opacity = nil
+        pcall(function() visibility = current:GetVisibility() end)
+        pcall(function() opacity = current:GetRenderOpacity() end)
+        log(string.format("  chain[%d] visibility=%s opacity=%s %s",
+            level, tostring(visibility), tostring(opacity), objectName(current)))
+
+        local changed = false
+        if visibility == COLLAPSED or visibility == HIDDEN then
+            if pcall(function() current:SetVisibility(VISIBLE) end) then changed = true end
+        end
+        if type(opacity) == "number" and opacity < 1.0 then
+            if pcall(function() current:SetRenderOpacity(1.0) end) then changed = true end
+        end
+        if changed then
+            restore[#restore + 1] =
+                { widget = current, visibility = visibility, opacity = opacity }
+        end
+
+        local parent = nil
+        pcall(function() parent = current.Slot.Parent end)
+        current = parent
+        level = level + 1
+    end
+
+    return restore
+end
+
+local function restoreVisibilityChain()
+    for _, entry in ipairs(restoreVisibility or {}) do
+        if isValid(entry.widget) then
+            if entry.visibility ~= nil then
+                pcall(function() entry.widget:SetVisibility(entry.visibility) end)
+            end
+            if entry.opacity ~= nil then
+                pcall(function() entry.widget:SetRenderOpacity(entry.opacity) end)
+            end
+        end
+    end
+    restoreVisibility = nil
+end
+
 -- Takes out only what the panel put in. The host belongs to the game, so
 -- detaching it would tear the start menu down with it.
 local function destroyPanel()
@@ -299,6 +361,7 @@ local function destroyPanel()
         if isValid(widget) then pcall(function() widget:RemoveFromParent() end) end
     end
     addedWidgets = {}
+    restoreVisibilityChain()
     canvas = nil
     rowWidgets = {}
     titleWidgets = nil
@@ -327,7 +390,14 @@ local function buildPanel()
         return false
     end
 
+    -- The canvas the game hands over is its SubMenu area, which stays collapsed
+    -- until a submenu opens. Without this the whole panel is built correctly and
+    -- renders nothing at all.
+    restoreVisibility = forceVisibleChain(canvas)
+
     addedWidgets[#addedWidgets + 1] = background
+    pcall(function() background:SetVisibility(VISIBLE) end)
+    pcall(function() background:SetRenderOpacity(1.0) end)
     pcall(function()
         background:SetColorAndOpacity({ R = 0.02, G = 0.03, B = 0.06, A = 0.88 })
     end)
