@@ -167,6 +167,49 @@ function Store.setModEnabled(modName, enabled)
     return false, "could not remove enabled.txt"
 end
 
+-- Changes the launch marker and the live ENABLED override as one transaction.
+-- If either write fails, restore the previous runtime table and launch marker.
+function Store.setEnabledState(modName, runtimeKey, enabled)
+    if type(runtimeKey) ~= "string" or runtimeKey == "" then
+        return false, "registered mod has no canonical ENABLED key"
+    end
+
+    local wasEnabled = Store.isModEnabled(modName)
+    if type(wasEnabled) ~= "boolean" then
+        return false, "could not read current enabled.txt state"
+    end
+
+    local previousRuntime = Store.readRuntime(modName)
+    local nextRuntime = {}
+    for key, value in pairs(previousRuntime) do
+        nextRuntime[key] = value
+    end
+    nextRuntime[runtimeKey] = enabled
+
+    local runtimeWritten, runtimeError =
+        Store.writeRuntime(modName, nextRuntime)
+    if not runtimeWritten then
+        return false, "runtime update failed: " .. tostring(runtimeError)
+    end
+
+    local markerWritten, markerError = Store.setModEnabled(modName, enabled)
+    if markerWritten then return true, nil end
+
+    local runtimeRolledBack, runtimeRollbackError =
+        Store.writeRuntime(modName, previousRuntime)
+    local markerRolledBack, markerRollbackError =
+        Store.setModEnabled(modName, wasEnabled)
+    if not runtimeRolledBack or not markerRolledBack then
+        return false, string.format(
+            "enabled.txt update failed (%s); rollback failed (runtime=%s, marker=%s)",
+            tostring(markerError),
+            tostring(runtimeRollbackError),
+            tostring(markerRollbackError)
+        )
+    end
+    return false, "enabled.txt update failed: " .. tostring(markerError)
+end
+
 -- Persists one changed setting, leaving every other override in place.
 function Store.setValue(modName, key, value)
     local values = Store.readRuntime(modName)

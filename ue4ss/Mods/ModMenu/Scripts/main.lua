@@ -1,4 +1,4 @@
--- ModMenu v1.2
+-- ModMenu v1.3
 -- Adds a native-styled "Mods" entry to Echoes of Aincrad's start menu, opening a
 -- panel that enables/disables the other mods and retunes their values in-game.
 --
@@ -12,7 +12,7 @@
 -- mod's Lua state, because UE4SS gives each mod its own.
 
 local MOD_NAME = "ModMenu"
-local MOD_VERSION = "v1.2"
+local MOD_VERSION = "v1.3"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -90,6 +90,14 @@ local function isValid(object)
     if object == nil then return false end
     local ok, valid = pcall(function() return object:IsValid() end)
     return ok and valid == true
+end
+
+local function dereferenceWeakObject(pointer)
+    if isValid(pointer) then return pointer end
+    if pointer == nil then return nil end
+    local ok, object = pcall(function() return pointer:Get() end)
+    if ok and isValid(object) then return object end
+    return nil
 end
 
 local function objectName(object)
@@ -475,19 +483,23 @@ local function injectModsEntry(mainMenu)
         return
     end
 
-    -- FieldEquipmentMenu builds a display-only clone of the main-menu widget when
-    -- Equipment opens, and that construction fires this mod's notification too.
-    -- Injecting a second Mods row into that clone is what makes the real row
-    -- appear to vanish behind Equipment. Refuse while a live menu already owns
-    -- the row.
-    if activeContext ~= nil and isValid(activeContext.mainMenu)
-        and objectName(activeContext.mainMenu) ~= menuKey then
-        local inViewport = false
-        pcall(function() inViewport = activeContext.mainMenu:IsInViewport() end)
-        if inViewport then
-            log("ignoring a second main-menu instance while one is live: " .. menuKey)
-            return
-        end
+    -- FieldEquipmentMenu deliberately creates a display-only clone of this
+    -- class for its stat overlay. The clone is added directly to the viewport
+    -- and has no owning widget component/actor; the real start menu is owned by
+    -- the game's world-space menu component. Injecting into the clone replaces
+    -- activeContext and strands the actual Mods row when the clone is removed.
+    local inViewport = false
+    local parentComponent = nil
+    local parentActor = nil
+    pcall(function() inViewport = mainMenu:IsInViewport() end)
+    pcall(function()
+        parentComponent = dereferenceWeakObject(mainMenu.ParentComponent)
+        parentActor = dereferenceWeakObject(mainMenu.ParentActor)
+    end)
+    if inViewport and not isValid(parentComponent) and not isValid(parentActor) then
+        injectedMenus[menuKey] = false
+        log("ignored display-only main-menu overlay: " .. menuKey)
+        return
     end
 
     log("injecting into " .. menuKey)
@@ -1124,11 +1136,15 @@ ensureInputHooks = function()
         end)
 
     -- The start menu closing must take the panel with it, or it would be left
-    -- floating over the world.
+    -- floating over the world. Keep the last context reference until a new real
+    -- menu replaces it: FieldEquipment temporarily closes/detaches that same
+    -- widget and later restores it. Clearing the context here made its Mods row
+    -- ownerless after returning from Equipment.
     safeHook("/Script/ROD.RODWidgetBPFunctionLibrary:EndMenu", function()
         if panel.isOpen() then closePanel() end
-        activeContext = nil
-        menuCloseBusy = false
+        -- If this EndMenu came from the Mods row, retain the close lock until
+        -- the next real menu injection. One physical Back press reaches several
+        -- hooked functions and must never call EndMenu more than once.
     end)
 
     log("input hooks installed")

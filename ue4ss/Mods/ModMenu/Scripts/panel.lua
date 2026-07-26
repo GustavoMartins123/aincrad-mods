@@ -421,7 +421,7 @@ local function buildPanel()
     if isValid(footer) then
         pcall(function()
             footer:SetText(FText(
-                "Up/Down select    Left/Right change    Enter toggle    Back close" ..
+                "Up/Down select    Left/Right change    Enter expand/toggle    Back close" ..
                 "        * restart required    + reopen menu"))
         end)
         styleText(footer, MUTED_COLOR)
@@ -435,7 +435,13 @@ local function buildPanel()
     -- count are simply collapsed, so over-allocating slightly is harmless.
     local widest = 0
     for _, entry in ipairs(registry or {}) do
-        widest = math.max(widest, #(entry.settings or {}))
+        local visibleSettings = 0
+        for _, setting in ipairs(entry.settings or {}) do
+            if setting.key ~= "ENABLED" then
+                visibleSettings = visibleSettings + 1
+            end
+        end
+        widest = math.max(widest, visibleSettings)
     end
     local maxRows = #(registry or {}) + widest
 
@@ -554,19 +560,24 @@ end
 
 local function toggleBool(row)
     if row.kind == "mod" then
-        -- Flip both halves of "enabled": enabled.txt is what UE4SS reads at
-        -- launch, and the mod's own ENABLED is what it honours while running.
-        -- Writing only one of them would leave the two disagreeing.
+        -- This is one UI toggle backed by an atomic store operation. enabled.txt
+        -- controls the next launch and the runtime ENABLED value controls the
+        -- already-loaded Lua state; neither half may change without the other.
         local loaded = store.isModEnabled(row.entry.mod)
         if loaded ~= nil then
             local wanted = not loaded
-            local ok, err = store.setModEnabled(row.entry.mod, wanted)
+            local enabledKey = nil
+            if row.enabledSetting ~= nil then
+                enabledKey = row.enabledSetting.key
+            end
+            local ok, err = store.setEnabledState(
+                row.entry.mod,
+                enabledKey,
+                wanted
+            )
             if not ok then
                 log("could not switch " .. row.entry.mod .. ": " .. tostring(err))
                 return false
-            end
-            if row.enabledSetting ~= nil then
-                store.setValue(row.entry.mod, row.enabledSetting.key, wanted)
             end
             buildRows()
             Panel.render()
@@ -617,14 +628,32 @@ function Panel.activate()
     if row.kind == "mod" then
         -- Enter expands, so a mod's settings are one press away and the enable
         -- toggle stays on left/right.
-        expandedMod = expandedMod == row.entry.mod and nil or row.entry.mod
+        local opening = expandedMod ~= row.entry.mod
+        if opening then
+            expandedMod = row.entry.mod
+        else
+            expandedMod = nil
+        end
         buildRows()
-        -- Keep the header the player just pressed under the cursor.
+        -- Opening lands on the first actual setting. Keeping the cursor on the
+        -- header made the next Left/Right press disable the whole mod when the
+        -- player reasonably expected to edit the newly opened settings.
+        local headerIndex = nil
         for index, candidate in ipairs(rows) do
             if candidate.kind == "mod" and candidate.entry.mod == row.entry.mod then
-                selectionIndex = index
+                headerIndex = index
                 break
             end
+        end
+        if headerIndex == nil then
+            log("row model lost the selected mod header: " .. row.entry.mod)
+            return
+        end
+        selectionIndex = headerIndex
+        if opening and rows[selectionIndex + 1] ~= nil
+            and rows[selectionIndex + 1].kind == "setting"
+            and rows[selectionIndex + 1].entry.mod == row.entry.mod then
+            selectionIndex = selectionIndex + 1
         end
         Panel.render()
         return
@@ -664,6 +693,11 @@ function Panel.close()
     if not isOpen then return end
     isOpen = false
     destroyPanel()
+    -- Each opening starts from a deterministic collapsed model. Persisting the
+    -- previous expansion made Enter collapse a mod that visually looked newly
+    -- opened, after which Left/Right acted on the wrong row.
+    expandedMod = nil
+    selectionIndex = 1
 end
 
 -- Dumps the host widget tree so the exact canvas/child names can be confirmed

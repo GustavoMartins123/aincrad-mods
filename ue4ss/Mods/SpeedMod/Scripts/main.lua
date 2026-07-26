@@ -1,9 +1,9 @@
-print("[SpeedMod] Loading TERRAIN RUNNER v7.12 - LIVE JUMP HEIGHT + STRICT CONFIG...")
+print("[SpeedMod] Loading TERRAIN RUNNER v7.13 - VERIFIED SPEED + JUMP STATE...")
 print("[SpeedMod] Startup is passive; lifecycle hooks arm only after the initial world settles.")
 print("[SpeedMod] Quest/map travel uses an extended post-load guard; ClientRestart uses tick-safe quarantine.")
 
 --========================================================--
---     TERRAIN RUNNER v7.12 - MOD STACK COMPATIBILITY   --
+--     TERRAIN RUNNER v7.13 - MOD STACK COMPATIBILITY   --
 --========================================================--
 -- Goals:
 --   * Preserve the transition/teleport crash protections.
@@ -232,6 +232,11 @@ local cachedHero = nil
 local jumpMovement = nil
 local nativeJumpZVelocity = nil
 local jumpWriteSupported = nil
+local movementReadyReported = false
+local movementErrorReported = false
+local jumpReadyReported = false
+local disabledStateReported = false
+local boostReadyReported = false
 local learnedJogCap = nil
 local learnedJogVelocity = nil
 local fallbackCalibrationMs = 0
@@ -377,10 +382,11 @@ end
 
 local function resolveMovementComponent(hero)
     local resolved, component = pcall(function()
-        return hero:GetCharacterMovement()
+        return hero:GetMovementComponent()
     end)
-    if resolved and isValidObj(component) then return component end
-    return nil
+    if resolved and isValidObj(component) then return component, nil end
+    if not resolved then return nil, tostring(component) end
+    return nil, "GetMovementComponent returned an invalid component"
 end
 
 local function acceptHero(hero)
@@ -486,6 +492,7 @@ local function clearJumpTracking()
     jumpMovement = nil
     nativeJumpZVelocity = nil
     jumpWriteSupported = nil
+    jumpReadyReported = false
 end
 
 local function restoreJumpVelocity()
@@ -539,10 +546,23 @@ local function applyJumpHeight(movement)
 
     local targetVelocity =
         nativeJumpZVelocity * math.sqrt(CONFIG.JUMP_HEIGHT_MULTIPLIER)
+
+    local function reportReady()
+        if jumpReadyReported then return end
+        jumpReadyReported = true
+        warn(string.format(
+            "JUMP READY | native=%.2f | applied=%.2f | height=%.2fx",
+            nativeJumpZVelocity,
+            targetVelocity,
+            CONFIG.JUMP_HEIGHT_MULTIPLIER
+        ))
+    end
+
     local currentVelocity = readNumber(movement, "JumpZVelocity")
     if currentVelocity ~= nil
         and math.abs(currentVelocity - targetVelocity) <= 0.01 then
         jumpWriteSupported = true
+        reportReady()
         return true
     end
 
@@ -565,6 +585,7 @@ local function applyJumpHeight(movement)
     end
 
     jumpWriteSupported = true
+    reportReady()
     return true
 end
 
@@ -580,9 +601,9 @@ local function applyLiveJumpSetting()
         return
     end
 
-    local movement = resolveMovementComponent(hero)
+    local movement, movementError = resolveMovementComponent(hero)
     if not isValidObj(movement) then
-        warn("JUMP HEIGHT ERROR | CharacterMovement is unavailable")
+        warn("JUMP HEIGHT ERROR | " .. tostring(movementError))
         return
     end
 
@@ -774,6 +795,9 @@ local function resetState()
     -- World teardown owns the old movement component. Discard its reference;
     -- writing into a component being destroyed is unsafe.
     clearJumpTracking()
+    movementReadyReported = false
+    movementErrorReported = false
+    boostReadyReported = false
     learnedJogCap = nil
     learnedJogVelocity = nil
     fallbackCalibrationMs = 0
@@ -1265,12 +1289,17 @@ local function tick(stepMs)
     end
 
     if not CONFIG.ENABLED then
+        if not disabledStateReported then
+            disabledStateReported = true
+            warn("DISABLED | runtime ENABLED=false; speed and jump are inactive")
+        end
         restoreJumpVelocity()
         clearAcceleration()
         lastClockSeconds = nil
         nextPollMs = IDLE_TICK_MS
         return
     end
+    disabledStateReported = false
 
     if os.clock() < quietUntil then
         clearAcceleration()
@@ -1304,12 +1333,21 @@ local function tick(stepMs)
         return
     end
 
-    local movement = resolveMovementComponent(hero)
+    local movement, movementError = resolveMovementComponent(hero)
     if not isValidObj(movement) then
+        if not movementErrorReported then
+            movementErrorReported = true
+            warn("MOVEMENT ERROR | " .. tostring(movementError))
+        end
         cachedHero = nil
         clearAcceleration()
         lastClockSeconds = nil
         return
+    end
+    movementErrorReported = false
+    if not movementReadyReported then
+        movementReadyReported = true
+        warn("MOVEMENT READY | GetMovementComponent resolved")
     end
 
     -- Jump height is independent of the sprint boost and remains active during
@@ -1501,6 +1539,15 @@ local function tick(stepMs)
             extraMultiplier = INITIAL_EXTRA_MULTIPLIER
             stableSprintSpeed = nil
             log("Native sprint detected by " .. detector)
+            if not boostReadyReported then
+                boostReadyReported = true
+                warn(string.format(
+                    "BOOST READY | detector=%s | start=%.2fx | max=%.2fx",
+                    tostring(detector),
+                    CONFIG.START_SPEED,
+                    CONFIG.MAX_SPEED
+                ))
+            end
         else
             extraMultiplier = math.min(
                 extraMultiplier +
@@ -1911,6 +1958,7 @@ do
                 -- A live ramp built from the old multipliers would otherwise keep
                 -- pushing the player at the previous speed until sprint ends.
                 resetLiveAcceleration()
+                warn("LIVE CONFIG | " .. speedConfigSummary())
                 applyLiveJumpSetting()
             end,
             log = function(message) print("[SpeedMod] " .. tostring(message) .. "\n") end,
