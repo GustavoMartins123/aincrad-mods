@@ -63,31 +63,85 @@ local function valid(o)
 end
 
 ------------------------------------------------------------------- hero switch
-local heroCache, switchedHero
+local heroCache, switchedHeroKey
+local heroWaitingReported = false
+local heroReadyReported = false
+local heroLookupErrorReported = false
+local heroIdentityErrorReported = false
+local heroSwitchErrorReported = false
 
 local function resolveHero()
     if valid(heroCache) then return heroCache end
     heroCache = nil
-    for _, n in ipairs({ "RODWorldHeroCharacter", "RODHeroCharacter", "BP_RODWorldHeroCharacter_C" }) do
-        local h = FindFirstOf(n)
-        if valid(h) then
-            local ok, isHost = pcall(function() return h:IsHostHero() end)
-            if not ok or isHost then heroCache = h; return h end
-        end
+
+    local found, hero = pcall(FindFirstOf, "RODWorldHeroCharacter")
+    if not found then
+        return nil, "FindFirstOf(RODWorldHeroCharacter) failed: " .. tostring(hero)
     end
-    return nil
+    if not valid(hero) then return nil, nil end
+
+    local hostResolved, isHost = pcall(function() return hero:IsHostHero() end)
+    if not hostResolved then
+        return nil, "RODWorldHeroCharacter:IsHostHero failed: " .. tostring(isHost)
+    end
+    if isHost ~= true then return nil, nil end
+
+    heroCache = hero
+    return heroCache, nil
 end
 
 local function applyHeroSwitch()
-    local hero = resolveHero()
-    if not valid(hero) then return end
-    if switchedHero == hero then return end
-    if pcall(function() hero:SetEnablePreventFalling(false) end) then
-        switchedHero = hero
+    local hero, lookupError = resolveHero()
+    if lookupError ~= nil then
+        if not heroLookupErrorReported then
+            heroLookupErrorReported = true
+            print("[norescue] HERO LOOKUP ERROR | " .. tostring(lookupError))
+        end
+        return false
+    end
+    heroLookupErrorReported = false
+
+    if not valid(hero) then
+        if not heroWaitingReported then
+            heroWaitingReported = true
+            print("[norescue] WAITING FOR HERO | safety net remains active")
+        end
+        return false
+    end
+
+    if heroWaitingReported or not heroReadyReported then
+        print("[norescue] HERO READY | safety net acquired the current hero")
+    end
+    heroWaitingReported = false
+    heroReadyReported = true
+
+    local identityResolved, heroKey = pcall(function() return hero:GetFullName() end)
+    if not identityResolved or type(heroKey) ~= "string" or heroKey == "" then
+        if not heroIdentityErrorReported then
+            heroIdentityErrorReported = true
+            print("[norescue] HERO IDENTITY ERROR | canonical object name is unavailable")
+        end
+        return false
+    end
+    heroIdentityErrorReported = false
+
+    if switchedHeroKey == heroKey then return true end
+    local switched, switchError = pcall(function()
+        hero:SetEnablePreventFalling(false)
+    end)
+    if switched then
+        switchedHeroKey = heroKey
+        heroSwitchErrorReported = false
         print("[norescue] edge-rescue disabled for the current hero")
+        return true
     else
-        switchedHero = nil
-        dbg("SetEnablePreventFalling failed; will retry")
+        switchedHeroKey = nil
+        if not heroSwitchErrorReported then
+            heroSwitchErrorReported = true
+            print("[norescue] EDGE RESCUE ERROR | SetEnablePreventFalling failed: "
+                .. tostring(switchError))
+        end
+        return false
     end
 end
 
@@ -132,7 +186,7 @@ end
 local function revertAll()
     local hero = resolveHero()
     if valid(hero) and pcall(function() hero:SetEnablePreventFalling(true) end) then
-        switchedHero = nil
+        switchedHeroKey = nil
     end
     if originalLandingHeight ~= nil then
         local ok, list = pcall(function() return FindAllOf("RODGameConfig") end)
@@ -180,11 +234,25 @@ local function safetyNet()
 end
 
 local function onRespawnPath()
-    heroCache, switchedHero = nil, nil
+    heroCache, switchedHeroKey = nil, nil
+    heroWaitingReported = false
+    heroReadyReported = false
+    heroLookupErrorReported = false
+    heroIdentityErrorReported = false
+    heroSwitchErrorReported = false
     ExecuteWithDelay(1000, function() ExecuteInGameThread(applyAll) end)
 end
 
-pcall(function() RegisterLoadMapPreHook(function() heroCache, switchedHero, gcCache = nil, nil, nil end) end)
+pcall(function()
+    RegisterLoadMapPreHook(function()
+        heroCache, switchedHeroKey, gcCache = nil, nil, nil
+        heroWaitingReported = false
+        heroReadyReported = false
+        heroLookupErrorReported = false
+        heroIdentityErrorReported = false
+        heroSwitchErrorReported = false
+    end)
+end)
 pcall(function() RegisterLoadMapPostHook(onRespawnPath) end)
 pcall(function() RegisterHook("/Script/Engine.PlayerController:ClientRestart", onRespawnPath) end)
 

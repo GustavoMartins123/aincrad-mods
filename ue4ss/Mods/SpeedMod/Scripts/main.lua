@@ -1,9 +1,9 @@
-print("[SpeedMod] Loading TERRAIN RUNNER v7.13 - VERIFIED SPEED + JUMP STATE...")
+print("[SpeedMod] Loading TERRAIN RUNNER v7.14 - PERSISTENT HERO + STABLE JUMP STATE...")
 print("[SpeedMod] Startup is passive; lifecycle hooks arm only after the initial world settles.")
 print("[SpeedMod] Quest/map travel uses an extended post-load guard; ClientRestart uses tick-safe quarantine.")
 
 --========================================================--
---     TERRAIN RUNNER v7.13 - MOD STACK COMPATIBILITY   --
+--     TERRAIN RUNNER v7.14 - MOD STACK COMPATIBILITY   --
 --========================================================--
 -- Goals:
 --   * Preserve the transition/teleport crash protections.
@@ -66,11 +66,11 @@ local CONFIG = {
 local SAFE_MIN_START = 1.00
 local SAFE_MAX_START = 2.50
 local SAFE_MIN_MAX = 1.00
-local SAFE_MAX_MAX = 4.50
+local SAFE_MAX_MAX = 8.00
 local SAFE_MIN_RAMP_SECONDS = 0.25
 local SAFE_MAX_RAMP_SECONDS = 10.00
 local SAFE_MIN_JUMP_HEIGHT = 0.25
-local SAFE_MAX_JUMP_HEIGHT = 4.00
+local SAFE_MAX_JUMP_HEIGHT = 6.00
 
 local function getScriptDirectory()
     if debug == nil or type(debug.getinfo) ~= "function" then
@@ -230,11 +230,14 @@ local DEBUG_LOGS = false
 
 local cachedHero = nil
 local jumpMovement = nil
+local jumpMovementKey = nil
 local nativeJumpZVelocity = nil
 local jumpWriteSupported = nil
 local movementReadyReported = false
 local movementErrorReported = false
-local jumpReadyReported = false
+local jumpReadySignature = nil
+local jumpIdentityErrorReported = false
+local heroWaitingReported = false
 local disabledStateReported = false
 local boostReadyReported = false
 local learnedJogCap = nil
@@ -398,7 +401,7 @@ local function acceptHero(hero)
         return hero:IsHostHero()
     end)
 
-    if not okHost or isHost then
+    if okHost and isHost == true then
         return hero
     end
 
@@ -420,26 +423,10 @@ local function tryFindFirstOf(className)
 end
 
 local function findHero()
-    -- Do these lookups explicitly instead of calling FindFirstOf while a generic
-    -- Lua iterator is live. Some UE4SS builds can leave the Lua stack in a bad
-    -- state when FindFirstOf fails during early world startup, which can corrupt
-    -- the next generic-for iterator step.
-    local hero = acceptHero(tryFindFirstOf("RODWorldHeroCharacter"))
-    if hero ~= nil then
-        return hero
-    end
-
-    hero = acceptHero(tryFindFirstOf("RODHeroCharacter"))
-    if hero ~= nil then
-        return hero
-    end
-
-    hero = acceptHero(tryFindFirstOf("BP_RODWorldHeroCharacter_C"))
-    if hero ~= nil then
-        return hero
-    end
-
-    return nil
+    -- RODWorldHeroCharacter is the canonical playable-world hero class.
+    -- Missing heroes are expected while a world is loading; the persistent
+    -- poll keeps trying this exact class until it exists.
+    return acceptHero(tryFindFirstOf("RODWorldHeroCharacter"))
 end
 
 local function resolveHero()
@@ -450,6 +437,7 @@ local function resolveHero()
     cachedHero = findHero()
 
     if isValidObj(cachedHero) then
+        heroWaitingReported = false
         log("Hero found")
     end
 
@@ -490,9 +478,11 @@ end
 
 local function clearJumpTracking()
     jumpMovement = nil
+    jumpMovementKey = nil
     nativeJumpZVelocity = nil
     jumpWriteSupported = nil
-    jumpReadyReported = false
+    jumpReadySignature = nil
+    jumpIdentityErrorReported = false
 end
 
 local function restoreJumpVelocity()
@@ -529,9 +519,23 @@ end
 local function applyJumpHeight(movement)
     if not isValidObj(movement) then return false end
 
-    if jumpMovement ~= movement then
+    local identityOk, movementIdentity = pcall(function()
+        return movement:GetFullName()
+    end)
+    if not identityOk or type(movementIdentity) ~= "string"
+        or movementIdentity == "" then
+        if not jumpIdentityErrorReported then
+            jumpIdentityErrorReported = true
+            warn("JUMP HEIGHT ERROR | canonical CharacterMovement identity is unavailable")
+        end
+        return false
+    end
+    jumpIdentityErrorReported = false
+
+    if jumpMovementKey ~= movementIdentity then
         if not restoreJumpVelocity() then return false end
         jumpMovement = movement
+        jumpMovementKey = movementIdentity
         nativeJumpZVelocity = readNumber(movement, "JumpZVelocity")
         jumpWriteSupported = nil
 
@@ -540,16 +544,25 @@ local function applyJumpHeight(movement)
             warn("JUMP HEIGHT ERROR | CharacterMovement.JumpZVelocity is unavailable")
             return false
         end
+    else
+        -- UE4SS may expose a new Lua wrapper for the same Unreal object on each
+        -- call. Refresh the wrapper but retain the native baseline and log state.
+        jumpMovement = movement
     end
 
     if jumpWriteSupported == false then return false end
 
     local targetVelocity =
         nativeJumpZVelocity * math.sqrt(CONFIG.JUMP_HEIGHT_MULTIPLIER)
+    local readySignature = string.format(
+        "%s|%.6f",
+        movementIdentity,
+        CONFIG.JUMP_HEIGHT_MULTIPLIER
+    )
 
     local function reportReady()
-        if jumpReadyReported then return end
-        jumpReadyReported = true
+        if jumpReadySignature == readySignature then return end
+        jumpReadySignature = readySignature
         warn(string.format(
             "JUMP READY | native=%.2f | applied=%.2f | height=%.2fx",
             nativeJumpZVelocity,
@@ -597,15 +610,24 @@ local function applyLiveJumpSetting()
 
     local hero = resolveHero()
     if not isValidObj(hero) then
-        warn("JUMP HEIGHT ERROR | hero is unavailable")
+        if not heroWaitingReported then
+            heroWaitingReported = true
+            warn("WAITING FOR HERO | movement poll remains active")
+        end
         return
     end
+    heroWaitingReported = false
 
     local movement, movementError = resolveMovementComponent(hero)
     if not isValidObj(movement) then
-        warn("JUMP HEIGHT ERROR | " .. tostring(movementError))
+        if not movementErrorReported then
+            movementErrorReported = true
+            warn("WAITING FOR MOVEMENT | " .. tostring(movementError) ..
+                " | poll remains active")
+        end
         return
     end
+    movementErrorReported = false
 
     applyJumpHeight(movement)
 end
@@ -797,6 +819,7 @@ local function resetState()
     clearJumpTracking()
     movementReadyReported = false
     movementErrorReported = false
+    heroWaitingReported = false
     boostReadyReported = false
     learnedJogCap = nil
     learnedJogVelocity = nil
@@ -1327,21 +1350,29 @@ local function tick(stepMs)
 
     local hero = resolveHero()
     if not isValidObj(hero) then
+        if not heroWaitingReported then
+            heroWaitingReported = true
+            warn("WAITING FOR HERO | movement poll remains active")
+        end
         cachedHero = nil
         clearAcceleration()
         lastClockSeconds = nil
+        nextPollMs = LOADING_POLL_MS
         return
     end
+    heroWaitingReported = false
 
     local movement, movementError = resolveMovementComponent(hero)
     if not isValidObj(movement) then
         if not movementErrorReported then
             movementErrorReported = true
-            warn("MOVEMENT ERROR | " .. tostring(movementError))
+            warn("WAITING FOR MOVEMENT | " .. tostring(movementError) ..
+                " | poll remains active")
         end
         cachedHero = nil
         clearAcceleration()
         lastClockSeconds = nil
+        nextPollMs = LOADING_POLL_MS
         return
     end
     movementErrorReported = false

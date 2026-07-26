@@ -1,7 +1,7 @@
--- AutoPickupMod v1.3
+-- AutoPickupMod v1.4
 
 local MOD_NAME = "AutoPickupMod"
-local MOD_VERSION = "v1.3"
+local MOD_VERSION = "v1.4"
 
 local GAME_CONFIG_PATHS = {
     "/Game/ROD/DataAssets/GameConfig.Default__GameConfig_C",
@@ -59,6 +59,9 @@ local expandedCount    = 0
 local lastCandidateTick = 0
 local expandedGimmicks = {}
 local cachedHero       = nil
+local heroWaitingReported = false
+local heroReadyReported = false
+local heroLookupErrorReported = false
 local heroRecheckTick  = 0
 local initialScanDone  = false
 local nearbyExpanded   = {}
@@ -108,6 +111,9 @@ local FT_ENABLE  = 3
 local function clearWorldRefs()
     dbg("clearWorldRefs/enter")
     cachedHero = nil
+    heroWaitingReported = false
+    heroReadyReported = false
+    heroLookupErrorReported = false
     expandedGimmicks = {}
     expandedCount = 0
     gimmickCooldown = {}
@@ -175,7 +181,6 @@ local function schedulePostTravelScan()
             if sid ~= travelScanId or mapLeaving then return end
             local hero = resolveHero()
             if not isValidObj(hero) then
-                print(string.format("[%s] %s: no hero yet\n", MOD_NAME, label))
                 return
             end
             applyHeroPickupRange(hero)
@@ -441,19 +446,58 @@ local function getDistance(hero, gimmick)
 end
 
 getHero = function()
-    for _, n in ipairs({ "RODWorldHeroCharacter", "RODHeroCharacter", "BP_RODWorldHeroCharacter_C" }) do
-        local hero = FindFirstOf(n)
-        if isValidObj(hero) then
-            local okH, isHost = pcall(function() return hero:IsHostHero() end)
-            if not okH or isHost then return hero end
-        end
+    local found, hero = pcall(FindFirstOf, "RODWorldHeroCharacter")
+    if not found then
+        return nil, "FindFirstOf(RODWorldHeroCharacter) failed: " .. tostring(hero)
     end
-    return nil
+    if not isValidObj(hero) then
+        return nil, nil
+    end
+
+    local hostResolved, isHost = pcall(function() return hero:IsHostHero() end)
+    if not hostResolved then
+        return nil, "RODWorldHeroCharacter:IsHostHero failed: " .. tostring(isHost)
+    end
+    if isHost ~= true then
+        return nil, nil
+    end
+    return hero, nil
 end
 
 resolveHero = function()
     if isValidObj(cachedHero) then return cachedHero end
-    cachedHero = getHero()
+    local hero, lookupError = getHero()
+    cachedHero = hero
+
+    if lookupError ~= nil then
+        if not heroLookupErrorReported then
+            heroLookupErrorReported = true
+            print(string.format("[%s] HERO LOOKUP ERROR | %s\n",
+                MOD_NAME, tostring(lookupError)))
+        end
+        return nil
+    end
+    heroLookupErrorReported = false
+
+    if not isValidObj(cachedHero) then
+        if not heroWaitingReported then
+            heroWaitingReported = true
+            print(string.format(
+                "[%s] WAITING FOR HERO | pickup poll remains active\n",
+                MOD_NAME
+            ))
+        end
+        return nil
+    end
+
+    if heroWaitingReported or not heroReadyReported then
+        print(string.format(
+            "[%s] HERO READY | pickup poll active\n",
+            MOD_NAME
+        ))
+    end
+    heroWaitingReported = false
+    heroReadyReported = true
     return cachedHero
 end
 
@@ -1284,6 +1328,9 @@ local function resetPollState()
     expandedGimmicks    = {}
     expandedCount       = 0
     cachedHero          = nil
+    heroWaitingReported = false
+    heroReadyReported   = false
+    heroLookupErrorReported = false
     heroRecheckTick     = 0
     initialScanDone     = false
     nearbyExpanded      = {}
