@@ -98,7 +98,7 @@ return {
         apply = "menu",
         settings = {
             { key = "ENABLED", label = "Enabled", type = "bool", default = true },
-            { key = "FORCE_CAMERA", label = "Frame character",
+            { key = "SHOW_CHARACTER", label = "Show character",
               type = "bool", default = true },
             { key = "DEBUG_LOGS", label = "Debug logging", type = "bool", default = true },
         },

@@ -62,8 +62,11 @@ natural and already issued enemies, depending on the configured radius. A
 request returns to the queue while untested candidates remain. The source
 enemy is resolved by exact object identity and supplied as both the native
 owner and instigator. The director calls the exact `RODSpawnActor` declaration
-from the supplied game header: class, transform, option, owner, instigator, and
-collision policy. Creation uses
+from the supplied game header through
+`RODGameState:CallFunction(RODSpawnActor, ...)`. Direct invocation through the
+UFunction Lua `__call` metamethod is not used: on UE4SS build `c838a8ac` it
+leaves the callable table in the parameter stack and shifts native object
+properties. Creation uses
 `AdjustIfPossibleButDontSpawnIfColliding`, so an occupied point is rejected
 instead of stacking actors. The returned
 `FRODSpawnActorResult.ServerSpawnActor` weak pointer is the sole ownership

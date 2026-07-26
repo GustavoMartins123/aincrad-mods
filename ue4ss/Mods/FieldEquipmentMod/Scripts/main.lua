@@ -1,12 +1,13 @@
--- FieldEquipmentMenu v1.15.1
+-- FieldEquipmentMenu v1.15.4
 -- Add a native-styled Equipment entry to Echoes of Aincrad's start menu.
 --
--- Selecting that entry opens the Equipment screen alone, with the camera moved
--- to frame the character, rather than beside a copy of the start menu's stat
--- panel. See OPENING EQUIPMENT below for what was measured on this build.
+-- Selecting that entry opens the Equipment screen alone, with the character
+-- revealed and the camera moved into the equip close-up, rather than beside a
+-- copy of the start menu's stat panel. See OPENING EQUIPMENT below for what was
+-- measured on this build.
 
 local MOD_NAME = "FieldEquipmentMenu"
-local MOD_VERSION = "v1.15.1"
+local MOD_VERSION = "v1.15.4"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -87,8 +88,8 @@ local SCRIPT_DIR = (function()
     return directory
 end)()
 
-local CONFIG = { ENABLED = true, DEBUG_LOGS = true, FORCE_CAMERA = true }
-local CONFIG_KEYS = { ENABLED = true, DEBUG_LOGS = true, FORCE_CAMERA = true }
+local CONFIG = { ENABLED = true, DEBUG_LOGS = true, SHOW_CHARACTER = true }
+local CONFIG_KEYS = { ENABLED = true, DEBUG_LOGS = true, SHOW_CHARACTER = true }
 
 local function log(message)
     if not CONFIG.DEBUG_LOGS then return end
@@ -360,32 +361,145 @@ end
 -- shipping build, so it is not usable from here. `fieldequip probe` re-measures
 -- that if a patch ever changes it.
 --
--- The camera half is what this build adds. RODMenuWidgetBase carries the answer
--- on the widget itself: IsOpenCameraEnable gates it, OpenForcedCameraSettings
--- holds the framing, and ProcessForcedCameraValues applies it. Enabling the flag
--- before the menu opens lets the widget's own open flow do the work, which costs
--- nothing and cannot crash. Calling ProcessForcedCameraValues afterwards is the
--- explicit fallback for the case where that flow does not consult the flag, and
--- it is what FORCE_CAMERA turns off.
+-- Showing the character took three things, and each was found by measuring what
+-- the previous attempt actually put on screen:
 --
--- What is deliberately not here any more is the display-only clone of the start
--- menu that older builds mounted beside Equipment for its stat panel. See
--- RETURNING FROM EQUIPMENT for what that clone cost.
+--   the hero -- the start menu hides the character, and it does it through the
+--              game's keyed hide system, not a plain flag. ARODCharacterBase
+--              carries HiddenInGameKeys, a TArray<FName>, and
+--              SetAllActorHiddenInGame(bHidden, Key) adds or removes one key.
+--              The actor stays hidden while any key remains, so any number of
+--              systems can ask for it independently and none of them can undo
+--              another request by accident. Calling the menu's own
+--              OnMainMenuCharacterHidden(false) did not clear it, which is why
+--              the screen came back with the camera in the right place and
+--              nobody standing in it. Every key present is removed on the way
+--              in and put back on the way out.
+--   the view target -- ARODInGamePlayerController:OnMainMenuOpened receives the
+--              level-sequence ACameraActor the start menu frames itself with, so
+--              the view can belong to something other than the hero. Measured on
+--              this build it does not: by the time Equipment is up the view is
+--              already back on the hero. The handover stays because it is cheap,
+--              it is symmetric, and it says so in the log when it fires.
+--   framing  -- RODMenuWidgetBase carries this on the widget itself.
+--              IsOpenCameraEnable gates it, OpenForcedCameraSettings holds it,
+--              ProcessForcedCameraValues applies it. Every parameter is relative
+--              to the player's camera boom (FOV, boom length, socket/target
+--              offset, relative rotator), which is why the view target has to be
+--              the hero before this runs.
+--
+-- All three are gated on SHOW_CHARACTER together, because they are one feature.
+-- Any one alone leaves the screen worse than not touching the camera at all.
+local previousViewTarget = nil
+local suppressedHiddenKeys = {}
+
 local function describeCameraState(widget)
     local enabled = nil
     pcall(function() enabled = widget.IsOpenCameraEnable end)
     return tostring(enabled)
 end
 
-local function applyEquipmentForcedCamera(widget)
-    if not CONFIG.FORCE_CAMERA then return end
+local function resolveHero()
+    local hero = FindFirstOf("RODWorldHeroCharacter")
+    if isValidObject(hero) then return hero end
+    return nil
+end
+
+-- Returns the keys as plain strings. The FName objects inside the array must not
+-- outlive the array being mutated, and strings are what the log wants anyway.
+local function readHiddenKeys(hero)
+    local keys = {}
+    if not isValidObject(hero) then return keys end
+    pcall(function()
+        hero.HiddenInGameKeys:ForEach(function(_, element)
+            local key = unwrap(element)
+            local name = nil
+            pcall(function() name = key:ToString() end)
+            if type(name) == "string" and name ~= "" then
+                keys[#keys + 1] = name
+            end
+        end)
+    end)
+    return keys
+end
+
+local function describeKeys(keys)
+    if #keys == 0 then return "none" end
+    return table.concat(keys, ", ")
+end
+
+-- Nothing here is allowed to leave the player invisible, so failures are logged
+-- rather than swallowed.
+local function revealHero(hero)
+    suppressedHiddenKeys = readHiddenKeys(hero)
+    log("hero hide keys on entry: " .. describeKeys(suppressedHiddenKeys))
+    for _, key in ipairs(suppressedHiddenKeys) do
+        local cleared, clearError = pcall(function()
+            hero:SetAllActorHiddenInGame(false, FName(key))
+        end)
+        if not cleared then
+            log("could not clear hero hide key " .. key .. ": " .. tostring(clearError))
+        end
+    end
+
+    local remaining = readHiddenKeys(hero)
+    local hidden = nil
+    pcall(function() hidden = hero:IsHidden() end)
+    log("hero after reveal: hidden=" .. tostring(hidden)
+        .. " remaining keys=" .. describeKeys(remaining))
+end
+
+local function restoreHeroHide(hero)
+    for _, key in ipairs(suppressedHiddenKeys) do
+        pcall(function() hero:SetAllActorHiddenInGame(true, FName(key)) end)
+    end
+    if #suppressedHiddenKeys > 0 then
+        log("restored hero hide keys: " .. describeKeys(suppressedHiddenKeys))
+    end
+    suppressedHiddenKeys = {}
+end
+
+local function takeViewTarget(controller, hero)
+    local current = nil
+    pcall(function() current = controller:GetViewTarget() end)
+    if isValidObject(current) and objectName(current) == objectName(hero) then
+        log("view target is already the hero; leaving it alone")
+        return
+    end
+
+    -- Remembered so the menu's own camera can be handed back on the way out.
+    previousViewTarget = isValidObject(current) and current or nil
+    local taken, takeError = pcall(function()
+        -- 0 is EViewTargetBlendFunction::VTBlend_Linear.
+        controller:SetViewTargetWithBlend(hero, 0.25, 0, 0.0, false)
+    end)
+    log("view target: was " .. objectName(current)
+        .. ", handed to the hero; success=" .. tostring(taken)
+        .. (taken and "" or (" error=" .. tostring(takeError))))
+end
+
+local function showEquipmentCharacter(widget)
+    if not CONFIG.SHOW_CHARACTER then return end
     if not isValidObject(widget) then return end
 
-    -- Step log before the call, not after. Passing a native struct back into a
+    local controller = resolveLocalController()
+    local hero = resolveHero()
+    if not isValidObject(controller) or not isValidObject(hero) then
+        log("cannot show the character for Equipment: "
+            .. "controller=" .. objectName(controller)
+            .. " hero=" .. objectName(hero))
+        return
+    end
+
+    log("showing the character for Equipment (SHOW_CHARACTER is on)")
+    takeViewTarget(controller, hero)
+    revealHero(hero)
+
+    -- Step log before the call, not after. Handing a native struct back to a
     -- native function is the one operation here that pcall cannot protect: if it
     -- takes the process down, this line is the last one in the log and names the
-    -- culprit. Turn FORCE_CAMERA off to skip it.
-    log("applying the Equipment forced camera (FORCE_CAMERA is on)")
+    -- culprit. Turn SHOW_CHARACTER off to skip it.
+    log("applying the Equipment forced camera")
     local applied, applyError = pcall(function()
         widget:ProcessForcedCameraValues(widget.OpenForcedCameraSettings)
     end)
@@ -393,6 +507,42 @@ local function applyEquipmentForcedCamera(widget)
         log("forced camera applied")
     else
         log("forced camera could not be applied: " .. tostring(applyError))
+    end
+end
+
+-- Called on the way back. The start menu draws its own character panel and wants
+-- the hero hidden behind its own camera, but only while it is actually up:
+-- putting the hide keys back with no menu on screen would leave the player
+-- invisible in the field, and stranding the view on the menu's camera would
+-- leave them looking at scenery they cannot move.
+local function restoreMenuCharacterState(startMenuIsUp)
+    if not CONFIG.SHOW_CHARACTER then return end
+
+    local controller = resolveLocalController()
+    local hero = resolveHero()
+    if isValidObject(controller) then
+        local target = startMenuIsUp and previousViewTarget or hero
+        if not isValidObject(target) then target = hero end
+        if isValidObject(target) then
+            local restored = pcall(function()
+                controller:SetViewTargetWithBlend(target, 0.25, 0, 0.0, false)
+            end)
+            log("view target returned to " .. objectName(target)
+                .. "; success=" .. tostring(restored))
+        end
+    end
+    previousViewTarget = nil
+
+    if not isValidObject(hero) then
+        suppressedHiddenKeys = {}
+        return
+    end
+    if startMenuIsUp then
+        restoreHeroHide(hero)
+    else
+        -- No menu to hide behind. Drop what was recorded rather than reapplying
+        -- it; being visible is the only safe end state out here.
+        suppressedHiddenKeys = {}
     end
 end
 
@@ -406,7 +556,7 @@ local function verifyEquipmentMounted()
             .. ": widget=" .. objectName(widget)
             .. " actor=" .. objectName(owner)
             .. " openCamera=" .. describeCameraState(widget))
-        applyEquipmentForcedCamera(widget)
+        showEquipmentCharacter(widget)
         return
     end
 
@@ -459,7 +609,7 @@ local function selectInjectedEquipment()
             -- out of Equipment has always worked.
             widget.ParentMenu = context.mainMenu
             widget.MenuKind = MENU_KIND_CHEST_EQUIP
-            if CONFIG.FORCE_CAMERA then
+            if CONFIG.SHOW_CHARACTER then
                 widget.IsOpenCameraEnable = true
             end
 
@@ -1304,6 +1454,9 @@ local function reopenStartMenuAfterEquipment()
         setNativeMenuPanelsVisibility(context, VISIBLE)
         rearmEquipmentEntry(context, true)
         focusEquipment(context)
+        -- The start menu draws its own character panel and wants the hero
+        -- hidden again.
+        restoreMenuCharacterState(true)
         equipmentReturnBusy = false
         log("start menu outlived the Equipment session; rearmed it in place")
         return
@@ -1313,6 +1466,8 @@ local function reopenStartMenuAfterEquipment()
     if not isValidObject(controller) then
         equipmentReturnBusy = false
         equipmentSessionArmed = false
+        -- No controller means no reopen, so the hero has to end up visible.
+        restoreMenuCharacterState(false)
         log("cannot reopen the start menu after Equipment: controller is unavailable")
         return
     end
@@ -1333,9 +1488,13 @@ local function reopenStartMenuAfterEquipment()
     equipmentSessionArmed = false
     if not reopened then
         pendingEquipmentFocus = false
+        -- Nothing is going to hide the hero on this path, and nothing should.
+        restoreMenuCharacterState(false)
         log("could not reopen the start menu after Equipment: " .. tostring(reopenError))
         return
     end
+    -- The reopened menu's own flow hides the hero again, so this only has to
+    -- cover the case where it never arrives.
     log("start menu was torn down with Equipment; reopened it so every rail mod "
         .. "reinjects into the new widget")
 
@@ -1348,6 +1507,9 @@ local function reopenStartMenuAfterEquipment()
         ExecuteInGameThread(function()
             if activeEquipmentContext ~= nil then return end
             pendingEquipmentFocus = false
+            -- No menu came back, so leaving the hero hidden would leave the
+            -- player invisible in the field.
+            restoreMenuCharacterState(false)
             log("the reopened start menu never reported a construction; "
                 .. "close and reopen the menu to get the Equipment row back")
         end)
@@ -1844,8 +2006,8 @@ end)
 local function reportState(reply)
     local controller = resolveLocalController()
     reply("controller: " .. objectName(controller))
-    reply(string.format("state: enabled=%s forceCamera=%s open=%s armed=%s",
-        tostring(CONFIG.ENABLED), tostring(CONFIG.FORCE_CAMERA),
+    reply(string.format("state: enabled=%s showCharacter=%s open=%s armed=%s",
+        tostring(CONFIG.ENABLED), tostring(CONFIG.SHOW_CHARACTER),
         tostring(equipmentSubmenuOpen), tostring(equipmentSessionArmed)))
 
     local context = activeEquipmentContext
@@ -1866,8 +2028,38 @@ local function reportState(reply)
         reply("equipment widget: none on screen")
     end
 
+    local hero = resolveHero()
+    if isValidObject(hero) then
+        local hidden = nil
+        local location = nil
+        pcall(function() hidden = hero:IsHidden() end)
+        pcall(function() location = hero:K2_GetActorLocation() end)
+        reply("hero: " .. objectName(hero) .. " hidden=" .. tostring(hidden))
+        if location ~= nil then
+            reply(string.format("  location: %.0f %.0f %.0f",
+                location.X or 0, location.Y or 0, location.Z or 0))
+        end
+        -- The actor stays hidden while any of these is present, so this names
+        -- exactly which system is still asking for it.
+        reply("  hide keys: " .. describeKeys(readHiddenKeys(hero)))
+        reply("  suppressed by this mod: " .. describeKeys(suppressedHiddenKeys))
+    else
+        reply("hero: not resolvable")
+    end
+
+    -- The question every camera failure so far came down to: who owns the view?
+    local viewTarget = nil
+    if isValidObject(controller) then
+        pcall(function() viewTarget = controller:GetViewTarget() end)
+    end
+    local ownedByHero = isValidObject(viewTarget) and isValidObject(hero)
+        and objectName(viewTarget) == objectName(hero)
+    reply("view target: " .. objectName(viewTarget)
+        .. (ownedByHero and "  (the hero)" or "  (NOT the hero)"))
+
     for _, name in ipairs({
         "DebugOpen3DMenu", "DebugOpenChangeEquipMenu", "DebugOpenMainMenu",
+        "OnMainMenuCharacterHidden",
     }) do
         local present = "unavailable"
         if isValidObject(controller) then

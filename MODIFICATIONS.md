@@ -370,7 +370,7 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/64)
 **Baseline:** `FieldEquipmentMod 64 1
 2026-07-21T11-45Z 8WdQj6lM4.7z`  
 **Original script version:** v1.14.3-release  
-**Integrated script version:** v1.15.1
+**Integrated script version:** v1.15.4
 
 ### Added
 
@@ -404,12 +404,35 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/64)
 - Removed the display-only `WBP_Console_MainMenu_C` clone that used to supply a
   stat panel beside Equipment, along with the `HeroDetail` nudge that positioned
   it. The stat panel no longer appears over the Equipment screen.
-- The Equipment widget is now opened with `IsOpenCameraEnable` set and its
-  `OpenForcedCameraSettings` applied through `ProcessForcedCameraValues`, so the
-  camera frames the character the way it does at a chest. The explicit
-  `ProcessForcedCameraValues` call is gated behind the new `FORCE_CAMERA`
-  setting, because it is the only place this mod hands a native struct back to a
-  native function; a step log is emitted immediately before it.
+- The Equipment screen now shows the character, under the new `SHOW_CHARACTER`
+  setting. Three things were needed and each was found by measuring what the
+  previous attempt produced on screen:
+  1. The character hide the Start Menu applies is undone through the game's
+     keyed hide system: `ARODCharacterBase` carries `HiddenInGameKeys`
+     (`TArray<FName>`) and `SetAllActorHiddenInGame(bHidden, Key)` adds or
+     removes one key, with the actor staying hidden while any key remains. Every
+     key present is removed on the way in and restored on the way out, and each
+     one is named in the log. `OnMainMenuCharacterHidden(false)`, tried first,
+     does not clear them — that attempt produced a correctly framed shot with
+     nobody standing in it.
+  2. The view target is handed back to the hero with the engine's
+     `SetViewTargetWithBlend`, because `OnMainMenuOpened` receives the
+     level-sequence `ACameraActor` the Start Menu frames itself with and the view
+     can therefore belong to something else. Measured on this build it does not:
+     by the time Equipment is up the view is already the hero, and the handover
+     logs that it skipped.
+  3. The framing itself comes from the widget's own `IsOpenCameraEnable` and
+     `OpenForcedCameraSettings`, applied through `ProcessForcedCameraValues`.
+     Every parameter in that struct is relative to the player's camera boom,
+     which is why the view target has to be the hero before it runs.
+
+  The previous view target is remembered and handed back on the way out, and
+  both the hide keys and the view target are only restored to their menu values
+  while a Start Menu is actually on screen, so no path can leave the player
+  invisible or looking at scenery they cannot move.
+  `ProcessForcedCameraValues` is the only place this mod hands a native struct
+  back to a native function, so a step log is emitted immediately before it and
+  `SHOW_CHARACTER` turns the whole feature off.
 - Added a read-only `fieldequip` console command (`probe`, `open3d`).
 - Returning from Equipment no longer detaches the real Start Menu and pushes it
   back into its widget component by hand. The mod now rearms in place when the
@@ -534,7 +557,7 @@ Changed above.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v1.4.6
+**Current script version:** v1.4.9
 
 ### Added
 
@@ -563,6 +586,14 @@ Changed above.
 - Calls the exact `RODSpawnActor` parameter sequence declared by the supplied
   game header. Runtime UFunction-property enumeration was removed because this
   UE4SS build does not expose `ForEachProperty` on its Lua UFunction wrapper.
+- Reports the rejected native property and remaining Lua argument types in one
+  compact spawn-contract fault instead of discarding that diagnostic context
+  or emitting the full repeated stack dump.
+- Invokes the unbound `RODSpawnActor` through
+  `RODGameState:CallFunction(UFunction, ...)` in the declared C++ parameter
+  order. Direct UFunction `__call` invocation on UE4SS build `c838a8ac` left
+  its callable table in the marshaling stack and shifted `inOwner` and
+  `InInstigator`.
 - Requires 50-150 cm separation from natural, pending, and owned enemies and
   uses `AdjustIfPossibleButDontSpawnIfColliding`.
 - Supplies `FRODSpawnActorOption` with server spawn, source level, `Prowl`

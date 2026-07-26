@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.4.6"
+local MOD_VERSION = "1.4.9"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -264,6 +264,27 @@ local function firstErrorLine(value)
     return message
 end
 
+local function summarizeSpawnCallError(value)
+    local message = tostring(value):gsub("\r", "")
+    local summary = firstErrorLine(message)
+    local property = message:match(
+        "Property%s*%([^%)]*%):%s*([^\n]+)"
+    )
+    if type(property) == "string" and property ~= "" then
+        summary = summary .. " | property=" .. property
+    end
+    local stack = message:match(
+        "LUA Stack dump %-%> START%-+%s*(.-)%s*" ..
+        "LUA Stack dump %-%> END"
+    )
+    if type(stack) == "string" and stack ~= "" then
+        stack = stack:gsub("[%s\t]+", " ")
+        if #stack > 180 then stack = stack:sub(1, 180) .. "..." end
+        summary = summary .. " | remaining-stack=" .. stack
+    end
+    return summary
+end
+
 local function resolveExactObject(fullName)
     if type(fullName) ~= "string" or fullName == "" then
         return nil, "canonical object name is missing"
@@ -498,7 +519,7 @@ local function resolveSpawnApi()
         end
         rodSpawnActorFunction = functionObject
         log(
-            "SPAWN CONTRACT | RODGameState.RODSpawnActor header contract acquired"
+            "SPAWN CONTRACT | RODSpawnActor UObject.CallFunction contract acquired"
         )
     end
     return true, nil
@@ -1717,8 +1738,8 @@ local function processSpawnRequest()
     local spawned = nil
     local insertedPending = false
     local okSpawn, spawnError = pcall(function()
-        local result = rodSpawnActorFunction(
-            rodGameState,
+        local result = rodGameState:CallFunction(
+            rodSpawnActorFunction,
             spawnClass,
             transform,
             option,
@@ -1761,7 +1782,7 @@ local function processSpawnRequest()
         end
         pauseForSpawnContractFailure(
             "RODSpawnActor canonical call failed: " ..
-                firstErrorLine(spawnError)
+                summarizeSpawnCallError(spawnError)
         )
         return
     end
