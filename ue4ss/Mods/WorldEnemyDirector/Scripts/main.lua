@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.4.1"
+local MOD_VERSION = "1.4.2"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -1130,39 +1130,20 @@ local function spawnPositionIsSeparated(position)
     return true
 end
 
-local function readLastPathPoint(path)
-    local points
-    local stateOk, pathValid, pathPartial = pcall(function()
-        points = path.PathPoints
-        return path:IsValid(), path:IsPartial()
+local function pathIsComplete(path)
+    local stateOk, pathValid, pathPartial, pathLength = pcall(function()
+        return path:IsValid(), path:IsPartial(), tonumber(path:GetPathLength())
     end)
     if not stateOk then
-        return nil, "UNavigationPath state is unreadable: " ..
+        return false, "UNavigationPath state is unreadable: " ..
             tostring(pathValid)
     end
-    if pathValid ~= true then return nil, "UNavigationPath is invalid" end
-    if pathPartial == true then return nil, "UNavigationPath is partial" end
-    if points == nil then return nil, "UNavigationPath.PathPoints is unavailable" end
-
-    local lastPoint = nil
-    local pointsOk, pointsError = pcall(function()
-        points:ForEach(function(_, element)
-            local rawPoint = element:get()
-            local parsed = vector(rawPoint)
-            if parsed == nil then
-                error("PathPoints contains an invalid FVector")
-            end
-            lastPoint = parsed
-        end)
-    end)
-    if not pointsOk then
-        return nil, "UNavigationPath.PathPoints read failed: " ..
-            tostring(pointsError)
+    if pathValid ~= true then return false, "UNavigationPath is invalid" end
+    if pathPartial == true then return false, "UNavigationPath is partial" end
+    if not finiteNumber(pathLength) or pathLength <= 0.0 then
+        return false, "UNavigationPath has no positive path length"
     end
-    if lastPoint == nil then
-        return nil, "UNavigationPath contains no path points"
-    end
-    return lastPoint, nil
+    return true, nil
 end
 
 local function pathCandidate(request, attempt)
@@ -1217,8 +1198,9 @@ local function resolveNavigableSpawnPosition(request, worldContext)
                 tostring(path), false
         end
         if isValid(path) then
-            local position, pathError = readLastPathPoint(path)
-            if position ~= nil then
+            local complete, pathError = pathIsComplete(path)
+            if complete then
+                local position = candidate
                 local maxRadius = CONFIG.SPAWN_RADIUS + 25.0
                 if planarDistanceSquared(position, request.originLocation)
                     <= maxRadius * maxRadius
@@ -1631,8 +1613,8 @@ local function processSpawnRequest()
             request.classObject,
             transform,
             option,
-            nil,
-            nil,
+            originState.object,
+            originState.object,
             SPAWN_COLLISION_ADJUST_OR_REJECT
         )
         if result == nil then error("RODSpawnActor returned no result") end

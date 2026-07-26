@@ -470,7 +470,7 @@ menu restoration, and equipment workflow were retained.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v1.4.1
+**Current script version:** v1.4.2
 
 ### Added
 
@@ -490,6 +490,12 @@ menu restoration, and equipment workflow were retained.
   `FindPathToLocationSynchronously`.
 - Tests up to 36 golden-angle candidates over multiple director cycles,
   retaining the request while the NavMesh is building or candidates remain.
+- Uses the complete `UNavigationPath` state and positive native path length as
+  the reachability contract instead of requiring Lua access to its internal
+  `TArray<FVector>`.
+- Supplies the natural source enemy as the exact native owner and instigator;
+  this prevents the current UE4SS argument bridge from dropping nullable
+  object arguments and shifting collision mode into `InInstigator`.
 - Requires 50-150 cm separation from natural, pending, and owned enemies and
   uses `AdjustIfPossibleButDontSpawnIfColliding`.
 - Supplies `FRODSpawnActorOption` with server spawn, source level, `Prowl`

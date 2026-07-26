@@ -55,10 +55,12 @@ Before that call, the director tests up to 36 points distributed in a
 golden-angle spiral through
 `NavigationSystemV1.FindPathToLocationSynchronously`. Four candidates are
 tested per director cycle so a difficult area does not stall one game frame.
-Only the final point of a complete, non-partial `UNavigationPath` is accepted.
-The point must also remain at least 50-150 cm from natural and already issued
-enemies, depending on the configured radius. A request returns to the queue
-while untested candidates remain. Creation uses
+Only a candidate with a complete, non-partial `UNavigationPath` and positive
+path length is accepted. The point must also remain at least 50-150 cm from
+natural and already issued enemies, depending on the configured radius. A
+request returns to the queue while untested candidates remain. The source
+enemy is supplied as both the native owner and instigator, avoiding nullable
+`UObject` argument loss in this UE4SS build. Creation uses
 `AdjustIfPossibleButDontSpawnIfColliding`, so an occupied point is rejected
 instead of stacking actors. The returned
 `FRODSpawnActorResult.ServerSpawnActor` weak pointer is the sole ownership
