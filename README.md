@@ -342,8 +342,8 @@ actor-spawn API. Additional species can be randomised from classes that the
 current world has already loaded. Every extra is owned by its exact returned
 actor object.
 
-The Mods panel exposes the spawn multiplier and cap, spawn radius, boss
-inclusion, scale range, fixed or random colour, health, attack, defence,
+The Mods panel exposes the spawn multiplier and cap, spawn radius, natural-boss
+mutation, scale range, fixed or random colour, health, attack, defence,
 movement speed, and experience multipliers. Natural quest actors are never
 replaced; only exact actors created and owned by this mod may be destroyed when
 the multiplier is reduced or the mod is disabled.
@@ -354,6 +354,13 @@ its exact Gameplay Ability System attributes. Health targets `Health` and
 calculated `ATK` and `Def` outputs. Live maximum-health changes preserve the
 enemy's current HP percentage, and disabling the director reverses only the
 deltas it applied.
+
+Bosses are never spawn candidates. The director checks both the reflected
+`EnemyRole_Boss` value and `GoldenGateBoss`; the boss option permits mutation
+of the natural actor only. A Blueprint class reused by a mission boss is
+quarantined for that whole world, including queued and existing extras.
+Quest-end events destroy extras and release all references before Unreal
+collects the outgoing mission world.
 
 See
 [`ue4ss\Mods\WorldEnemyDirector\README.md`](ue4ss/Mods/WorldEnemyDirector/README.md)
@@ -400,6 +407,8 @@ It writes validated settings to each mod's `Scripts\runtime.lua`. The target mod
 reads and validates that exact file from its own isolated state. Existing mods
 may use the shared `ModMenuBridge.lua`; World Enemy Director uses its own strict
 canonical loader and disables its operations when configuration is invalid.
+Writes are transaction-locked and published from a complete staged file, so a
+reader never observes a partially written Lua table.
 
 Disabling a mod is transactional: the menu updates both its live `ENABLED`
 setting and its next-launch `enabled.txt` marker. If either filesystem operation

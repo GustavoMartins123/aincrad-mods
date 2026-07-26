@@ -415,6 +415,8 @@ menu restoration, and equipment workflow were retained.
   the next-launch `enabled.txt` marker together.
 - Rollback to the previous runtime and marker state if either filesystem
   operation fails.
+- Transaction-locked `runtime.lua` publication so independent mod readers
+  never observe a valid but partially written settings table.
 - The shared `ue4ss\Mods\shared\ModMenuBridge.lua` used by isolated Lua states.
 
 ### Changed
@@ -437,6 +439,16 @@ menu restoration, and equipment workflow were retained.
 - Fixed lobby-to-mission transitions requiring manual OFF/ON cycles. Each
   loaded mod now retains its persisted setting while map-owned references are
   invalidated and reacquired.
+- Fixed live numeric edits exposing a partially written `runtime.lua`, which
+  could make SpeedMod reject a temporarily missing `START_SPEED`.
+- Fixed World Enemy Director retaining outgoing-mission enemy references until
+  `ClientRestart`; quest-end events now destroy owned extras and release
+  references before world collection.
+- Boss detection now uses the reflected `EnemyRole_Boss` enum together with
+  `GoldenGateBoss`. Bosses can be mutated explicitly but can never be
+  multiplied or selected by species randomisation.
+- Blueprint classes reused by a mission boss are quarantined for that world;
+  queued, pending, and already-owned extras of the class are removed.
 - Fixed a configuration read failure being replaced by registry defaults in the
   panel. Missing, malformed, or invalid canonical settings now fail closed and
   are reported explicitly.

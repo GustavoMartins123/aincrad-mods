@@ -158,12 +158,127 @@ local function writeFile(path, contents)
     return true, nil
 end
 
+local function removeFile(path)
+    local contents, readError = bridge.readFile(path)
+    if readError ~= nil then
+        return false, "state read failed: " .. tostring(readError)
+    end
+    if contents == nil then return true, nil end
+    local removed, removeError = os.remove(path)
+    if removed == true then return true, nil end
+    return false, tostring(removeError)
+end
+
+-- runtime.lua is watched from independent Lua states. Writing it directly with
+-- "wb" briefly exposes a valid but incomplete table to those readers. Publish
+-- a complete staged file under a transaction lock, then replace the canonical
+-- file while readers deliberately keep their last validated configuration.
+local function writeRuntimeTransaction(path, contents)
+    local nextPath = path .. ".next"
+    local lockPath = path .. ".lock"
+
+    local lockText, lockReadError = bridge.readFile(lockPath)
+    if lockReadError ~= nil then
+        return false, "transaction lock read failed: " .. tostring(lockReadError)
+    end
+    if lockText ~= nil then
+        return false, "runtime transaction lock already exists: " .. lockPath
+    end
+
+    local stagedText, stagedReadError = bridge.readFile(nextPath)
+    if stagedReadError ~= nil then
+        return false, "staged runtime read failed: " .. tostring(stagedReadError)
+    end
+    if stagedText ~= nil then
+        return false, "staged runtime already exists: " .. nextPath
+    end
+
+    local previousText, previousReadError = bridge.readFile(path)
+    if previousReadError ~= nil then
+        return false, "current runtime read failed: " .. tostring(previousReadError)
+    end
+
+    local staged, stageError = writeFile(nextPath, contents)
+    if not staged then
+        return false, "could not stage runtime: " .. tostring(stageError)
+    end
+
+    local locked, lockError = writeFile(
+        lockPath,
+        "ModMenu runtime transaction in progress\n"
+    )
+    if not locked then
+        local removed, removeError = removeFile(nextPath)
+        if not removed then
+            return false, "could not create transaction lock (" ..
+                tostring(lockError) .. "); staged cleanup failed: " ..
+                tostring(removeError)
+        end
+        return false, "could not create transaction lock: " .. tostring(lockError)
+    end
+
+    local function rollback()
+        local targetRemoved, targetRemoveError = removeFile(path)
+        if not targetRemoved then
+            return false, "target cleanup failed: " .. tostring(targetRemoveError)
+        end
+        if previousText ~= nil then
+            local restored, restoreError = writeFile(path, previousText)
+            if not restored then
+                return false, "previous runtime restore failed: " ..
+                    tostring(restoreError)
+            end
+        end
+        return true, nil
+    end
+
+    local targetRemoved, targetRemoveError = removeFile(path)
+    if not targetRemoved then
+        local stagedRemoved, stagedRemoveError = removeFile(nextPath)
+        local lockRemoved, lockRemoveError = removeFile(lockPath)
+        return false, string.format(
+            "canonical runtime removal failed (%s); cleanup staged=%s lock=%s",
+            tostring(targetRemoveError),
+            tostring(stagedRemoved and "ok" or stagedRemoveError),
+            tostring(lockRemoved and "ok" or lockRemoveError)
+        )
+    end
+
+    local published, publishError = os.rename(nextPath, path)
+    if published ~= true then
+        local rolledBack, rollbackError = rollback()
+        local stagedRemoved, stagedRemoveError = removeFile(nextPath)
+        local lockRemoved, lockRemoveError = removeFile(lockPath)
+        return false, string.format(
+            "runtime publish failed (%s); rollback=%s staged=%s lock=%s",
+            tostring(publishError),
+            tostring(rolledBack and "ok" or rollbackError),
+            tostring(stagedRemoved and "ok" or stagedRemoveError),
+            tostring(lockRemoved and "ok" or lockRemoveError)
+        )
+    end
+
+    local lockRemoved, lockRemoveError = removeFile(lockPath)
+    if not lockRemoved then
+        local rolledBack, rollbackError = rollback()
+        local secondRemoval, secondRemovalError = removeFile(lockPath)
+        return false, string.format(
+            "transaction lock removal failed (%s); rollback=%s lock cleanup=%s",
+            tostring(lockRemoveError),
+            tostring(rolledBack and "ok" or rollbackError),
+            tostring(secondRemoval and "ok" or secondRemovalError)
+        )
+    end
+
+    return true, nil
+end
+
 function Store.writeRuntime(modName, values)
     local ok, serialized = pcall(function() return Store.serialize(values) end)
     if not ok then
         return false, "runtime serialization failed: " .. tostring(serialized)
     end
-    return writeFile(runtimePathFor(modName), serialized)
+    return writeRuntimeTransaction(runtimePathFor(modName), serialized)
 end
 
 --========================================================--

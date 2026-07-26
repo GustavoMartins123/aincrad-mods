@@ -117,7 +117,7 @@ return {
               default = 300, min = 100, max = 1500, step = 50, format = "%.0f cm" },
             { key = "RANDOMIZE_EXTRA_SPECIES", label = "Random extra species",
               type = "bool", default = false },
-            { key = "INCLUDE_BOSSES", label = "Include bosses",
+            { key = "INCLUDE_BOSSES", label = "Mutate bosses",
               type = "bool", default = false },
             { key = "SCALE_MIN", label = "Minimum scale", type = "number",
               default = 1.0, min = 0.25, max = 4.0, step = 0.25,

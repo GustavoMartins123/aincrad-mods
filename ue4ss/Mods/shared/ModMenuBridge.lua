@@ -82,6 +82,27 @@ function Bridge.readSettings(_modName, scriptDir)
 
     local configPath = scriptDir .. "config.lua"
     local runtimePath = scriptDir .. "runtime.lua"
+    local transactionPath = runtimePath .. ".lock"
+    local transactionText, transactionReadError =
+        readExactFile(transactionPath, false)
+    if transactionReadError ~= nil then
+        return nil, "TRANSACTION-ERROR\0" .. tostring(transactionReadError), {
+            error = "runtime transaction lock read failed: " ..
+                tostring(transactionReadError),
+            configPath = configPath,
+            runtimePath = runtimePath,
+            transactionPath = transactionPath,
+        }
+    end
+    if transactionText ~= nil then
+        return nil, "TRANSACTION-ACTIVE\0" .. transactionText, {
+            error = "runtime settings transaction is in progress",
+            configPath = configPath,
+            runtimePath = runtimePath,
+            transactionPath = transactionPath,
+            transactionInProgress = true,
+        }
+    end
     local configText, configReadError = readExactFile(configPath, true)
     local runtimeText, runtimeReadError = readExactFile(runtimePath, false)
     local fingerprint =
@@ -206,6 +227,13 @@ function Bridge.attach(options)
         lastFingerprint = fingerprint
 
         if settings == nil then
+            -- ModMenu publishes runtime.lua under an explicit transaction
+            -- lock. Retaining the already-validated active configuration
+            -- while that lock exists is part of the canonical write protocol,
+            -- not an alternate settings source.
+            if info ~= nil and info.transactionInProgress == true then
+                return false
+            end
             dispatchFailure(info and info.error or "settings rejected")
             return false
         end

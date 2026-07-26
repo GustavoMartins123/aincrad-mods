@@ -28,7 +28,7 @@ ModMenu is installed, open the game's Start Menu, choose **Mods**, and expand
 | Maximum extras | 0-200 | Global cap covering live, queued, and pending extras |
 | Spawn radius | 100-1500 cm | Random horizontal distance from the natural spawn |
 | Random extra species | On/Off | Chooses among enemy classes already loaded by the current world |
-| Include bosses | On/Off | Allows boss mutation and multiplication |
+| Mutate bosses | On/Off | Allows mutations on natural bosses; bosses are never multiplied or randomised |
 | Minimum/maximum scale | 0.25x-4x | Stable random scale range per actor |
 | Colour mode | Off/Fixed/Random | Uses the game's material-parameter interface |
 | Colour preset | Seven presets | Colour used by Fixed, or palette used by Random |
@@ -113,6 +113,14 @@ logging.
 
 - Only classes already loaded naturally in the current world can be randomised.
 - Natural quest actors are intentionally not replaced.
+- `EnemyRole_Boss` and `GoldenGateBoss` actors are permanently excluded from
+  the spawn catalog and multiplication origins. The boss setting affects
+  mutations only.
+- If a mission promotes a normally common Blueprint class to boss role, that
+  entire class is quarantined from spawning for the current world. Queued,
+  initializing, or already-owned extras of that class are removed.
+- Quest-end hooks destroy owned extras and release all world references before
+  Unreal begins collecting the outgoing mission.
 - A material that lacks the exact configured colour parameter will keep its
   original appearance and produce an explicit error.
 - Actor creation or initialization failures are reported and are not retried

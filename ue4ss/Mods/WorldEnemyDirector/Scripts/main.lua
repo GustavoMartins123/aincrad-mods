@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.3.0"
+local MOD_VERSION = "1.3.1"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -18,6 +18,7 @@ end
 
 local CONFIG_PATH = SCRIPT_DIR .. "config.lua"
 local RUNTIME_PATH = SCRIPT_DIR .. "runtime.lua"
+local RUNTIME_LOCK_PATH = RUNTIME_PATH .. ".lock"
 
 local STARTUP_SETTLE_MS = 8000
 local RESTART_SETTLE_MS = 5000
@@ -29,6 +30,8 @@ local GAMEPLAY_MOD_ADDITIVE = 0
 local SPAWN_COLLISION_ALWAYS = 1
 local SPAWN_SCALE_MULTIPLY_ROOT = 1
 local GAS_VALUE_EPSILON = 0.01
+local ENEMY_ROLE_NONE = 0
+local ENEMY_ROLE_BOSS = 3
 
 local GAS_ATTRIBUTE_NAMES = {
     health = "Health",
@@ -183,6 +186,18 @@ local function validateSettings(base, runtime)
 end
 
 local function loadSettings()
+    local transactionContents, transactionReadError =
+        readFile(RUNTIME_LOCK_PATH, false)
+    if transactionReadError ~= nil then
+        return nil, nil,
+            "cannot read runtime transaction lock: " ..
+                tostring(transactionReadError),
+            false
+    end
+    if transactionContents ~= nil then
+        return nil, "TRANSACTION-ACTIVE\0" .. transactionContents, nil, true
+    end
+
     local configContents, configReadError = readFile(CONFIG_PATH, true)
     if configContents == nil then return nil, nil, "cannot read config.lua: " .. configReadError end
 
@@ -204,7 +219,7 @@ local function loadSettings()
     local merged, validationError = validateSettings(base, runtime)
     if merged == nil then return nil, nil, validationError end
     local digest = configContents .. "\0" .. (runtimeContents or "")
-    return merged, digest, nil
+    return merged, digest, nil, false
 end
 
 local function isValid(object)
@@ -267,6 +282,7 @@ local states = {}
 local origins = {}
 local classCatalog = {}
 local classOrder = {}
+local protectedBossClasses = {}
 local objectQueue = {}
 local spawnQueue = {}
 local pendingSpawns = {}
@@ -274,19 +290,31 @@ local discoveryBatch = false
 local generation = 1
 local worldPaused = true
 local resumeAtMs = STARTUP_SETTLE_MS
-local restartResetPending = false
 local rescanRequested = false
 local worldFault = nil
 
 local materialLibrary = nil
 local materialInterface = nil
 local gameplayStatics = nil
+local disableWorld
+local releaseWorldForTravel
+local gcScheduled = false
+
+local function scheduleReferenceCollection()
+    if gcScheduled then return end
+    gcScheduled = true
+    ExecuteWithDelay(1, function()
+        gcScheduled = false
+        collectgarbage("collect")
+    end)
+end
 
 local function clearWorldReferences()
     states = {}
     origins = {}
     classCatalog = {}
     classOrder = {}
+    protectedBossClasses = {}
     objectQueue = {}
     spawnQueue = {}
     pendingSpawns = {}
@@ -295,21 +323,38 @@ local function clearWorldReferences()
 end
 
 local function beginTravel(reason)
+    if worldPaused and resumeAtMs == nil then return end
     generation = generation + 1
     worldPaused = true
     resumeAtMs = nil
-    restartResetPending = false
+    local released, releaseFailures = 0, 0
+    if releaseWorldForTravel ~= nil then
+        released, releaseFailures =
+            releaseWorldForTravel("world transition: " .. reason)
+    end
     clearWorldReferences()
-    log("TRAVEL START | " .. reason .. " | native object access paused")
+    scheduleReferenceCollection()
+    if releaseFailures > 0 then
+        log(string.format(
+            "TRAVEL CLEANUP ERROR | %s | released=%d failed=%d",
+            reason,
+            released,
+            releaseFailures
+        ))
+    end
+    log(string.format(
+        "TRAVEL START | %s | extras released=%d | native references cleared",
+        reason,
+        released
+    ))
 end
 
 local function beginRestartSettle()
     generation = generation + 1
     worldPaused = true
     resumeAtMs = elapsedMs + RESTART_SETTLE_MS
-    restartResetPending = true
-    objectQueue = {}
-    spawnQueue = {}
+    clearWorldReferences()
+    scheduleReferenceCollection()
     log("TRAVEL SETTLE | ClientRestart | waiting 5 seconds")
 end
 
@@ -435,7 +480,8 @@ local function snapshotGas(enemy)
 end
 
 local function snapshotEnemy(enemy)
-    local ok, scale, maxHealth, attack, defence, experience, movingSpeed, isBoss =
+    local ok, scale, maxHealth, attack, defence, experience, movingSpeed,
+        goldenGateBoss, enemyRole =
         pcall(function()
             return enemy:GetActorScale3D(),
                 enemy.MaxHelth,
@@ -443,7 +489,8 @@ local function snapshotEnemy(enemy)
                 enemy.DefencePower,
                 enemy.ExperiencePoint,
                 enemy.MovingSpeed,
-                enemy.GoldenGateBoss
+                enemy.GoldenGateBoss,
+                enemy.EnemyRole
         end)
     if not ok then return nil, "required enemy fields are unreadable" end
     local parsedScale = vector(scale)
@@ -457,9 +504,18 @@ local function snapshotEnemy(enemy)
     }) do
         if not finiteNumber(value) then return nil, key .. " is not numeric" end
     end
-    if type(isBoss) ~= "boolean" then return nil, "GoldenGateBoss is not boolean" end
+    if type(goldenGateBoss) ~= "boolean" then
+        return nil, "GoldenGateBoss is not boolean"
+    end
+    if not finiteNumber(enemyRole)
+        or enemyRole % 1 ~= 0
+        or enemyRole < ENEMY_ROLE_NONE
+        or enemyRole > ENEMY_ROLE_BOSS then
+        return nil, "EnemyRole is outside the reflected EEnemyRole contract"
+    end
     local gas, gasError = snapshotGas(enemy)
     if gas == nil then return nil, gasError end
+    local isBoss = goldenGateBoss or enemyRole == ENEMY_ROLE_BOSS
     return {
         scale = parsedScale,
         MaxHelth = maxHealth,
@@ -467,6 +523,8 @@ local function snapshotEnemy(enemy)
         DefencePower = defence,
         ExperiencePoint = experience,
         MovingSpeed = movingSpeed,
+        enemyRole = enemyRole,
+        goldenGateBoss = goldenGateBoss,
         isBoss = isBoss,
         gas = gas,
     }, nil
@@ -936,16 +994,35 @@ local function enforceGlobalCap()
 end
 
 local function selectSpawnClass(origin)
+    if protectedBossClasses[origin.classKey] == true then return nil, nil end
     if not CONFIG.RANDOMIZE_EXTRA_SPECIES then
+        if origin.spawnEligible ~= true then return nil, nil end
         return origin.classObject, origin.classKey
     end
     if #classOrder == 0 then return nil, nil end
     local entry = classCatalog[classOrder[math.random(1, #classOrder)]]
-    if entry == nil or not isValid(entry.classObject) then return nil, nil end
+    if entry == nil
+        or entry.spawnEligible ~= true
+        or protectedBossClasses[entry.classKey] == true
+        or not isValid(entry.classObject) then
+        return nil, nil
+    end
     return entry.classObject, entry.classKey
 end
 
 local function queueExtra(origin, slot)
+    if origin.spawnEligible ~= true then
+        worldFault = "boss-protection invariant rejected spawn origin " ..
+            tostring(origin.key)
+        log("WORLD ERROR | " .. worldFault .. " | director paused")
+        return false
+    end
+    if protectedBossClasses[origin.classKey] == true then
+        worldFault = "boss-protection invariant rejected class " ..
+            tostring(origin.classKey)
+        log("WORLD ERROR | " .. worldFault .. " | director paused")
+        return false
+    end
     if activeExtraCount() >= CONFIG.MAX_ACTIVE_EXTRAS then
         dbg("SPAWN CAP | slot " .. slot .. " for " .. origin.key .. " was not issued")
         return false
@@ -972,6 +1049,7 @@ local function queueExtra(origin, slot)
         classKey = classKey,
         level = origin.level,
         position = position,
+        spawnEligible = true,
     }
     origin.issued = slot
     return true
@@ -1008,10 +1086,55 @@ local function reconcileOrigin(origin)
 end
 
 local function addClass(classObject, classKey)
+    if protectedBossClasses[classKey] == true then return end
     if classCatalog[classKey] ~= nil then return end
-    classCatalog[classKey] = { classObject = classObject, classKey = classKey }
+    classCatalog[classKey] = {
+        classObject = classObject,
+        classKey = classKey,
+        spawnEligible = true,
+    }
     classOrder[#classOrder + 1] = classKey
     dbg("CLASS DISCOVERED | " .. classKey)
+end
+
+local function protectBossClass(classKey)
+    if protectedBossClasses[classKey] == true then return end
+    protectedBossClasses[classKey] = true
+    classCatalog[classKey] = nil
+    for index = #classOrder, 1, -1 do
+        if classOrder[index] == classKey then table.remove(classOrder, index) end
+    end
+    for index = #spawnQueue, 1, -1 do
+        if spawnQueue[index].classKey == classKey then
+            table.remove(spawnQueue, index)
+        end
+    end
+    for index = #pendingSpawns, 1, -1 do
+        local request = pendingSpawns[index]
+        if request.classKey == classKey then
+            table.remove(pendingSpawns, index)
+            destroyPending(request, "class identified as a boss class")
+        end
+    end
+
+    local originKeys = {}
+    for originKey, origin in pairs(origins) do
+        if origin.classKey == classKey then
+            originKeys[#originKeys + 1] = originKey
+        end
+    end
+    for _, originKey in ipairs(originKeys) do removeOrigin(originKey, true) end
+
+    local unsafeOwned = {}
+    for _, state in pairs(states) do
+        if state.owned and state.classKey == classKey then
+            unsafeOwned[#unsafeOwned + 1] = state
+        end
+    end
+    for _, state in ipairs(unsafeOwned) do
+        destroyOwned(state, "class identified as a boss class")
+    end
+    log("BOSS CLASS PROTECTED | removed from spawn system: " .. classKey)
 end
 
 local function takePendingSpawn(actorKey)
@@ -1083,6 +1206,14 @@ local function registerEnemy(enemy, reused)
         end
         return
     end
+    if baseline.isBoss then
+        protectBossClass(classKey)
+        if request ~= nil then
+            destroyPending(request, "spawn initialized as a boss")
+            log("BOSS SPAWN REJECTED | destroyed owned actor: " .. key)
+            return
+        end
+    end
 
     if request ~= nil and activeExtraCount() >= CONFIG.MAX_ACTIVE_EXTRAS then
         destroyPending(request, "completed above the current cap")
@@ -1101,7 +1232,12 @@ local function registerEnemy(enemy, reused)
     }
     states[key] = state
 
-    if not state.owned and (CONFIG.INCLUDE_BOSSES or not baseline.isBoss) then
+    -- INCLUDE_BOSSES controls mutation only. Boss classes and boss actors are
+    -- never admitted to either spawning structure, so a quest boss cannot be
+    -- duplicated by same-species multiplication or by randomisation.
+    if not state.owned
+        and not baseline.isBoss
+        and protectedBossClasses[classKey] ~= true then
         addClass(classObject, classKey)
         local okLevel, level = pcall(function() return enemy:GetEnemyLevel() end)
         if not okLevel or not finiteNumber(level) then
@@ -1114,8 +1250,11 @@ local function registerEnemy(enemy, reused)
                 level = math.max(1, math.floor(level)),
                 location = location,
                 issued = 0,
+                spawnEligible = true,
             }
         end
+    elseif not state.owned then
+        dbg("BOSS PROTECTED | excluded from spawn catalog: " .. key)
     end
 
     if configHealthy and CONFIG.ENABLED then applyMutation(state) end
@@ -1157,6 +1296,18 @@ end
 local function processSpawnRequest()
     local request = table.remove(spawnQueue, 1)
     if request == nil or request.generation ~= generation then return end
+    if request.spawnEligible ~= true then
+        worldFault = "boss-protection invariant rejected queued class " ..
+            tostring(request.classKey)
+        log("WORLD ERROR | " .. worldFault .. " | director paused")
+        return
+    end
+    if protectedBossClasses[request.classKey] == true then
+        worldFault = "boss-protection invariant rejected queued boss class " ..
+            tostring(request.classKey)
+        log("WORLD ERROR | " .. worldFault .. " | director paused")
+        return
+    end
     if not isValid(request.classObject) then
         log("SPAWN ERROR | requested UClass is no longer valid: " .. request.classKey)
         return
@@ -1252,7 +1403,7 @@ local function requestWorldScan()
     return true
 end
 
-local function disableWorld(reason)
+disableWorld = function(reason)
     spawnQueue = {}
     for index = #pendingSpawns, 1, -1 do
         local request = table.remove(pendingSpawns, index)
@@ -1270,6 +1421,35 @@ local function disableWorld(reason)
     for _, origin in pairs(origins) do origin.issued = 0 end
 end
 
+-- The outgoing world is about to be destroyed, so natural actors do not need
+-- their mutations rolled back. Destroy only actors owned by this mod, then let
+-- beginTravel release every Lua reference immediately.
+releaseWorldForTravel = function(reason)
+    local released = 0
+    local failures = 0
+    spawnQueue = {}
+    for index = #pendingSpawns, 1, -1 do
+        local request = table.remove(pendingSpawns, index)
+        if destroyPending(request, reason) then
+            released = released + 1
+        else
+            failures = failures + 1
+        end
+    end
+    local owned = {}
+    for _, state in pairs(states) do
+        if state.owned then owned[#owned + 1] = state end
+    end
+    for _, state in ipairs(owned) do
+        if destroyOwned(state, reason) then
+            released = released + 1
+        else
+            failures = failures + 1
+        end
+    end
+    return released, failures
+end
+
 local function applyNewSettings(settings, digest)
     local previous = CONFIG
     local wasEnabled = configHealthy and CONFIG ~= nil and CONFIG.ENABLED
@@ -1282,11 +1462,12 @@ local function applyNewSettings(settings, digest)
     configDigest = digest
     configHealthy = true
     log(string.format(
-        "CONFIG APPLIED | enabled=%s spawn=%dx cap=%d random=%s scale=%.2f-%.2f color=%s",
+        "CONFIG APPLIED | enabled=%s spawn=%dx cap=%d random=%s bossMutation=%s bossSpawn=false scale=%.2f-%.2f color=%s",
         tostring(CONFIG.ENABLED),
         CONFIG.SPAWN_MULTIPLIER,
         CONFIG.MAX_ACTIVE_EXTRAS,
         tostring(CONFIG.RANDOMIZE_EXTRA_SPECIES),
+        tostring(CONFIG.INCLUDE_BOSSES),
         CONFIG.SCALE_MIN,
         CONFIG.SCALE_MAX,
         CONFIG.COLOR_MODE
@@ -1320,7 +1501,8 @@ local function checkSettings(force)
     if not force and elapsedMs - lastSettingsCheckMs < SETTINGS_POLL_MS then return end
     lastSettingsCheckMs = elapsedMs
 
-    local settings, digest, settingsError = loadSettings()
+    local settings, digest, settingsError, transactionInProgress = loadSettings()
+    if transactionInProgress then return end
     if settings == nil then
         local failureDigest = "ERROR:" .. tostring(settingsError)
         if configDigest ~= failureDigest then
@@ -1341,12 +1523,6 @@ local function tick(stepMs)
 
     if worldPaused then
         if resumeAtMs ~= nil and elapsedMs >= resumeAtMs then
-            if restartResetPending then
-                restartResetPending = false
-                cleanupInvalidStates()
-                disableWorld("ClientRestart world reset")
-                clearWorldReferences()
-            end
             worldPaused = false
             resumeAtMs = nil
             rescanRequested = true
@@ -1439,6 +1615,9 @@ requireHook(
 for _, travelHook in ipairs({
     { "/Script/Engine.PlayerController:ClientTravelInternal", "ClientTravelInternal" },
     { "/Script/Engine.PlayerController:ClientPrepareMapChange", "ClientPrepareMapChange" },
+    { "/Script/ROD.RODGameState:StartQuestEnd", "StartQuestEnd" },
+    { "/Script/ROD.RODGameState:QuestEnd", "QuestEnd" },
+    { "/Script/ROD.RODGameState:ShowQuestResult", "GameState.ShowQuestResult" },
     { "/Script/ROD.RODPlayerState:ServerDecideTown", "ServerDecideTown" },
     { "/Script/ROD.RODPlayerState:ServerDecideFastTravel", "ServerDecideFastTravel" },
     { "/Script/ROD.RODPlayerState:ServerShowQuestResult", "ServerShowQuestResult" },

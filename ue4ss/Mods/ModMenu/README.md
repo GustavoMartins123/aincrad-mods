@@ -34,6 +34,10 @@ target mod watches and validates that file from its own state. Most existing
 mods use `Mods/shared/ModMenuBridge.lua`; a mod with a stricter loader can own
 the same file contract. Nothing is shared in memory.
 
+Runtime publication is transaction-locked: ModMenu writes a complete staged
+file before replacing `runtime.lua`. While the lock exists, readers retain only
+their last fully validated configuration and never parse an incomplete table.
+
 | File | Written by | Role |
 |---|---|---|
 | `Scripts/config.lua` | Player or mod author | Canonical settings, never rewritten by ModMenu |
