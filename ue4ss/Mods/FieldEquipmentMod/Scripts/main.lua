@@ -1,4 +1,4 @@
--- FieldEquipmentMenu v1.15.4
+-- FieldEquipmentMenu v1.16.0
 -- Add a native-styled Equipment entry to Echoes of Aincrad's start menu.
 --
 -- Selecting that entry opens the Equipment screen alone, with the character
@@ -7,7 +7,7 @@
 -- measured on this build.
 
 local MOD_NAME = "FieldEquipmentMenu"
-local MOD_VERSION = "v1.15.4"
+local MOD_VERSION = "v1.16.0"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -32,6 +32,9 @@ local EQUIPMENT_CLOSE_SETTLE_MS = 900
 -- Applied after the rail is rebuilt, late enough that every other mod has had
 -- its own construction notification and appended its row.
 local EQUIPMENT_REFOCUS_DELAY_MS = 600
+-- The forced camera can interpolate its values over its own Speed/Duration, so
+-- the height nudge is written once more after that settles.
+local CAMERA_HEIGHT_REAPPLY_MS = 500
 
 local MAX_NATIVE_MENU_ITEMS = 7
 local ACCEPT_BUTTON = 1
@@ -88,8 +91,21 @@ local SCRIPT_DIR = (function()
     return directory
 end)()
 
-local CONFIG = { ENABLED = true, DEBUG_LOGS = true, SHOW_CHARACTER = true }
-local CONFIG_KEYS = { ENABLED = true, DEBUG_LOGS = true, SHOW_CHARACTER = true }
+local CONFIG = {
+    ENABLED = true,
+    DEBUG_LOGS = true,
+    SHOW_CHARACTER = true,
+    CAMERA_HEIGHT = 40.0,
+}
+
+-- Bounds are the ones the Mods menu offers. Anything outside them is a typo in
+-- config.lua, not a preference, so it fails loudly rather than being clamped.
+local CONFIG_KEYS = {
+    ENABLED = { type = "boolean" },
+    DEBUG_LOGS = { type = "boolean" },
+    SHOW_CHARACTER = { type = "boolean" },
+    CAMERA_HEIGHT = { type = "number", min = -100.0, max = 200.0 },
+}
 
 local function log(message)
     if not CONFIG.DEBUG_LOGS then return end
@@ -99,13 +115,23 @@ end
 local function applyExternalConfig(external)
     if type(external) ~= "table" then error("settings must be a table") end
     for key in pairs(external) do
-        if not CONFIG_KEYS[key] then
+        if CONFIG_KEYS[key] == nil then
             error("unknown setting: " .. tostring(key))
         end
     end
-    for key in pairs(CONFIG_KEYS) do
-        if type(external[key]) ~= "boolean" then
-            error(key .. " must be boolean")
+    for key, rule in pairs(CONFIG_KEYS) do
+        local value = external[key]
+        if type(value) ~= rule.type then
+            error(key .. " must be " .. rule.type)
+        end
+        if rule.type == "number" then
+            if value ~= value or value == math.huge or value == -math.huge then
+                error(key .. " must be finite")
+            end
+            if value < rule.min or value > rule.max then
+                error(string.format("%s must be between %.1f and %.1f",
+                    key, rule.min, rule.max))
+            end
         end
     end
     for key in pairs(CONFIG_KEYS) do
@@ -392,6 +418,7 @@ end
 -- Any one alone leaves the screen worse than not touching the camera at all.
 local previousViewTarget = nil
 local suppressedHiddenKeys = {}
+local previousBoomTargetOffset = nil
 
 local function describeCameraState(widget)
     local enabled = nil
@@ -459,6 +486,56 @@ local function restoreHeroHide(hero)
     suppressedHiddenKeys = {}
 end
 
+-- CAMERA_HEIGHT raises the boom's origin, which lowers the character in frame
+-- and shows more above them. It is a live setting rather than a constant because
+-- the right amount is a matter of taste and no amount of reading headers settles
+-- it — the Mods menu can nudge it while the screen is open.
+--
+-- This runs after ProcessForcedCameraValues, on top of whatever framing the
+-- widget asked for, and is applied twice: the forced camera can interpolate its
+-- own values over a Speed/Duration, so a single write can be overwritten a frame
+-- later.
+local function raiseEquipmentCamera(hero, isReapply)
+    if CONFIG.CAMERA_HEIGHT == 0.0 then return end
+
+    local boom = nil
+    pcall(function() boom = hero.CameraBoom end)
+    if not isValidObject(boom) then
+        if not isReapply then log("camera boom is unavailable; height not applied") end
+        return
+    end
+
+    local applied, applyError = pcall(function()
+        local offset = boom.TargetOffset
+        if previousBoomTargetOffset == nil then
+            previousBoomTargetOffset = { X = offset.X, Y = offset.Y, Z = offset.Z }
+        end
+        offset.Z = previousBoomTargetOffset.Z + CONFIG.CAMERA_HEIGHT
+        boom.TargetOffset = offset
+    end)
+    if isReapply then return end
+    log(string.format("camera height %+.0f applied to the boom; success=%s%s",
+        CONFIG.CAMERA_HEIGHT, tostring(applied),
+        applied and "" or (" error=" .. tostring(applyError))))
+end
+
+local function restoreEquipmentCamera(hero)
+    if previousBoomTargetOffset == nil then return end
+
+    local boom = nil
+    pcall(function() boom = hero.CameraBoom end)
+    if isValidObject(boom) then
+        pcall(function()
+            local offset = boom.TargetOffset
+            offset.X = previousBoomTargetOffset.X
+            offset.Y = previousBoomTargetOffset.Y
+            offset.Z = previousBoomTargetOffset.Z
+            boom.TargetOffset = offset
+        end)
+    end
+    previousBoomTargetOffset = nil
+end
+
 local function takeViewTarget(controller, hero)
     local current = nil
     pcall(function() current = controller:GetViewTarget() end)
@@ -508,6 +585,14 @@ local function showEquipmentCharacter(widget)
     else
         log("forced camera could not be applied: " .. tostring(applyError))
     end
+
+    raiseEquipmentCamera(hero, false)
+    ExecuteWithDelay(CAMERA_HEIGHT_REAPPLY_MS, function()
+        ExecuteInGameThread(function()
+            if not equipmentSubmenuOpen or not isValidObject(hero) then return end
+            raiseEquipmentCamera(hero, true)
+        end)
+    end)
 end
 
 -- Called on the way back. The start menu draws its own character panel and wants
@@ -535,8 +620,10 @@ local function restoreMenuCharacterState(startMenuIsUp)
 
     if not isValidObject(hero) then
         suppressedHiddenKeys = {}
+        previousBoomTargetOffset = nil
         return
     end
+    restoreEquipmentCamera(hero)
     if startMenuIsUp then
         restoreHeroHide(hero)
     else
@@ -2072,6 +2159,38 @@ local function reportState(reply)
         .. "DebugOpen3DMenu returns without opening anything.")
 end
 
+-- `<MISSING STRING TABLE ENTRY>` on some Equipment labels means the string table
+-- those keys live in is not resident. Opening this screen in the field skips
+-- whatever normally pulls it in at a chest, and string tables are collectable,
+-- so whether it is there varies within a session. This lists what is loaded so
+-- the right asset can be named instead of guessed at.
+local function reportStringTables(reply)
+    local ok, tables = pcall(function() return FindAllOf("StringTable") end)
+    if not ok or tables == nil then
+        reply("string tables: FindAllOf(StringTable) returned nothing")
+        return
+    end
+
+    local count = 0
+    for _, table_ in ipairs(tables) do
+        if isValidObject(table_) then
+            count = count + 1
+            if count <= 40 then reply("  " .. objectName(table_)) end
+        end
+    end
+    reply("string tables loaded: " .. tostring(count)
+        .. (count > 40 and "  (first 40 shown)" or ""))
+
+    local manager = FindFirstOf("RODDataManager")
+    if isValidObject(manager) then
+        local general = nil
+        pcall(function() general = manager.GeneralLocalizeStringTable end)
+        reply("RODDataManager.GeneralLocalizeStringTable: " .. objectName(general))
+    else
+        reply("RODDataManager: not resolvable")
+    end
+end
+
 local commandOk, commandError = pcall(function()
     RegisterConsoleCommandHandler("fieldequip", function(_full, params, ar)
         local function reply(message)
@@ -2119,7 +2238,13 @@ local commandOk, commandError = pcall(function()
             return true
         end
 
-        reply("Usage: fieldequip probe | open3d")
+        if sub == "strings" then
+            local ok, err = pcall(reportStringTables, reply)
+            if not ok then reply("string probe error: " .. tostring(err)) end
+            return true
+        end
+
+        reply("Usage: fieldequip probe | strings | open3d")
         return true
     end)
 end)

@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.4.9"
+local MOD_VERSION = "1.4.10"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -385,6 +385,7 @@ local function clearWorldReferences()
     worldFault = nil
     rodGameState = nil
     navigationSystem = nil
+    rodSpawnActorFunction = nil
 end
 
 local function beginTravel(reason)
@@ -506,20 +507,19 @@ local function resolveSpawnApi()
     if not isValid(rodSpawnActorFunction) then
         rodSpawnActorFunction = nil
 
-        local functionOk, functionObject = pcall(
-            StaticFindObject,
-            "/Script/ROD.RODGameState:RODSpawnActor"
-        )
+        local functionOk, functionObject = pcall(function()
+            return rodGameState.RODSpawnActor
+        end)
         if not functionOk then
-            return false, "RODSpawnActor UFunction lookup failed: " ..
+            return false, "bound RODSpawnActor UFunction lookup failed: " ..
                 tostring(functionObject)
         end
         if not isValid(functionObject) then
-            return false, "canonical RODSpawnActor UFunction is unavailable"
+            return false, "bound RODSpawnActor UFunction is unavailable"
         end
         rodSpawnActorFunction = functionObject
         log(
-            "SPAWN CONTRACT | RODSpawnActor UObject.CallFunction contract acquired"
+            "SPAWN CONTRACT | bound RODSpawnActor CallFunction contract acquired"
         )
     end
     return true, nil

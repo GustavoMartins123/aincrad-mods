@@ -19,4 +19,11 @@ return {
     -- function. If the game ever stops surviving that, switch it off: the screen
     -- still opens, just with the character hidden and the camera left alone.
     SHOW_CHARACTER = true,
+
+    -- How much higher than normal the camera sits on the Equipment screen, in
+    -- centimetres. Raising it lowers your character in frame and shows more
+    -- above them; negative values do the opposite. Adjust it from the Mods menu
+    -- with the screen open and you can see each step. Ignored when
+    -- SHOW_CHARACTER is off, and 0 leaves the boom exactly where the game put it.
+    CAMERA_HEIGHT = 40.0,
 }

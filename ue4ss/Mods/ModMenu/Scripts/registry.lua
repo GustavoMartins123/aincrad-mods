@@ -100,6 +100,10 @@ return {
             { key = "ENABLED", label = "Enabled", type = "bool", default = true },
             { key = "SHOW_CHARACTER", label = "Show character",
               type = "bool", default = true },
+            -- Bounds mirror the CAMERA_HEIGHT rule in FieldEquipmentMod. Takes
+            -- effect the next time Equipment is opened, not the current screen.
+            { key = "CAMERA_HEIGHT", label = "Camera height", type = "number",
+              default = 40, min = -100, max = 200, step = 5, format = "%+.0f cm" },
             { key = "DEBUG_LOGS", label = "Debug logging", type = "bool", default = true },
         },
     },

@@ -1,4 +1,4 @@
--- ModMenu v1.5.1
+-- ModMenu v1.5.2
 -- Adds a native-styled "Mods" entry to Echoes of Aincrad's start menu, opening a
 -- panel that enables/disables the other mods and retunes their values in-game.
 --
@@ -12,7 +12,7 @@
 -- mod's Lua state, because UE4SS gives each mod its own.
 
 local MOD_NAME = "ModMenu"
-local MOD_VERSION = "v1.5.1"
+local MOD_VERSION = "v1.5.2"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"

@@ -370,7 +370,7 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/64)
 **Baseline:** `FieldEquipmentMod 64 1
 2026-07-21T11-45Z 8WdQj6lM4.7z`  
 **Original script version:** v1.14.3-release  
-**Integrated script version:** v1.15.4
+**Integrated script version:** v1.16.0
 
 ### Added
 
@@ -441,6 +441,12 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/64)
 - The Equipment session is only treated as open once the widget is confirmed to
   exist, so the `EndMenu` the manager fires for the outgoing Start Menu is no
   longer mistaken for the player leaving.
+- Added `CAMERA_HEIGHT`, a live setting that raises the camera boom's
+  `TargetOffset.Z` while the Equipment screen is up. How high the shot should sit
+  is a matter of taste, so it is a Mods-menu slider rather than a constant. The
+  original offset is recorded and restored on the way out, and the nudge is
+  written a second time after the forced camera finishes interpolating its own
+  values.
 
 ### Measured on this build
 
@@ -450,6 +456,20 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/64)
   v1.15.0 and reverted. `RODWidgetBPFunctionLibrary:DebugOpenMenu` + `OpenMenu`
   remains the only working path. `fieldequip open3d` re-runs the experiment if a
   future patch changes it.
+- `ARODInGamePlayerController:OnMainMenuCharacterHidden(false)` does not clear
+  the Start Menu's character hide. `ARODCharacterBase:SetAllActorHiddenInGame`
+  against each key in `HiddenInGameKeys` does.
+
+### Known limitations
+
+- Some Equipment labels can render as `<MISSING STRING TABLE ENTRY>` —
+  "Proficiência na Arma", "MOD Único", "MOD Extra", "Armas Obtidas" and similar.
+  Item names, descriptions and every other panel resolve normally. The string
+  table those particular keys live in is not resident: opening this screen in the
+  field skips whatever pulls it in at a chest, and string tables are collectable,
+  so whether it is present varies within a session rather than between builds.
+  `fieldequip strings` lists what is loaded, which is what naming the asset to
+  preload will need.
 
 ### Fixed
 
@@ -478,7 +498,7 @@ Changed above.
 **Original archive:** None of the six Nexus baselines contains ModMenu or
 `ModMenuBridge.lua`
 
-**Current script version:** v1.5.1
+**Current script version:** v1.5.2
 
 ### Added
 
@@ -557,7 +577,7 @@ Changed above.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v1.4.9
+**Current script version:** v1.4.10
 
 ### Added
 
@@ -589,11 +609,14 @@ Changed above.
 - Reports the rejected native property and remaining Lua argument types in one
   compact spawn-contract fault instead of discarding that diagnostic context
   or emitting the full repeated stack dump.
-- Invokes the unbound `RODSpawnActor` through
+- Invokes `RODSpawnActor` through
   `RODGameState:CallFunction(UFunction, ...)` in the declared C++ parameter
   order. Direct UFunction `__call` invocation on UE4SS build `c838a8ac` left
   its callable table in the marshaling stack and shifted `inOwner` and
   `InInstigator`.
+- Acquires the UFunction from the current `RODGameState`, providing
+  `CallFunction` with a bound calling context. The bound UFunction reference is
+  cleared on every world transition.
 - Requires 50-150 cm separation from natural, pending, and owned enemies and
   uses `AdjustIfPossibleButDontSpawnIfColliding`.
 - Supplies `FRODSpawnActorOption` with server spawn, source level, `Prowl`
