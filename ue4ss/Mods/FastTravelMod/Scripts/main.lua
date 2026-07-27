@@ -1,4 +1,4 @@
--- FastTravelMod v0.3.7
+-- FastTravelMod v0.4.0
 --
 -- Adds a native-styled Fast Travel row to Echoes of Aincrad's Start Menu and
 -- opens the game's ordinary WBP_Map screen in teleport mode. Confirming an
@@ -9,18 +9,41 @@
 --   ARODInGamePlayerController::EndMainMenu(true)
 --   UGameplayAbility::GetAbilitySystemComponentFromActorInfo()
 --   UGameplayAbility::AbilityTriggers
---   URODAbilitySystemComponent::TryActivateAbilityWithPayloadFromClass(...)
+--   ARODAvatarCharacter::ActivateFPCameraMenuAbility(EventTag, MenuKey, Target)
+--   UGA_AvatarMenu_FirstPersonCamera_C::LevelSequenceMap / CurrentMenuKey
 --   ARODInGamePlayerController::EndMapMenu(AllClose)
 --   URODMapMenuWidgetBase::UpdateIcon(...)
 --   ARODAvatarCharacter::ServerDebugTeleportGimmick(FVector)
 --   WBP_Map_C
+--
+-- HOW THE MAP IS OPENED, AND WHY IT USED TO FAIL
+--
+-- GA_AvatarMenu_Map_C is not a standalone ability: it derives from
+-- GA_AvatarMenu_FirstPersonCamera_C, which activates from an event and then
+-- looks its opening cutscene up in LevelSequenceMap, a TMap<FName, LevelSequence>
+-- indexed by CurrentMenuKey. That key is what decides whether the avatar ever
+-- raises the menu, and it is the only thing that eventually calls
+-- ARODInGamePlayerController::DisplayMapMenu, which is what actually constructs
+-- WBP_Map_C.
+--
+-- Calling TryActivateAbilityWithPayloadFromClass with a blank FGameplayEventData
+-- activated the ability -- the call returned true -- and then the ability sat
+-- there with no menu key, no level sequence and no display step, so no widget was
+-- ever built. The measured symptom was exactly that: "map gameplay ability
+-- activated" followed by "WBP_Map_C was not constructed".
+--
+-- ARODAvatarCharacter::ActivateFPCameraMenuAbility(EventTag, MenuKey, Target) is
+-- the game's own entry point for this ability family and takes the menu key as a
+-- real argument. The hook on it below records what the game passes for every
+-- first-person-camera menu it opens (the Start Menu opens through the same
+-- function), so the key this mod sends is measured rather than assumed.
 --
 -- No terminal impersonation, FastTravelStatus write or direct actor-location
 -- mutation exists here. If the exact selected icon or its native map position
 -- is unavailable, the operation stops and reports the error.
 
 local MOD_NAME = "FastTravelMod"
-local MOD_VERSION = "v0.3.7"
+local MOD_VERSION = "v0.4.0"
 local SUPPORTED_SDK = "Echoes of Aincrad 1.0.3"
 
 local MAIN_MENU_ICON_CLASS =
@@ -93,6 +116,7 @@ end)()
 local CONFIG = {
     ENABLED = true,
     DEBUG_LOGS = false,
+    MAP_MENU_KEY = "",
 }
 
 local runtimeHealthy = true
@@ -110,10 +134,20 @@ local teleportMapModeActive = false
 local mapTeleportBusy = false
 local mapIconDestinations = {}
 local pendingMapAbility = nil
+local pendingMapContract = nil
 local lastNativeFastTravelStatus = nil
 local lastNativeAccessibleStatus = nil
 local lastNativeAccessingTerminal = nil
 local lastNativeAccessibleGimmickId = nil
+
+-- Everything the game itself has passed to ActivateFPCameraMenuAbility this
+-- session: event tag name -> menu key. Written only by the hook, so a key taken
+-- from here is a measured value and never a guess.
+local observedMenuKeys = {}
+local observedMenuKeyOrder = {}
+local mapSequenceKeyCache = nil
+local lastMapMenuKey = nil
+local lastMapMenuKeySource = nil
 
 local function log(message)
     print(string.format("[%s] %s\n", MOD_NAME, tostring(message)))
@@ -181,22 +215,34 @@ local function applySettings(settings)
     if type(settings) ~= "table" then
         error("settings must be a table")
     end
-    local known = {
+    local booleanKeys = {
         ENABLED = true,
         DEBUG_LOGS = true,
     }
+    -- MAP_MENU_KEY is deliberately absent from the ModMenu registry: it is a
+    -- free-text FName escape hatch for the case where the menu key cannot be
+    -- learned from the game, and the in-game menu has no text field.
+    local stringKeys = {
+        MAP_MENU_KEY = true,
+    }
     for key in pairs(settings) do
-        if known[key] ~= true then
+        if booleanKeys[key] ~= true and stringKeys[key] ~= true then
             error("unknown setting: " .. tostring(key))
         end
     end
-    for key in pairs(known) do
+    for key in pairs(booleanKeys) do
         if type(settings[key]) ~= "boolean" then
             error(key .. " must be boolean")
         end
     end
+    for key in pairs(stringKeys) do
+        if settings[key] ~= nil and type(settings[key]) ~= "string" then
+            error(key .. " must be a string")
+        end
+    end
     CONFIG.ENABLED = settings.ENABLED
     CONFIG.DEBUG_LOGS = settings.DEBUG_LOGS
+    CONFIG.MAP_MENU_KEY = settings.MAP_MENU_KEY or ""
     runtimeHealthy = true
 end
 
@@ -415,7 +461,6 @@ local function resolveMapAbilityContract()
     local mapAbilityClassName = nil
     local mapAbilityTriggerTag = nil
     local mapAbilityTriggerTagName = nil
-    local mapAbilityPayload = nil
     local contractOk, contractError = pcall(function()
         mapAbility = resolveOwnedAbility(
             MAP_MENU_ABILITY_CLASS,
@@ -481,12 +526,6 @@ local function resolveMapAbilityContract()
             mapAbilityTriggerTag.TagName,
             MAP_MENU_ABILITY_CLASS .. " trigger TagName")
 
-        mapAbilityPayload = mapAbility.CurrentEventData
-        if mapAbilityPayload == nil then
-            error(MAP_MENU_ABILITY_CLASS ..
-                " CurrentEventData payload is unavailable")
-        end
-
         local mainMenuActive =
             isOwnedAbilityClassActive(
                 MAIN_MENU_ABILITY_CLASS,
@@ -502,14 +541,87 @@ local function resolveMapAbilityContract()
     end
 
     return {
+        hero = hero,
         abilitySystem = abilitySystem,
         mapAbility = mapAbility,
         mapAbilityClass = mapAbilityClass,
         mapAbilityClassName = mapAbilityClassName,
         mapAbilityTriggerTag = mapAbilityTriggerTag,
         mapAbilityTriggerTagName = mapAbilityTriggerTagName,
-        mapAbilityPayload = mapAbilityPayload,
     }, nil
+end
+
+-- The legal menu keys for this ability, read straight out of its own
+-- LevelSequenceMap. A key that is not in here has no opening sequence, and the
+-- ability that used to be activated with a blank payload had exactly that.
+local function mapSequenceKeys(mapAbility)
+    if mapSequenceKeyCache ~= nil then return mapSequenceKeyCache end
+
+    local keys = {}
+    local readOk, readError = pcall(function()
+        local sequences = mapAbility.LevelSequenceMap
+        if sequences == nil then
+            error("LevelSequenceMap is unavailable")
+        end
+        sequences:ForEach(function(key)
+            keys[#keys + 1] =
+                exactFNameString(key:get(), "LevelSequenceMap key")
+        end)
+    end)
+    if not readOk then
+        log("MAP SEQUENCE KEYS | unreadable: " .. tostring(readError))
+        mapSequenceKeyCache = {}
+        return mapSequenceKeyCache
+    end
+
+    mapSequenceKeyCache = keys
+    log(string.format(
+        "MAP SEQUENCE KEYS | %s LevelSequenceMap holds %d key(s): %s",
+        MAP_MENU_ABILITY_CLASS,
+        #keys,
+        #keys == 0 and "<none>" or table.concat(keys, ", ")))
+    return mapSequenceKeyCache
+end
+
+-- Sources are tried strongest first. "Observed" means the game itself passed
+-- that key to ActivateFPCameraMenuAbility while this session was running.
+local function resolveMapMenuKey(contract)
+    local keys = mapSequenceKeys(contract.mapAbility)
+    local legal = {}
+    for _, key in ipairs(keys) do legal[key] = true end
+
+    if CONFIG.MAP_MENU_KEY ~= "" then
+        return CONFIG.MAP_MENU_KEY, "config MAP_MENU_KEY"
+    end
+
+    local observedForMap = observedMenuKeys[contract.mapAbilityTriggerTagName]
+    if observedForMap ~= nil then
+        return observedForMap, "observed native map activation"
+    end
+
+    -- The key names the avatar's opening pose, not the menu, so the Start Menu
+    -- and the map share a vocabulary. Only accept a borrowed key if the map
+    -- ability actually declares a sequence for it.
+    for index = #observedMenuKeyOrder, 1, -1 do
+        local tagName = observedMenuKeyOrder[index]
+        local candidate = observedMenuKeys[tagName]
+        if candidate ~= nil and legal[candidate] == true then
+            return candidate, "observed " .. tagName .. " key, shared"
+        end
+    end
+
+    if #keys == 1 then
+        return keys[1], "sole LevelSequenceMap key"
+    end
+    for _, key in ipairs(keys) do
+        if string.find(string.lower(key), "map", 1, true) ~= nil then
+            return key, "LevelSequenceMap key naming the map"
+        end
+    end
+    if #keys > 0 then
+        return keys[1], "first of " .. #keys .. " LevelSequenceMap keys"
+    end
+    return nil, "no key source"
 end
 
 local function resolveWorldGameState()
@@ -1360,10 +1472,42 @@ local function isPresentedTeleportMapWidget(widget)
         and objectName(mounted) == objectName(widget)
 end
 
+-- Read back what the ability did with the key we sent it. CurrentMenuKey is set
+-- by the native activation path, so an empty one says the key never landed and a
+-- populated one moves the investigation past this mod.
+local function logMapAbilityState(label)
+    local contract = pendingMapContract
+    if contract == nil or not isValid(contract.mapAbility) then
+        log(string.format(
+            "MAP ABILITY STATE | %s | ability reference is gone", label))
+        return
+    end
+
+    local active = "unreadable"
+    pcall(function()
+        active = tostring(contract.mapAbility:BP_IsActive())
+    end)
+
+    local currentKey = "unreadable"
+    pcall(function()
+        currentKey = exactFNameString(
+            contract.mapAbility.CurrentMenuKey, "CurrentMenuKey")
+    end)
+
+    log(string.format(
+        "MAP ABILITY STATE | %s | active=%s | CurrentMenuKey=%s | sent=%s (%s)",
+        label,
+        active,
+        currentKey,
+        tostring(lastMapMenuKey),
+        tostring(lastMapMenuKeySource)))
+end
+
 local function failPendingOpen(serial, reason)
     if serial ~= nil and serial ~= openSerial then return end
     local abilityToCancel = pendingMapAbility
     pendingMapAbility = nil
+    pendingMapContract = nil
     if isValid(abilityToCancel) then
         local active = false
         local activeOk = pcall(function()
@@ -1396,6 +1540,7 @@ local function verifyTeleportMapOpen(serial)
         return FindAllOf(MAP_WIDGET_FRAGMENT)
     end)
     if not ok or type(widgets) ~= "table" then
+        logMapAbilityState("no widget")
         failPendingOpen(
             serial,
             "WBP_Map_C was not constructed")
@@ -1409,6 +1554,7 @@ local function verifyTeleportMapOpen(serial)
         end
     end
     if #presented ~= 1 then
+        logMapAbilityState("widget not presented")
         failPendingOpen(serial, string.format(
             "expected one presented %s, found %d",
             MAP_WIDGET_FRAGMENT, #presented))
@@ -1416,6 +1562,7 @@ local function verifyTeleportMapOpen(serial)
     end
     openBusy = false
     pendingMapAbility = nil
+    pendingMapContract = nil
     teleportMapWidgetKey = objectName(presented[1])
     teleportMapModeActive = true
     log("teleport map presented; select an eligible icon and confirm")
@@ -1424,32 +1571,49 @@ end
 local function activateTeleportMapAbility(serial, contract)
     if serial ~= openSerial then return end
 
-    local activated = nil
+    if not isValid(contract.hero) then
+        failPendingOpen(serial, "local hero is unavailable at activation")
+        return
+    end
+
+    local menuKey, menuKeySource = resolveMapMenuKey(contract)
+    lastMapMenuKey = menuKey
+    lastMapMenuKeySource = menuKeySource
+    if menuKey == nil then
+        failPendingOpen(
+            serial,
+            "no menu key is available for " .. MAP_MENU_ABILITY_CLASS ..
+                "; set MAP_MENU_KEY in config.lua or open the map once " ..
+                "natively so the key can be observed")
+        return
+    end
+
+    -- Step-logged before the native call, because an access violation inside it
+    -- would take the process down with no Lua error to catch.
+    log(string.format(
+        "MAP OPEN | ActivateFPCameraMenuAbility | tag=%s | menuKey=%s (%s)",
+        contract.mapAbilityTriggerTagName,
+        menuKey,
+        menuKeySource))
+
+    pendingMapAbility = contract.mapAbility
+    pendingMapContract = contract
+
     local activationOk, activationError = pcall(function()
-        activated =
-            contract.abilitySystem:
-                TryActivateAbilityWithPayloadFromClass(
-                contract.mapAbilityClass,
-                contract.mapAbilityTriggerTag,
-                contract.mapAbilityPayload)
+        contract.hero:ActivateFPCameraMenuAbility(
+            contract.mapAbilityTriggerTag,
+            FName(menuKey),
+            nil)
     end)
     if not activationOk then
         failPendingOpen(
             serial,
-            "map gameplay ability activation failed: " ..
+            "ActivateFPCameraMenuAbility failed: " ..
                 tostring(activationError))
         return
     end
-    if activated ~= true then
-        failPendingOpen(
-            serial,
-            "map gameplay event activation was rejected: " ..
-                contract.mapAbilityTriggerTagName)
-        return
-    end
 
-    pendingMapAbility = contract.mapAbility
-    log("map gameplay ability activated | ability=" ..
+    log("map gameplay ability requested | ability=" ..
         tostring(objectName(contract.mapAbility)) ..
         " | class=" .. contract.mapAbilityClassName ..
         " | trigger=" .. contract.mapAbilityTriggerTagName)
@@ -1535,6 +1699,7 @@ local function requestFastTravelOpen(source)
     mapTeleportBusy = false
     mapIconDestinations = {}
     pendingMapAbility = nil
+    pendingMapContract = nil
 
     local state = nil
     local stateOk, stateError =
@@ -2090,6 +2255,57 @@ requireHook(
     end)
 )
 
+-- Observation only. Every first-person-camera menu the game opens -- the Start
+-- Menu included -- comes through here, so one Start Menu open is enough to learn
+-- the exact argument shape this mod has to reproduce. It never fails the mod:
+-- a decode problem here must not cost the user their Fast Travel row.
+requireHook(
+    "/Script/ROD.RODAvatarCharacter:ActivateFPCameraMenuAbility",
+    function(selfParameter, tagParameter, keyParameter, targetParameter)
+        pcall(function()
+            local avatar = hookValue(selfParameter)
+            if not isValid(avatar) then return end
+
+            local tagName = "<unreadable>"
+            pcall(function()
+                tagName = exactFNameString(
+                    hookValue(tagParameter).TagName, "EventTag TagName")
+            end)
+
+            local menuKey = "<unreadable>"
+            pcall(function()
+                menuKey = exactFNameString(
+                    hookValue(keyParameter), "MenuKey")
+            end)
+
+            local targetName = "<null>"
+            pcall(function()
+                local target = hookValue(targetParameter)
+                if isValid(target) then
+                    targetName = tostring(objectName(target))
+                end
+            end)
+
+            local known = observedMenuKeys[tagName]
+            observedMenuKeys[tagName] = menuKey
+            if known == nil then
+                observedMenuKeyOrder[#observedMenuKeyOrder + 1] = tagName
+            end
+            if known ~= menuKey then
+                log(string.format(
+                    "NATIVE FP MENU | tag=%s | menuKey=%s | target=%s | avatar=%s",
+                    tagName,
+                    menuKey,
+                    targetName,
+                    tostring(objectName(avatar))))
+            else
+                dbg(string.format(
+                    "native FP menu repeat | tag=%s | menuKey=%s", tagName, menuKey))
+            end
+        end)
+    end
+)
+
 requireHook(
     "/Script/ROD.RODInGamePlayerController:OpenDirectingMapMenu",
     guardedHookCallback("directing map open", function(selfParameter)
@@ -2175,6 +2391,8 @@ requireHook(
         mapIconDestinations = {}
         openSerial = openSerial + 1
         teleportMapWidgetKey = nil
+        pendingMapAbility = nil
+        pendingMapContract = nil
         dbg("native restart completed; teleport map state cleared")
     end)
 )
@@ -2191,6 +2409,8 @@ requireHook(
             mapTeleportBusy = false
             mapIconDestinations = {}
             openSerial = openSerial + 1
+            pendingMapAbility = nil
+            pendingMapContract = nil
             dbg("teleport map closed")
         end
     end)
@@ -2367,6 +2587,45 @@ local commandOk, commandError = pcall(function()
                 return true
             end
 
+            if subcommand == "menukeys" then
+                reply(
+                    "Menu key report scheduled; output goes to the UE4SS console.")
+                ExecuteInGameThread(function()
+                    local reportOk, reportError = xpcall(function()
+                        log("MENU KEY REPORT | configured=" ..
+                            (CONFIG.MAP_MENU_KEY == ""
+                                and "<auto>" or CONFIG.MAP_MENU_KEY) ..
+                            " | lastSent=" .. tostring(lastMapMenuKey) ..
+                            " (" .. tostring(lastMapMenuKeySource) .. ")")
+                        if #observedMenuKeyOrder == 0 then
+                            log("MENU KEY REPORT | nothing observed yet; " ..
+                                "open the Start Menu once")
+                        end
+                        for _, tagName in ipairs(observedMenuKeyOrder) do
+                            log(string.format(
+                                "MENU KEY REPORT | observed %s -> %s",
+                                tagName,
+                                tostring(observedMenuKeys[tagName])))
+                        end
+                        local contract, contractError =
+                            resolveMapAbilityContract()
+                        if contract == nil then
+                            log("MENU KEY REPORT | LevelSequenceMap " ..
+                                "unavailable: " .. tostring(contractError) ..
+                                " (open the Start Menu first)")
+                            return
+                        end
+                        mapSequenceKeyCache = nil
+                        mapSequenceKeys(contract.mapAbility)
+                    end, debug.traceback)
+                    if not reportOk then
+                        log("MENU KEY REPORT ERROR | " ..
+                            tostring(reportError))
+                    end
+                end)
+                return true
+            end
+
             if subcommand == "terminals" then
                 reply(
                     "Terminal catalog scheduled; output goes to the UE4SS console.")
@@ -2396,7 +2655,7 @@ local commandOk, commandError = pcall(function()
             end
 
             reply(
-                "Usage: fasttravel status | open | terminals | pins")
+                "Usage: fasttravel status | open | menukeys | terminals | pins")
             return true
         end
     )

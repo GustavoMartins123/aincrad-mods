@@ -20,9 +20,10 @@ local CONFIG_PATH = SCRIPT_DIR .. "config.lua"
 local RUNTIME_PATH = SCRIPT_DIR .. "runtime.lua"
 local RUNTIME_LOCK_PATH = RUNTIME_PATH .. ".lock"
 
-local STARTUP_SETTLE_MS = 8000
-local RESTART_SETTLE_MS = 5000
-local QUEST_TELEPORT_SETTLE_MS = 8000
+local STARTUP_SETTLE_MS = 2000
+local RESTART_SETTLE_MS = 1500
+local QUEST_TELEPORT_SETTLE_MS = 2000
+local STABILITY_SAMPLES_REQUIRED = 3
 local DISCOVERY_STABILIZE_MS = 2000
 local SETTINGS_POLL_MS = 1000
 local SPAWN_INITIALIZE_MS = 8000
@@ -354,6 +355,8 @@ local origins = {}
 local classCatalog = {}
 local classOrder = {}
 local protectedBossClasses = {}
+local gasAttributesByClass = {}
+local readinessStabilitySamples = 0
 local objectQueue = {}
 local spawnQueue = {}
 local pendingSpawns = {}
@@ -402,6 +405,8 @@ local function clearWorldReferences()
     classCatalog = {}
     classOrder = {}
     protectedBossClasses = {}
+    gasAttributesByClass = {}
+    readinessStabilitySamples = 0
     objectQueue = {}
     spawnQueue = {}
     pendingSpawns = {}
@@ -670,42 +675,51 @@ local function readGasValue(gas, key)
     return value, nil
 end
 
-local function snapshotGas(enemy)
+local function snapshotGas(enemy, className)
     local okSystem, abilitySystem = pcall(function() return enemy.AbilitySystem end)
     if not okSystem or not isValid(abilitySystem) then
         return nil, "required enemy AbilitySystem is unavailable"
     end
 
-    local reflected = {}
-    local okAttributes, attributesError =
-        pcall(function() abilitySystem:GetAllAttributes(reflected) end)
-    if not okAttributes then
-        return nil, "GetAllAttributes failed: " .. tostring(attributesError)
-    end
-
-    local wanted = {}
-    for key, name in pairs(GAS_ATTRIBUTE_NAMES) do wanted[name] = key end
-    local attributes = {}
-    for index = 1, #reflected do
-        local attribute, elementError =
-            gameplayAttributeFromArrayElement(reflected[index], index)
-        if attribute == nil then return nil, elementError end
-        local name, nameError = gameplayAttributeName(attribute)
-        if name == nil then
-            return nil, "attribute " .. tostring(index) .. ": " .. nameError
+    local attributes = nil
+    if className ~= nil and gasAttributesByClass[className] ~= nil then
+        attributes = gasAttributesByClass[className]
+    else
+        local reflected = {}
+        local okAttributes, attributesError =
+            pcall(function() abilitySystem:GetAllAttributes(reflected) end)
+        if not okAttributes then
+            return nil, "GetAllAttributes failed: " .. tostring(attributesError)
         end
-        local key = wanted[name]
-        if key ~= nil then
-            if attributes[key] ~= nil then
-                return nil, "duplicate GAS attribute " .. name
+
+        local wanted = {}
+        for key, name in pairs(GAS_ATTRIBUTE_NAMES) do wanted[name] = key end
+        attributes = {}
+        for index = 1, #reflected do
+            local attribute, elementError =
+                gameplayAttributeFromArrayElement(reflected[index], index)
+            if attribute == nil then return nil, elementError end
+            local name, nameError = gameplayAttributeName(attribute)
+            if name == nil then
+                return nil, "attribute " .. tostring(index) .. ": " .. nameError
             end
-            attributes[key] = attribute
+            local key = wanted[name]
+            if key ~= nil then
+                if attributes[key] ~= nil then
+                    return nil, "duplicate GAS attribute " .. name
+                end
+                attributes[key] = attribute
+            end
         end
-    end
 
-    for key, name in pairs(GAS_ATTRIBUTE_NAMES) do
-        if attributes[key] == nil then
-            return nil, "required GAS attribute is absent: " .. name
+        for key, name in pairs(GAS_ATTRIBUTE_NAMES) do
+            if attributes[key] == nil then
+                return nil, "required GAS attribute is absent: " .. name
+            end
+        end
+
+        if className ~= nil then
+            gasAttributesByClass[className] = attributes
         end
     end
 
@@ -727,6 +741,7 @@ local function snapshotGas(enemy)
 end
 
 local function snapshotEnemy(enemy)
+    local classObj, className = classData(enemy)
     local ok, mesh, meshScale, maxHealth, attack, defence, experience,
         movingSpeed, goldenGateBoss, enemyRole,
         bossEventSequence, bossFinisherSequence =
@@ -768,7 +783,7 @@ local function snapshotEnemy(enemy)
         or enemyRole > ENEMY_ROLE_BOSS then
         return nil, "EnemyRole is outside the reflected EEnemyRole contract"
     end
-    local gas, gasError = snapshotGas(enemy)
+    local gas, gasError = snapshotGas(enemy, className)
     if gas == nil then return nil, gasError end
 
     -- Protection is for the mission's own boss, not for anything the data
@@ -2389,11 +2404,23 @@ local function tick(stepMs)
     checkSettings(CONFIG == nil)
 
     if worldPaused then
-        if resumeAtMs ~= nil and elapsedMs >= resumeAtMs then
+        local hero = resolveHero()
+        local controller = resolveLocalController()
+        local heroReady = isValid(hero)
+        local clockPassed = (resumeAtMs ~= nil and elapsedMs >= resumeAtMs)
+
+        if heroReady and controller ~= nil then
+            readinessStabilitySamples = readinessStabilitySamples + 1
+        else
+            readinessStabilitySamples = 0
+        end
+
+        if clockPassed or readinessStabilitySamples >= STABILITY_SAMPLES_REQUIRED then
+            readinessStabilitySamples = 0
             worldPaused = false
             resumeAtMs = nil
             rescanRequested = true
-            log("WORLD READY | enemy director resumed")
+            log("WORLD READY | enemy director resumed via readiness stability")
         else
             return
         end

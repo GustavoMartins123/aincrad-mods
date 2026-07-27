@@ -116,7 +116,7 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/45)
 **Baseline:** `SpeedMod v8 Stablized 45 8
 2026-07-20T00-09Z 3CxMATjay.zip`  
 **Original script version:** v7.11  
-**Integrated script version:** v7.18
+**Integrated script version:** v7.19
 
 ### Added
 
@@ -131,9 +131,13 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/45)
 - Live settings integration through the canonical shared
   `ModMenuBridge.lua`.
 - `Scripts\runtime.lua` for settings written by ModMenu.
+- Dynamic state-machine readiness based on consecutive hero and world stability sampling.
 
 ### Changed
 
+- Replaced fixed startup and quarantine delays with a dynamic state-machine readiness check requiring consecutive stable hero/movement samples.
+- Cached `MovementComponent` reference alongside `cachedHero` per world generation to eliminate per-tick component lookup.
+- Fast-pathed movement baseline and jump height validation to bypass per-tick `GetFullName()` C++ reflection calls when component references remain unchanged.
 - Replaced the legacy setting aliases with the exact public keys used by
   `config.lua`: `START_SPEED`, `MAX_SPEED`, `SECONDS_TO_MAX_SPEED`, and
   `JUMP_HEIGHT_MULTIPLIER`.
@@ -241,6 +245,8 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/19)
   applied range state before applying the new value.
 - Made the `autopickup` console command read-only. Persistent configuration has
   one path through `config.lua` or ModMenu.
+- Consolidated post-travel and post-rest scan workflows by removing redundant +3s and +8s delayed expand retries in favor of a single prompt scan upon world readiness.
+- Cached valid `GameConfig` candidate instances in `collectGameConfigCandidates()` to avoid per-apply `StaticFindObject` and `FindFirstOf` reflection lookups.
 
 ### Fixed
 
@@ -728,6 +734,8 @@ Changed above.
   delegates; the engine auto-possesses the pawn but nothing calls those, because
   the game's own path reaches them through `RODSpawnActor`. The controller is now
   set up first, then the character, then the behaviour tree.
+- Replaced fixed settlement timers (`STARTUP_SETTLE_MS`, `RESTART_SETTLE_MS`, `QUEST_TELEPORT_SETTLE_MS`) with a dynamic state-machine readiness check requiring 3 consecutive stable hero and controller samples.
+- Cached `FGameplayAttribute` handles by class key in `snapshotGas()`, eliminating per-enemy `GetAllAttributes()` native array reflection.
 - Fixed stutter introduced with distance recycling. `FindFirstOf` walks the
   global object array and was being called twice per tick to locate the hero; it
   is now resolved once and kept until it stops being valid. The nearby-origin
@@ -798,6 +806,64 @@ actor-root-scale compatibility path.
 
 A population-call contract failure rolls back the director, clears queued
 work, and emits one concise world fault. It is not retried every poll cycle.
+
+## New Fast Travel component
+
+**Origin:** New local quality-of-life implementation
+
+**Original archive:** None of the six Nexus baselines contains this component
+
+**Current script version:** v0.4.0
+
+### Added
+
+- A native-styled "Fast Travel" row in the Start Menu, injected with the game's
+  own `WBP_Console_MainMenu_MenuIcon_C` wrapper so the rail keeps its focus
+  order and other mods' injected rows stay reachable.
+- The game's ordinary `WBP_Map_C` screen as the destination picker. Checkpoint,
+  teleport gate, safe-area and hero/pillar/instant pin icons are eligible;
+  confirming a selected one teleports through the hero's native server RPC.
+- Observation of `ARODAvatarCharacter::ActivateFPCameraMenuAbility`, recording
+  the event tag, menu key and target for every first-person-camera menu the game
+  opens. A `fasttravel menukeys` console report prints what has been observed
+  alongside `GA_AvatarMenu_Map_C`'s own `LevelSequenceMap` keys.
+- A `MAP_MENU_KEY` setting in `config.lua` overriding the resolved menu key. It
+  is deliberately absent from the ModMenu registry, which has no text field.
+
+### Changed
+
+- The map is now opened through
+  `ARODAvatarCharacter::ActivateFPCameraMenuAbility(EventTag, MenuKey, Target)`
+  instead of
+  `URODAbilitySystemComponent::TryActivateAbilityWithPayloadFromClass` with a
+  blank `FGameplayEventData`.
+- `GA_AvatarMenu_Map_C`'s `CurrentEventData` is no longer read as a precondition.
+  Nothing consumed it once the payload stopped being the activation vehicle.
+
+### Fixed
+
+- Fixed the map never appearing. `GA_AvatarMenu_Map_C` derives from
+  `GA_AvatarMenu_FirstPersonCamera_C`, which resolves its opening level sequence
+  through `LevelSequenceMap`, a `TMap<FName, ULevelSequence*>` indexed by
+  `CurrentMenuKey`. That sequence is what eventually reaches
+  `ARODInGamePlayerController::DisplayMapMenu`, and `DisplayMapMenu` is what
+  constructs `WBP_Map_C`. Activating with a blank payload left the ability with
+  no menu key, so it activated and then did nothing. The measured symptom was
+  exactly that pair of log lines: "map gameplay ability activated" followed 2.5
+  seconds later by "WBP_Map_C was not constructed", with neither
+  `OpenDirectingMapMenu` nor `DisplayMapMenu` ever entered.
+
+### Known limitations
+
+- The menu key sent to `ActivateFPCameraMenuAbility` is resolved rather than
+  configured: the ability's own `LevelSequenceMap` keys first, then keys observed
+  from the game's own menu activations, then `MAP_MENU_KEY`. Which source wins on
+  this build is not yet measured — the first run that opens the Start Menu logs
+  `NATIVE FP MENU`, and a failed open logs `MAP ABILITY STATE` with the ability's
+  `CurrentMenuKey` read back. Those two lines decide it.
+- Teleporting uses `ServerDebugTeleportGimmick(FVector)` with the icon's native
+  map position. It is not the native `ServerDecideFastTravel(ID)` transaction, so
+  no `FastTravelStatus` is written and no terminal is impersonated.
 
 ## New Experience Notifications component
 

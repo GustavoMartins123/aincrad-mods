@@ -182,9 +182,12 @@ local TRAVEL_TIMEOUT_MS = 30000
 local travelTimeoutId = 0
 local travelScanId = 0
 
+local cachedGameConfigList = nil
+
 local function clearWorldRefs()
     dbg("clearWorldRefs/enter")
     cachedHero = nil
+    cachedGameConfigList = nil
     heroWaitingReported = false
     heroReadyReported = false
     heroLookupErrorReported = false
@@ -204,8 +207,7 @@ local function clearWorldRefs()
 end
 
 local function scheduleRangeRefresh()
-
-    for _, ms in ipairs({ 300, 2000 }) do
+    for _, ms in ipairs({ 300, 1500 }) do
         ExecuteWithDelay(ms, function()
             if mapLeaving then return end
             ExecuteInGameThread(function()
@@ -217,57 +219,40 @@ local function scheduleRangeRefresh()
 end
 
 local function schedulePostRestRangeRefresh()
-
     expandedGimmicks = {}
     expandedCount = 0
-    for _, ms in ipairs({ 500, 1500, 3000, 6000, 10000, 15000 }) do
-        ExecuteWithDelay(ms, function()
-            if mapLeaving then return end
-            ExecuteInGameThread(function()
-                applyHeroPickupRange(resolveHero())
-            end)
+    ExecuteWithDelay(500, function()
+        if mapLeaving then return end
+        ExecuteInGameThread(function()
+            applyHeroPickupRange(resolveHero())
+            local hero = resolveHero()
+            if isValidObj(hero) and expandOperatable then
+                local n = expandGimmicksInRange(hero, getScanRange(getEffectiveRange(hero)))
+                dbg("schedulePostRestRangeRefresh", string.format("post-rest expand: %d items", n or 0))
+            end
         end)
-    end
-    scheduleIconRangePatch(2000, 4)
+    end)
+    scheduleIconRangePatch(1500, 2)
+end
+
+local function schedulePostTravelScan()
     travelScanId = travelScanId + 1
     local sid = travelScanId
-    ExecuteWithDelay(8000, function()
+    ExecuteWithDelay(500, function()
         if sid ~= travelScanId or mapLeaving then return end
         ExecuteInGameThread(function()
             if sid ~= travelScanId or mapLeaving then return end
             local hero = resolveHero()
             if not isValidObj(hero) then return end
-            if expandOperatable then
-                local n = expandGimmicksInRange(hero, getScanRange(getEffectiveRange(hero)))
-                print(string.format("[%s] post-rest expand: %d items\n", MOD_NAME, n or 0))
-            end
-        end)
-    end)
-end
-
-local function schedulePostTravelScan()
-
-    travelScanId = travelScanId + 1
-    local sid = travelScanId
-    local function runExpand(label)
-        if sid ~= travelScanId or mapLeaving then return end
-        ExecuteInGameThread(function()
-            if sid ~= travelScanId or mapLeaving then return end
-            local hero = resolveHero()
-            if not isValidObj(hero) then
-                return
-            end
             applyHeroPickupRange(hero)
             if expandOperatable then
                 expandedGimmicks = {}
                 expandedCount = 0
                 local n = expandGimmicksInRange(hero, getScanRange(getEffectiveRange(hero)))
-                print(string.format("[%s] %s: %d gimmicks\n", MOD_NAME, label, n or 0))
+                dbg("schedulePostTravelScan", string.format("post-travel initial expand: %d gimmicks", n or 0))
             end
         end)
-    end
-    ExecuteWithDelay(3000, function() runExpand("expand+3s") end)
-    ExecuteWithDelay(8000, function() runExpand("expand+8s") end)
+    end)
 end
 
 local function endTravelState()
@@ -616,6 +601,19 @@ local function configObjectKey(gc)
 end
 
 local function collectGameConfigCandidates()
+    if cachedGameConfigList ~= nil and #cachedGameConfigList > 0 then
+        local validList = {}
+        for _, gc in ipairs(cachedGameConfigList) do
+            if isValidObj(gc) then
+                validList[#validList + 1] = gc
+            end
+        end
+        if #validList > 0 then
+            cachedGameConfigList = validList
+            return validList
+        end
+    end
+
     local list = {}
     local seen = {}
 
@@ -648,6 +646,7 @@ local function collectGameConfigCandidates()
         add(FindFirstOf(clsName))
     end
 
+    cachedGameConfigList = list
     return list
 end
 
