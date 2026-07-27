@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.4.13"
+local MOD_VERSION = "1.7.1"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -26,10 +26,22 @@ local QUEST_TELEPORT_SETTLE_MS = 8000
 local DISCOVERY_STABILIZE_MS = 2000
 local SETTINGS_POLL_MS = 1000
 local SPAWN_INITIALIZE_MS = 8000
+-- How close a newly seen enemy must be to where a request asked for one
+-- The spawn point is lifted off the navmesh surface before the actor is
+-- created. Spawning a character capsule exactly on the ground fails the
+-- collision check; this was in the mod originally and its removal is what
+-- silently stopped multiplication.
+local SPAWN_Z_OFFSET_CM = 40.0
+local SPAWN_COLLISION_ALWAYS = 1
+local SPAWN_SCALE_MULTIPLY_ROOT = 1
+-- Requests allowed to expire unmatched, in a row, before multiplication is
+-- declared non-functional for this session.
+local UNMATCHED_SPAWN_GIVE_UP = 12
+-- How often origins near the hero are revisited when nothing was freed.
+local ORIGIN_SWEEP_MS = 3000
 local NAV_ATTEMPTS_PER_PASS = 1
 local NAV_MAX_ATTEMPTS = 12
 local NAV_MIN_SEPARATION_CM = 150.0
-local NAV_GOLDEN_ANGLE_RADIANS = 2.399963229728653
 local MAX_DISCOVERY_PER_TICK = 2
 local GAMEPLAY_MOD_ADDITIVE = 0
 local SPAWN_ON_SERVER = 0
@@ -79,6 +91,7 @@ local SCHEMA = {
     MOVE_SPEED_MULTIPLIER = { kind = "number", minimum = 0.25, maximum = 3.0 },
     XP_MULTIPLIER = { kind = "number", minimum = 0.0, maximum = 10.0 },
     POLL_MS = { kind = "number", minimum = 100, maximum = 2000, integer = true },
+    DESPAWN_RADIUS = { kind = "number", minimum = 1500.0, maximum = 30000.0 },
     DEBUG_LOGS = { kind = "boolean" },
 }
 
@@ -355,13 +368,22 @@ local awaitingTravelRestart = false
 
 local materialLibrary = nil
 local materialInterface = nil
-local rodGameState = nil
 local navigationSystem = nil
+local gameplayStatics = nil
+local worldPartitionSubsystem = nil
+local streamingGateReported = false
 local spawnContractVerified = false
+-- Consecutive spawn requests that expired without ever being matched to a
+-- new enemy. A spawn API that quietly does nothing looks exactly like this.
+local unmatchedSpawnStreak = 0
+local spawningProvenInert = false
+local cachedHero = nil
+local nextOriginSweepMs = 0
 local spawnOrderProbeIds = nil
 local spawnOrderProbeReported = false
-local spawnArgumentsReported = false
 local disableWorld
+-- Assigned below; called from registerEnemy, which is defined before it.
+local activateSpawnedEnemy
 local releaseWorldForTravel
 local gcScheduled = false
 
@@ -386,9 +408,14 @@ local function clearWorldReferences()
     discoveryBatch = false
     discoveryReadyAtMs = nil
     worldFault = nil
-    rodGameState = nil
     navigationSystem = nil
+    gameplayStatics = nil
+    worldPartitionSubsystem = nil
     spawnContractVerified = false
+    unmatchedSpawnStreak = 0
+    spawningProvenInert = false
+    cachedHero = nil
+    nextOriginSweepMs = 0
 end
 
 local function beginTravel(reason)
@@ -546,19 +573,16 @@ local function armSpawnOrderProbe()
     log("SPAWN PROBE | watching the next engine RODSpawnActor call")
 end
 
-local function resolveSpawnApi()
-    if not isValid(rodGameState) then
-        rodGameState = nil
-        local stateOk, state = pcall(FindFirstOf, "RODGameState")
-        if not stateOk then
-            return false, "FindFirstOf(RODGameState) failed: " .. tostring(state)
-        end
-        if not isValid(state) then
-            return false, "current RODGameState is unavailable"
-        end
-        rodGameState = state
-    end
+-- The local host controller, which owns ServerDebugEnemySpawn. Resolved fresh
+-- each time rather than cached: it is replaced across travel, and a stale one
+-- would send the RPC into a dead world.
+local function resolveLocalController()
+    local ok, controller = pcall(FindFirstOf, "RODInGamePlayerController")
+    if not ok or not isValid(controller) then return nil end
+    return controller
+end
 
+local function resolveSpawnApi()
     if not isValid(navigationSystem) then
         navigationSystem = nil
         local navOk, nav = pcall(
@@ -574,42 +598,36 @@ local function resolveSpawnApi()
         navigationSystem = nav
     end
 
-    -- RODSpawnActor is called on the game state as rodGameState:RODSpawnActor(...).
+    -- Spawning goes through the engine's deferred pair,
+    -- BeginDeferredActorSpawnFromClass + FinishSpawningActor. That is what this
+    -- mod used before the spawn path was rewritten, and it is the only one of
+    -- the three that works here:
     --
-    -- Two other shapes were tried on this build and neither works:
+    --   * ARODGameState:RODSpawnActor cannot be called from Lua on this build.
+    --     Every argument was verified correct and in order and the rejection
+    --     never moved off "[push_objectproperty] ... :InInstigator". The
+    --     FRODSpawnActorOption table is the only thing left between the two
+    --     calls, and no readable property in the game holds a real one to borrow.
+    --   * ARODInGamePlayerController:ServerDebugEnemySpawn returns without error
+    --     and creates nothing, despite having a real native symbol.
     --
-    --   * Caching rodGameState.RODSpawnActor and handing it to
-    --     UObject:CallFunction. Indexing a UObject with a function name returns a
-    --     callable already bound to that object, not a UFunction, so
-    --     CallFunction rejects it with "Tried calling function without both
-    --     UFunction and calling context". It answers IsValid() truthily, so the
-    --     contract logged itself as acquired and could never be used.
-    --   * Resolving the UFunction with StaticFindObject and reading its parameter
-    --     order with ForEachProperty. ForEachProperty is a UStruct method and
-    --     this build's Lua binding types a UFunction as a plain UObject, so the
-    --     call is nil: "attempt to call a nil value".
-    --
-    -- What remains unresolved is the argument layout. Passing the six values in
-    -- the order the header declares them lands the collision-handling enum on
-    -- InInstigator, which UE4SS reports as
-    -- "[push_objectproperty] ... :InInstigator" — the arguments are off by one
-    -- somewhere before that parameter. Since the order cannot be read back on
-    -- this build, armSpawnOrderProbe below watches the game make its own spawn
-    -- call and reports what the engine passes, which is the only source of truth
-    -- left. It is read-only and unregisters itself after one report.
-    if not spawnContractVerified then
-        local presentOk, present = pcall(function()
-            return rodGameState.RODSpawnActor ~= nil
-        end)
-        if not presentOk then
-            return false, "RODSpawnActor lookup failed: " .. tostring(present)
+    -- The deferred pair also returns the actor it created, so ownership is exact
+    -- and nothing has to be matched by guesswork afterwards.
+    if not isValid(gameplayStatics) then
+        gameplayStatics = nil
+        local ok, library = pcall(
+            StaticFindObject,
+            "/Script/Engine.Default__GameplayStatics"
+        )
+        if not ok or not isValid(library) then
+            return false, "canonical GameplayStatics spawn API is unavailable"
         end
-        if present ~= true then
-            return false, "RODGameState does not expose RODSpawnActor"
+        gameplayStatics = library
+        if not spawnContractVerified then
+            spawnContractVerified = true
+            log("SPAWN CONTRACT | GameplayStatics deferred spawn is available")
+            armSpawnOrderProbe()
         end
-        spawnContractVerified = true
-        log("SPAWN CONTRACT | RODGameState:RODSpawnActor is available")
-        armSpawnOrderProbe()
     end
     return true, nil
 end
@@ -710,7 +728,8 @@ end
 
 local function snapshotEnemy(enemy)
     local ok, mesh, meshScale, maxHealth, attack, defence, experience,
-        movingSpeed, goldenGateBoss, enemyRole =
+        movingSpeed, goldenGateBoss, enemyRole,
+        bossEventSequence, bossFinisherSequence =
         pcall(function()
             local enemyMesh = enemy.Mesh
             return enemyMesh,
@@ -721,7 +740,9 @@ local function snapshotEnemy(enemy)
                 enemy.ExperiencePoint,
                 enemy.MovingSpeed,
                 enemy.GoldenGateBoss,
-                enemy.EnemyRole
+                enemy.EnemyRole,
+                enemy.BossEventSequence,
+                enemy.BossFinisherLevelSequence
         end)
     if not ok then return nil, "required enemy fields are unreadable" end
     if not isValid(mesh) then return nil, "required skeletal mesh is unavailable" end
@@ -749,7 +770,20 @@ local function snapshotEnemy(enemy)
     end
     local gas, gasError = snapshotGas(enemy)
     if gas == nil then return nil, gasError end
-    local isBoss = goldenGateBoss or enemyRole == ENEMY_ROLE_BOSS
+
+    -- Protection is for the mission's own boss, not for anything the data
+    -- happens to label EnemyRole_Boss.
+    --
+    -- That role is worn by field elites too — BP_E001004, a big boar, carries it
+    -- — and treating it as "boss" pulled ordinary elites out of the spawn
+    -- catalog entirely and left them unmutated. What separates a real boss is
+    -- its staging: BossEventSequence and BossFinisherLevelSequence are the
+    -- cinematics a mission boss owns and an elite does not, and GoldenGateBoss
+    -- marks the floor boss outright. The role is kept in the snapshot for
+    -- diagnostics, but it no longer decides anything on its own.
+    local hasBossStaging = isValid(bossEventSequence)
+        or isValid(bossFinisherSequence)
+    local isBoss = goldenGateBoss or hasBossStaging
     return {
         mesh = mesh,
         meshScale = parsedMeshScale,
@@ -760,6 +794,7 @@ local function snapshotEnemy(enemy)
         MovingSpeed = movingSpeed,
         enemyRole = enemyRole,
         goldenGateBoss = goldenGateBoss,
+        hasBossStaging = hasBossStaging,
         isBoss = isBoss,
         gas = gas,
     }, nil
@@ -1170,16 +1205,20 @@ local function destroyOwned(state, reason)
     return true
 end
 
+-- A pending request is a ticket, not an actor: ServerDebugEnemySpawn has not
+-- reported anything back yet, so there is usually nothing to destroy. Only a
+-- request reconstructed from an already-owned enemy carries an object.
 local function destroyPending(request, reason)
+    local label = request.actorKey or (request.classKey or "unclaimed ticket")
     if isValid(request.object) then
         local ok, destroyError = pcall(function() request.object:K2_DestroyActor() end)
         if not ok then
-            log("DESTROY ERROR | pending " .. request.actorKey ..
+            log("DESTROY ERROR | pending " .. label ..
                 " | " .. tostring(destroyError))
             return false
         end
     end
-    dbg("PENDING EXTRA REMOVED | " .. request.actorKey .. " | " .. reason)
+    dbg("PENDING EXTRA REMOVED | " .. label .. " | " .. reason)
     return true
 end
 
@@ -1242,21 +1281,38 @@ local function enforceGlobalCap()
     end
 end
 
+-- With RANDOMIZE_EXTRA_SPECIES on, one draw landing on an entry that has since
+-- become ineligible is not the same thing as having no species to spawn. The
+-- draw is retried across the catalog before giving up, because the caller treats
+-- a nil result as "nothing can be spawned here" and permanently consumes the
+-- slot — an unlucky single draw used to silently cost an extra and report the
+-- catalog as empty.
+local function classEntryIsSpawnable(entry)
+    return entry ~= nil
+        and entry.spawnEligible == true
+        and protectedBossClasses[entry.classKey] ~= true
+        and isValid(entry.classObject)
+end
+
 local function selectSpawnClass(origin)
     if protectedBossClasses[origin.classKey] == true then return nil, nil end
     if not CONFIG.RANDOMIZE_EXTRA_SPECIES then
         if origin.spawnEligible ~= true then return nil, nil end
         return origin.classObject, origin.classKey
     end
-    if #classOrder == 0 then return nil, nil end
-    local entry = classCatalog[classOrder[math.random(1, #classOrder)]]
-    if entry == nil
-        or entry.spawnEligible ~= true
-        or protectedBossClasses[entry.classKey] == true
-        or not isValid(entry.classObject) then
-        return nil, nil
+
+    local count = #classOrder
+    if count == 0 then return nil, nil end
+    -- Start at a random position and walk the catalog once, so the pick stays
+    -- uniform-ish without ever scanning it more than a single time.
+    local start = math.random(1, count)
+    for step = 0, count - 1 do
+        local entry = classCatalog[classOrder[((start + step - 1) % count) + 1]]
+        if classEntryIsSpawnable(entry) then
+            return entry.classObject, entry.classKey
+        end
     end
-    return entry.classObject, entry.classKey
+    return nil, nil
 end
 
 local function planarDistanceSquared(a, b)
@@ -1297,34 +1353,106 @@ local function spawnPositionIsSeparated(position)
     return true
 end
 
-local function pathIsComplete(path)
-    local stateOk, pathValid, pathPartial = pcall(function()
-        return path:IsValid(), path:IsPartial()
-    end)
-    if not stateOk then
-        return false, "UNavigationPath state is unreadable: " ..
-            tostring(pathValid)
-    end
-    if pathValid ~= true then return false, "UNavigationPath is invalid" end
-    if pathPartial == true then return false, "UNavigationPath is partial" end
-    return true, nil
-end
+--========================================================--
+--                  SPAWN POSITIONING                     --
+--========================================================--
+-- Positioning allocates no UObject. That is the whole point of this section.
+--
+-- It used to validate candidates with FindPathToLocationSynchronously, which
+-- returns a UNavigationPath — a NewObject outered to the NavigationSystemV1, one
+-- per call, up to NAV_MAX_ATTEMPTS per requested extra and thousands per
+-- mission. On this World Partition map there is almost always a package in async
+-- loading, and every UObject created on the game thread while that is true is
+-- born with EInternalObjectFlags::Async, which is part of GarbageCollectionKeepFlags:
+-- it is never collected, not even after being marked PendingKill. Those paths are
+-- outered to the world, so the old world could not be collected either, and the
+-- engine's world-leak check is fatal in a cooked build:
+--
+--   LowLevelFatalError ReferenceChainSearch.cpp:1948
+--   Fatal world leaks detected ... (PendingKill) (async) NavigationPath
+--     -> Outer = NavigationSystemV1 -> Outer = World
+--
+-- It fired on mission end and fast travel, with the log showing
+-- "owned references released=0" — the leak was never the spawned actors.
+--
+-- K2_GetRandomReachablePointInRadius returns a bool and writes the point into an
+-- out parameter. It gives the same guarantee the old pathIsComplete checked for
+-- (a point on the navmesh, reachable from the origin, not a partial path) in one
+-- call, and allocates nothing.
+--
+-- NOTE ON THE SIGNATURE: it takes a WorldContextObject FIRST. The header is
+--   bool K2_GetRandomReachablePointInRadius(UObject* WorldContextObject,
+--       const FVector& Origin, FVector& RandomLocation, float Radius,
+--       ANavigationData* NavData, TSubclassOf<UNavigationQueryFilter> FilterClass)
+-- Six parameters, not five. Calling a native function with the wrong arity is a
+-- hard crash that pcall cannot catch.
 
-local function pathCandidate(request, attempt)
-    local separation = minimumSpawnSeparation()
-    local usableRadius = CONFIG.SPAWN_RADIUS - separation
-    if usableRadius < 0.0 then
-        error("SPAWN_RADIUS is smaller than the required separation")
+-- How UE4SS hands back the RandomLocation out parameter is decided once, on the
+-- first call, and logged. Guessing between "extra return value" and "the table
+-- you passed in was mutated" is exactly the kind of assumption the house rules
+-- say to verify against a visible result rather than build logic on.
+local navOutParamMode = nil
+
+local function sampleReachablePoint(worldContext, origin, radius)
+    local scratch = { X = 0.0, Y = 0.0, Z = 0.0 }
+
+    if navOutParamMode == nil then
+        log("NAV PROBE | calling K2_GetRandomReachablePointInRadius for the "
+            .. "first time to learn its out-parameter shape")
     end
-    local fraction = (attempt - 0.5) / NAV_MAX_ATTEMPTS
-    local radius = separation + math.sqrt(fraction) * usableRadius
-    local angle = request.navSeed
-        + attempt * NAV_GOLDEN_ANGLE_RADIANS
+
+    local callOk, reachable, returnedLocation = pcall(function()
+        return navigationSystem:K2_GetRandomReachablePointInRadius(
+            worldContext,
+            origin,
+            scratch,
+            radius,
+            nil,
+            nil
+        )
+    end)
+    if not callOk then
+        return nil, "K2_GetRandomReachablePointInRadius failed: "
+            .. tostring(reachable)
+    end
+
+    local function usable(candidate)
+        return type(candidate) == "table"
+            and type(candidate.X) == "number"
+            and type(candidate.Y) == "number"
+            and type(candidate.Z) == "number"
+            and (candidate.X ~= 0.0 or candidate.Y ~= 0.0 or candidate.Z ~= 0.0)
+    end
+
+    local located = nil
+    if usable(returnedLocation) then
+        located = returnedLocation
+        if navOutParamMode == nil then
+            navOutParamMode = "return"
+            log("NAV PROBE | out parameter arrives as an extra return value")
+        end
+    elseif usable(scratch) then
+        located = scratch
+        if navOutParamMode == nil then
+            navOutParamMode = "mutated"
+            log("NAV PROBE | out parameter arrives by mutating the passed table")
+        end
+    elseif navOutParamMode == nil then
+        navOutParamMode = "unknown"
+        log("NAV PROBE | no usable point came back; reachable="
+            .. tostring(reachable)
+            .. " returned=" .. type(returnedLocation))
+    end
+
+    if reachable ~= true then return nil, "no reachable point in radius" end
+    if located == nil then return nil, "reachable point was not readable" end
+    -- Lifted off the navmesh surface: a character capsule created exactly on the
+    -- ground fails its collision check and no actor appears.
     return {
-        X = request.originLocation.X + math.cos(angle) * radius,
-        Y = request.originLocation.Y + math.sin(angle) * radius,
-        Z = request.originLocation.Z,
-    }
+        X = located.X,
+        Y = located.Y,
+        Z = located.Z + SPAWN_Z_OFFSET_CM,
+    }, nil
 end
 
 local function resolveNavigableSpawnPosition(request, worldContext)
@@ -1339,47 +1467,37 @@ local function resolveNavigableSpawnPosition(request, worldContext)
         return nil, "NavMesh is still being built or locked", true
     end
 
+    -- Same per-pass budget as before, so a request that cannot be placed yet
+    -- costs the tick no more than it used to and is retried rather than dropped.
     local firstAttempt = request.navAttempts + 1
     local finalAttempt = math.min(
         request.navAttempts + NAV_ATTEMPTS_PER_PASS,
         NAV_MAX_ATTEMPTS
     )
-    local lastFailure = "navigation rejected every candidate"
+    local lastFailure = "navigation rejected every sample"
     for attempt = firstAttempt, finalAttempt do
         request.navAttempts = attempt
-        local candidate = pathCandidate(request, attempt)
-        local queryOk, path = pcall(function()
-            return navigationSystem:FindPathToLocationSynchronously(
-                worldContext,
-                request.originLocation,
-                candidate,
-                worldContext,
-                nil
-            )
-        end)
-        if not queryOk then
-            return nil, "FindPathToLocationSynchronously failed: " ..
-                tostring(path), false
-        end
-        if isValid(path) then
-            local complete, pathError = pathIsComplete(path)
-            if complete then
-                local position = candidate
-                local maxRadius = CONFIG.SPAWN_RADIUS + 25.0
-                if planarDistanceSquared(position, request.originLocation)
-                    <= maxRadius * maxRadius
-                    and spawnPositionIsSeparated(position) then
-                    return position, nil, false
-                end
-                lastFailure = string.format(
-                    "path endpoint violated radius or %.0f cm separation",
-                    minimumSpawnSeparation()
-                )
-            else
-                lastFailure = pathError
-            end
+        local position, sampleError = sampleReachablePoint(
+            worldContext,
+            request.originLocation,
+            CONFIG.SPAWN_RADIUS
+        )
+        if position == nil then
+            lastFailure = sampleError
         else
-            lastFailure = "FindPathToLocationSynchronously returned no path"
+            -- The engine already bounds the sample by Radius; this is a cheap
+            -- guard, and spawnPositionIsSeparated is what still enforces the
+            -- minimum distance from origins, tickets and owned extras.
+            local maxRadius = CONFIG.SPAWN_RADIUS + 25.0
+            if planarDistanceSquared(position, request.originLocation)
+                <= maxRadius * maxRadius
+                and spawnPositionIsSeparated(position) then
+                return position, nil, false
+            end
+            lastFailure = string.format(
+                "sample violated radius or %.0f cm separation",
+                minimumSpawnSeparation()
+            )
         end
     end
     if request.navAttempts < NAV_MAX_ATTEMPTS then
@@ -1394,6 +1512,7 @@ local function resolveNavigableSpawnPosition(request, worldContext)
 end
 
 local function queueExtra(origin, slot)
+    if spawningProvenInert then return false end
     if origin.spawnEligible ~= true then
         worldFault = "boss-protection invariant rejected spawn origin " ..
             tostring(origin.key)
@@ -1414,7 +1533,14 @@ local function queueExtra(origin, slot)
     local classObject, classKey = selectSpawnClass(origin)
     if not isValid(classObject) then
         origin.issued = slot
-        log("SPAWN ERROR | loaded enemy class catalog is empty")
+        if CONFIG.RANDOMIZE_EXTRA_SPECIES then
+            log("SPAWN ERROR | no spawnable species in a catalog of "
+                .. tostring(#classOrder)
+                .. " | every entry is boss-protected, ineligible or unloaded")
+        else
+            log("SPAWN ERROR | origin species is not spawnable: "
+                .. tostring(origin.classKey))
+        end
         return true
     end
     spawnQueue[#spawnQueue + 1] = {
@@ -1430,7 +1556,6 @@ local function queueExtra(origin, slot)
             Z = origin.location.Z,
         },
         navAttempts = 0,
-        navSeed = math.random() * math.pi * 2.0,
         spawnEligible = true,
     }
     origin.issued = slot
@@ -1529,13 +1654,18 @@ local function protectBossClass(classKey)
         return
     end
 
-    log("BOSS CLASS PROTECTED | removed from spawn system: " .. classKey)
+    log("MISSION BOSS PROTECTED | removed from spawn system: " .. classKey)
 end
 
+-- BeginDeferredActorSpawnFromClass hands back the actor it created, so a
+-- request owns an exact object and is claimed by identity. No proximity
+-- guessing, which is what made the very first version of this mod attribute
+-- pre-existing enemies to itself.
 local function takePendingSpawn(actorKey)
     for index, request in ipairs(pendingSpawns) do
         if request.generation == generation and request.actorKey == actorKey then
             table.remove(pendingSpawns, index)
+            unmatchedSpawnStreak = 0
             return request
         end
     end
@@ -1630,6 +1760,12 @@ local function registerEnemy(enemy, reused)
     }
     states[key] = state
 
+    -- An extra this mod created has to be told to start. A naturally placed
+    -- enemy arrived through the game's own spawn path and is already running.
+    if state.owned then
+        activateSpawnedEnemy(enemy, key, state.spawnPosition)
+    end
+
     -- INCLUDE_BOSSES controls mutation only. Boss classes and boss actors are
     -- never admitted to either spawning structure, so a quest boss cannot be
     -- duplicated by same-species multiplication or by randomisation.
@@ -1679,13 +1815,33 @@ local function expirePendingSpawns()
         if request.generation ~= generation or elapsedMs >= request.expiresAtMs then
             table.remove(pendingSpawns, index)
             if request.generation == generation then
-                log(string.format(
-                    "SPAWN ERROR | created enemy did not finish initialization origin=%s slot=%d class=%s",
-                    request.originKey,
-                    request.slot,
-                    request.classKey
-                ))
+                unmatchedSpawnStreak = unmatchedSpawnStreak + 1
+                if not spawningProvenInert then
+                    dbg(string.format(
+                        "SPAWN UNMATCHED | origin=%s slot=%d class=%s | streak=%d",
+                        request.originKey,
+                        request.slot,
+                        request.classKey,
+                        unmatchedSpawnStreak
+                    ))
+                end
                 destroyPending(request, "initialization timeout")
+                if not spawningProvenInert
+                    and unmatchedSpawnStreak >= UNMATCHED_SPAWN_GIVE_UP then
+                    -- Actors were created and none of them ever came back
+                    -- through discovery. Stop asking rather than repeating the
+                    -- same failure every poll forever; mutation of the enemies
+                    -- that already exist is unaffected and keeps running. One
+                    -- successful claim clears the streak and re-enables this.
+                    spawningProvenInert = true
+                    spawnQueue = {}
+                    log(string.format(
+                        "SPAWN DISABLED | %d consecutive created actors never "
+                            .. "finished initialization | multiplication is off, "
+                            .. "mutation of existing enemies continues",
+                        unmatchedSpawnStreak
+                    ))
+                end
             end
         end
     end
@@ -1697,9 +1853,166 @@ local function pauseForSpawnContractFailure(reason)
     log("WORLD ERROR | " .. worldFault .. " | director paused")
 end
 
+-- A deferred spawn produces the pawn and nothing else.
+--
+-- Possession is not the gap: AutoPossessAI is 3 (PlacedInWorldOrSpawned) on
+-- these Blueprints, so the engine attaches an AIC_* controller by itself and
+-- SpawnDefaultController was measured to be a no-op — the controller is already
+-- there before and after. The enemy still stands inert, because having a
+-- controller is not the same as having started.
+--
+-- What the game's own path does and GameplayStatics does not is the rest of
+-- FRODSpawnActorOption: IsStartBehaviorTree and the initial state. On
+-- ARODEnemyCharacter those are StartAI(DetectFlag) and StartBehaviorTree(), and
+-- they are called here, after the enemy reports itself initialized rather than
+-- straight after creation — an enemy whose assets are still resolving has
+-- nothing for a behaviour tree to run yet.
+local activationReported = false
+
+activateSpawnedEnemy = function(enemy, key, spawnPosition)
+    if not isValid(enemy) then return end
+
+    -- InitialStateLoc, the last piece of FRODSpawnActorOption this path never
+    -- supplies. ProwlFirstPosition is the anchor the idle/patrol logic works
+    -- around, and on an actor created outside the game's own spawn call it is
+    -- left at the origin — so the enemy's whole notion of "where I belong" is
+    -- (0,0,0), on the far side of the map. DisableDetectFlag is the matching
+    -- half for perception: nothing clears it here, and while it is set the
+    -- enemy has no reason to look for anyone.
+    if spawnPosition ~= nil then
+        pcall(function()
+            enemy.ProwlFirstPosition = spawnPosition
+            enemy.ProwlGoalPosition = spawnPosition
+            enemy.ProwlGoalPositionFlag = false
+        end)
+    end
+    local clearedDetect = pcall(function()
+        enemy.DisableDetectFlag = false
+    end)
+
+    local controller = nil
+    pcall(function() controller = enemy.Controller end)
+
+    -- Two StartAI functions exist and they are not the same thing.
+    --
+    -- ARODEnemyCharacter:StartAI(DetectFlag) is the one that was being called,
+    -- and it is enough to get the enemy idling and patrolling. But the extras
+    -- never noticed the player — invisible until hit — because perception lives
+    -- on the controller side: ARODAIControllerBase:StartAI(ProcessedPawn) is
+    -- what binds the possessed pawn into the perception system, and
+    -- ApplyBindFunction wires its delegates. The engine auto-possesses the pawn
+    -- but nothing calls those, since the game's own path reaches them through
+    -- RODSpawnActor.
+    --
+    -- The controller is set up first, then the character, then the tree: binding
+    -- perception after the tree is already running is what leaves an enemy
+    -- walking its idle loop with nothing feeding it targets.
+    local boundController, controllerError = true, nil
+    if isValid(controller) then
+        boundController, controllerError = pcall(function()
+            controller:StartAI(enemy)
+            controller:ApplyBindFunction()
+        end)
+    end
+
+    -- DetectFlag mirrors the option struct's IsNodetect, which this mod sets
+    -- false: the extra should perceive the player like any other enemy.
+    local startedAI, aiError = pcall(function() enemy:StartAI(true) end)
+    local startedTree, treeResult = pcall(function()
+        return enemy:StartBehaviorTree()
+    end)
+
+    if not activationReported then
+        activationReported = true
+        local detectStart, disableDetect, prowlAnchor = nil, nil, nil
+        pcall(function() detectStart = enemy.DetectStartFlagN end)
+        pcall(function() disableDetect = enemy.DisableDetectFlag end)
+        pcall(function() prowlAnchor = vector(enemy.ProwlFirstPosition) end)
+        log(string.format(
+            "SPAWN ACTIVATION | detect cleared=%s DisableDetectFlag=%s "
+                .. "DetectStartFlagN=%s | prowl anchor=%s",
+            tostring(clearedDetect),
+            tostring(disableDetect),
+            tostring(detectStart),
+            prowlAnchor
+                and string.format("%.0f %.0f %.0f",
+                    prowlAnchor.X, prowlAnchor.Y, prowlAnchor.Z)
+                or "unreadable"
+        ))
+        log(string.format(
+            "SPAWN ACTIVATION | controller=%s | controller:StartAI ok=%s%s | "
+                .. "enemy:StartAI ok=%s%s | StartBehaviorTree ok=%s returned=%s",
+            isValid(controller) and objectKey(controller) or "none",
+            tostring(boundController),
+            boundController and "" or (" error=" .. tostring(controllerError)),
+            tostring(startedAI),
+            startedAI and "" or (" error=" .. tostring(aiError)),
+            tostring(startedTree),
+            tostring(treeResult)
+        ))
+    elseif not startedAI or not startedTree then
+        dbg("SPAWN ACTIVATION | " .. tostring(key) .. " | StartAI ok="
+            .. tostring(startedAI) .. " StartBehaviorTree ok="
+            .. tostring(startedTree))
+    end
+end
+
+-- Actors are not created while World Partition is still streaming.
+--
+-- Two crashes were seen with heavy spawning, both null dereferences on
+-- task-graph worker threads (Foreground Worker #1 reading 0x8, Background
+-- Worker #3 reading 0xa4) in two different work items. Neither could be
+-- symbolicated: the available symbol map covers only exec* UFunction thunks and
+-- the frames land megabytes from the nearest one, so the actual cause is NOT
+-- established.
+--
+-- What is established is that a UObject created on the game thread while a
+-- package is async loading is born with EInternalObjectFlags::Async, and that
+-- parallel systems pick up newly created enemies immediately. Creating actors in
+-- the middle of cell streaming is the one thing this mod does that fits both
+-- crashes, so it stops doing it. This is a mitigation, not a diagnosed fix.
+--
+-- The gate fails open: if the subsystem cannot be resolved, spawning continues
+-- and says so once, rather than silently disabling the feature forever.
+local function streamingIsSettled()
+    if not isValid(worldPartitionSubsystem) then
+        worldPartitionSubsystem = nil
+        local ok, subsystem = pcall(FindFirstOf, "WorldPartitionSubsystem")
+        if not ok or not isValid(subsystem) then
+            if not streamingGateReported then
+                streamingGateReported = true
+                log("SPAWN GATE | WorldPartitionSubsystem is unavailable; "
+                    .. "spawning without a streaming gate")
+            end
+            return true
+        end
+        worldPartitionSubsystem = subsystem
+    end
+
+    local ok, completed = pcall(function()
+        return worldPartitionSubsystem:IsAllStreamingCompleted()
+    end)
+    if not ok then
+        if not streamingGateReported then
+            streamingGateReported = true
+            log("SPAWN GATE | IsAllStreamingCompleted failed: "
+                .. tostring(completed) .. "; spawning without a streaming gate")
+        end
+        return true
+    end
+    return completed == true
+end
+
 local function processSpawnRequest()
     local request = table.remove(spawnQueue, 1)
     if request == nil or request.generation ~= generation then return end
+    if not streamingIsSettled() then
+        -- Put it back untouched: this is not a failed attempt, so it must not
+        -- consume the navigation budget or age the request.
+        table.insert(spawnQueue, 1, request)
+        dbg("SPAWN DEFERRED | world partition is still streaming")
+        return
+    end
     if request.spawnEligible ~= true then
         worldFault = "boss-protection invariant rejected queued class " ..
             tostring(request.classKey)
@@ -1747,24 +2060,18 @@ local function processSpawnRequest()
         )
         return
     end
-    local instigator, instigatorResolveError =
-        resolveExactObject(request.originKey)
-    if instigator == nil then
-        pauseForSpawnContractFailure(
-            "spawn instigator resolution failed: " ..
-                firstErrorLine(instigatorResolveError)
-        )
-        return
-    end
+    -- The origin is still resolved because the navigation query below needs a
+    -- world context actor. It is no longer passed to the spawn call itself.
     local contractObjectsOk, contractObjectsError = pcall(function()
+        local actorClass = StaticFindObject("/Script/Engine.Actor")
+        if not isValid(actorClass) then
+            error("canonical Actor class is unavailable")
+        end
         if spawnClass:IsAnyClass() ~= true then
             error("resolved Class is not a UClass")
         end
-        if owner:IsA("/Script/Engine.Actor") ~= true then
-            error("resolved inOwner is not an Actor")
-        end
-        if instigator:IsA("/Script/Engine.Pawn") ~= true then
-            error("resolved InInstigator is not a Pawn")
+        if owner:IsA(actorClass) ~= true then
+            error("resolved spawn origin is not an Actor")
         end
     end)
     if not contractObjectsOk then
@@ -1774,7 +2081,6 @@ local function processSpawnRequest()
         )
         return
     end
-
     local position, navigationError, navigationRetryable =
         resolveNavigableSpawnPosition(request, owner)
     if position == nil then
@@ -1800,75 +2106,52 @@ local function processSpawnRequest()
     end
     request.position = position
 
+    -- The transform is a plain Lua table and marshals fine: this exact shape is
+    -- what the working version passed. FTransform was never the problem in the
+    -- RODSpawnActor attempts.
     local transform = {
         Rotation = { X = 0.0, Y = 0.0, Z = 0.0, W = 1.0 },
         Translation = request.position,
         Scale3D = { X = 1.0, Y = 1.0, Z = 1.0 },
     }
-    local option = {
-        ActorTags = {},
-        FlowGameplayTags = {},
-        DefaultSpawnOn = SPAWN_ON_SERVER,
-        ItemLotKey = FName("None"),
-        Items = {},
-        IsDropItems = false,
-        HeroNumber = 0,
-        IsPermanentableItem = false,
-        ReplaceNameID = 0,
-        Level = request.level,
-        InitialState = INITIAL_STATE_PROWL,
-        InitialStateLoc = request.position,
-        IsNodetect = false,
-        IsStartBehaviorTree = true,
-        IsBossWave = false,
-        IsDangerousTreasureChests = false,
-        IsForcePlaySpawnFX = false,
-    }
     local spawned = nil
     local insertedPending = false
     local okSpawn, spawnError = pcall(function()
-        -- Logged once, immediately before the call, so this mod's own arguments
-        -- can be lined up against what SPAWN PROBE reports the engine passing.
-        -- Between the two, an argument that lands on the wrong parameter is
-        -- visible rather than inferred from a marshaling error.
-        if not spawnArgumentsReported then
-            spawnArgumentsReported = true
-            log("SPAWN ARGS | 1=" .. describeSpawnArgument(spawnClass)
-                .. " 2=" .. describeSpawnArgument(transform)
-                .. " 3=" .. describeSpawnArgument(option)
-                .. " 4=" .. describeSpawnArgument(owner)
-                .. " 5=" .. describeSpawnArgument(instigator)
-                .. " 6=" .. describeSpawnArgument(
-                    SPAWN_COLLISION_ADJUST_OR_REJECT))
-        end
-        local result = rodGameState:RODSpawnActor(
+        spawned = gameplayStatics:BeginDeferredActorSpawnFromClass(
+            owner,
             spawnClass,
             transform,
-            option,
-            owner,
-            instigator,
-            SPAWN_COLLISION_ADJUST_OR_REJECT
+            SPAWN_COLLISION_ALWAYS,
+            nil,
+            SPAWN_SCALE_MULTIPLY_ROOT
         )
-        if result == nil then error("RODSpawnActor returned no result") end
-        local resultSpawnOn = tonumber(result.SpawnOn)
-        if resultSpawnOn ~= SPAWN_ON_SERVER then
-            error("RODSpawnActor returned non-server SpawnOn=" ..
-                tostring(resultSpawnOn))
-        end
-        local weakActor = result.ServerSpawnActor
-        if weakActor == nil then
-            error("RODSpawnActor result has no ServerSpawnActor")
-        end
-        spawned = weakActor:Get()
         if not isValid(spawned) then
-            error("RODSpawnActor returned no valid server actor")
+            error("BeginDeferredActorSpawnFromClass returned no actor")
         end
+        -- Registered as pending before FinishSpawningActor, so a failure in the
+        -- second half still has an owner to clean up.
         request.actorKey = objectKey(spawned)
-        if request.actorKey == nil then error("created actor has no canonical object key") end
+        if request.actorKey == nil then
+            error("created actor has no canonical object key")
+        end
         request.object = spawned
         request.expiresAtMs = elapsedMs + SPAWN_INITIALIZE_MS
         pendingSpawns[#pendingSpawns + 1] = request
         insertedPending = true
+
+        local finished = gameplayStatics:FinishSpawningActor(
+            spawned,
+            transform,
+            SPAWN_SCALE_MULTIPLY_ROOT
+        )
+        if not isValid(finished) then
+            error("FinishSpawningActor returned no actor")
+        end
+        if objectKey(finished) ~= request.actorKey then
+            error("FinishSpawningActor returned a different actor")
+        end
+        request.object = finished
+        finished:SetEnemyLevel(request.level, false)
     end)
     if not okSpawn then
         if insertedPending then
@@ -1882,10 +2165,8 @@ local function processSpawnRequest()
         if isValid(spawned) then
             pcall(function() spawned:K2_DestroyActor() end)
         end
-        pauseForSpawnContractFailure(
-            "RODSpawnActor canonical call failed: " ..
-                summarizeSpawnCallError(spawnError)
-        )
+        log("SPAWN ERROR | canonical actor creation failed: " ..
+            summarizeSpawnCallError(spawnError))
         return
     end
     dbg(string.format(
@@ -2020,6 +2301,83 @@ local function checkSettings(force)
     applyNewSettings(settings, digest)
 end
 
+-- Distance recycling.
+--
+-- Origins here are actors placed in the persistent level, so they never become
+-- invalid and cleanupInvalidStates never fires for them. Without this, extras
+-- created in one place stay alive forever: MAX_ACTIVE_EXTRAS stays saturated by
+-- enemies the player has long left behind, and no new area ever gets any.
+--
+-- It also bounds how many owned actors are alive when a mission ends, which is
+-- when the engine's fatal world-leak check runs. That check has already been
+-- seen firing on a spawned enemy's AI controller.
+-- FindFirstOf walks the global object array. Doing that twice a tick was enough
+-- to be felt as stutter, so the hero is resolved once and kept until it stops
+-- being valid, which is also when travel invalidates it.
+local function resolveHeroLocation()
+    if not isValid(cachedHero) then
+        cachedHero = nil
+        local ok, hero = pcall(FindFirstOf, "RODWorldHeroCharacter")
+        if not ok or not isValid(hero) then return nil end
+        cachedHero = hero
+    end
+    return actorLocation(cachedHero)
+end
+
+local function recycleDistantExtras()
+    local heroLocation, heroError = resolveHeroLocation()
+    if heroLocation == nil then
+        dbg("RECYCLE | hero location unavailable: " .. tostring(heroError))
+        return
+    end
+
+    local limitSquared = CONFIG.DESPAWN_RADIUS * CONFIG.DESPAWN_RADIUS
+    local distant = {}
+    for _, state in pairs(states) do
+        if state.owned then
+            local location = isValid(state.object) and actorLocation(state.object)
+                or state.spawnPosition
+            if location ~= nil
+                and planarDistanceSquared(location, heroLocation) > limitSquared then
+                distant[#distant + 1] = state
+            end
+        end
+    end
+
+    for _, state in ipairs(distant) do
+        local originKey = state.originKey
+        if destroyOwned(state, "player left the area") then
+            -- The slot is handed back so the same origin can re-issue it if the
+            -- player returns, instead of the origin being permanently spent.
+            local origin = originKey ~= nil and origins[originKey] or nil
+            if origin ~= nil and origin.issued > 0 then
+                origin.issued = origin.issued - 1
+            end
+        end
+    end
+    if #distant > 0 then
+        dbg(string.format("RECYCLE | released %d extra(s) beyond %.0f cm",
+            #distant, CONFIG.DESPAWN_RADIUS))
+    end
+    return #distant > 0
+end
+
+-- Origins are only reconciled when their natural enemy is rediscovered, and a
+-- persistent-level enemy is discovered once per world. After recycling frees
+-- slots, the origins near the player have to be revisited or nothing refills.
+local function reconcileNearbyOrigins()
+    local heroLocation = resolveHeroLocation()
+    if heroLocation == nil then return end
+
+    local limitSquared = CONFIG.DESPAWN_RADIUS * CONFIG.DESPAWN_RADIUS
+    for _, origin in pairs(origins) do
+        if origin.location ~= nil
+            and planarDistanceSquared(origin.location, heroLocation) <= limitSquared then
+            reconcileOrigin(origin)
+        end
+    end
+end
+
 local function tick(stepMs)
     elapsedMs = elapsedMs + stepMs
     checkSettings(CONFIG == nil)
@@ -2043,6 +2401,17 @@ local function tick(stepMs)
 
     cleanupInvalidStates()
     expirePendingSpawns()
+    if not discoveryBatch then
+        -- reconcileNearbyOrigins is O(origins x states); running it every tick
+        -- alongside recycling was the other half of the stutter. It only has
+        -- anything to do after a slot is freed, so it runs then, or on a slow
+        -- cadence to pick up an origin that came into range on its own.
+        local freed = recycleDistantExtras()
+        if freed or elapsedMs >= nextOriginSweepMs then
+            nextOriginSweepMs = elapsedMs + ORIGIN_SWEEP_MS
+            reconcileNearbyOrigins()
+        end
+    end
     if rescanRequested then
         rescanRequested = false
         if not requestWorldScan() then return end
@@ -2151,6 +2520,187 @@ requireHook(
 
 requireHook("/Script/Engine.PlayerController:ClientRestart", beginRestartSettle)
 
+--========================================================--
+--                   SPAWN CALL MATRIX                    --
+--========================================================--
+-- `worldenemy spawntest` tries several argument shapes against RODSpawnActor in
+-- one pass and reports which property each one dies on.
+--
+-- This exists because the failure only reproduces in game and every hypothesis
+-- so far cost a full restart to test exactly one variable. The property named in
+-- each rejection is the signal: comparing which parameter each shape stops at
+-- says how many stack slots the ones before it consumed, which is the thing that
+-- cannot be read back on this build any other way.
+--
+-- A shape that gets through spawns a real enemy. That is the intended success
+-- condition, and the extra enemy is left as an ordinary one the director does
+-- not own.
+local function spawnTestSubject()
+    local state = FindFirstOf("RODGameState")
+    if not isValid(state) then return nil, nil, nil, "RODGameState is unavailable" end
+
+    local enemy = FindFirstOf("RODEnemyCharacter")
+    if not isValid(enemy) then
+        return nil, nil, nil, "no RODEnemyCharacter is loaded to spawn beside"
+    end
+
+    local classOk, enemyClass = pcall(function() return enemy:GetClass() end)
+    if not classOk or not isValid(enemyClass) then
+        return nil, nil, nil, "enemy class is unreadable"
+    end
+
+    local library = StaticFindObject("/Script/Engine.Default__KismetMathLibrary")
+    if not isValid(library) then
+        return nil, nil, nil, "KismetMathLibrary is unavailable"
+    end
+
+    local transformOk, transform = pcall(function()
+        local origin = enemy:K2_GetActorLocation()
+        return library:MakeTransform(
+            { X = origin.X + 200.0, Y = origin.Y + 200.0, Z = origin.Z },
+            { Pitch = 0.0, Yaw = 0.0, Roll = 0.0 },
+            { X = 1.0, Y = 1.0, Z = 1.0 }
+        )
+    end)
+    if not transformOk or transform == nil then
+        return nil, nil, nil, "MakeTransform failed: " .. tostring(transform)
+    end
+
+    return state, enemyClass, { enemy = enemy, transform = transform }, nil
+end
+
+local function fullSpawnOption(location)
+    return {
+        ActorTags = {},
+        FlowGameplayTags = {},
+        DefaultSpawnOn = SPAWN_ON_SERVER,
+        ItemLotKey = "None",
+        Items = {},
+        IsDropItems = false,
+        HeroNumber = 0,
+        IsPermanentableItem = false,
+        ReplaceNameID = 0,
+        Level = 1,
+        InitialState = INITIAL_STATE_PROWL,
+        InitialStateLoc = location,
+        IsNodetect = false,
+        IsStartBehaviorTree = true,
+        IsBossWave = false,
+        IsDangerousTreasureChests = false,
+        IsForcePlaySpawnFX = false,
+    }
+end
+
+local function runSpawnTest()
+    local state, enemyClass, subject, subjectError = spawnTestSubject()
+    if state == nil then
+        log("SPAWN TEST | cannot run: " .. tostring(subjectError))
+        return
+    end
+
+    local enemy = subject.enemy
+    local transform = subject.transform
+    local location = nil
+    pcall(function() location = enemy:K2_GetActorLocation() end)
+
+    log("SPAWN TEST | subject class=" .. tostring(objectKey(enemyClass))
+        .. " owner=" .. tostring(objectKey(enemy)))
+
+    local controller = resolveLocalController()
+    local spawnPoint = nil
+    pcall(function()
+        local origin = enemy:K2_GetActorLocation()
+        spawnPoint = {
+            X = origin.X + 200.0,
+            Y = origin.Y + 200.0,
+            Z = origin.Z,
+        }
+    end)
+
+    -- Each shape varies exactly one thing from the one above it.
+    local shapes = {
+        {
+            -- The path the director uses. Its native symbol exists, it returns
+            -- without error, and nothing appears; this confirms that against a
+            -- deliberate, visible attempt right next to the player.
+            name = "ServerDebugEnemySpawn(class, level, position)",
+            call = function()
+                if not isValid(controller) then
+                    error("RODInGamePlayerController is unavailable")
+                end
+                if spawnPoint == nil then error("spawn point unreadable") end
+                return controller:ServerDebugEnemySpawn(enemyClass, 1, spawnPoint)
+            end,
+        },
+        {
+            name = "full option, instigator=owner",
+            call = function()
+                return state:RODSpawnActor(enemyClass, transform,
+                    fullSpawnOption(location), enemy, enemy,
+                    SPAWN_COLLISION_ADJUST_OR_REJECT)
+            end,
+        },
+        {
+            name = "empty option, instigator=owner",
+            call = function()
+                return state:RODSpawnActor(enemyClass, transform, {}, enemy,
+                    enemy, SPAWN_COLLISION_ADJUST_OR_REJECT)
+            end,
+        },
+        {
+            name = "nil option, instigator=owner",
+            call = function()
+                return state:RODSpawnActor(enemyClass, transform, nil, enemy,
+                    enemy, SPAWN_COLLISION_ADJUST_OR_REJECT)
+            end,
+        },
+        {
+            name = "four arguments only",
+            call = function()
+                return state:RODSpawnActor(enemyClass, transform,
+                    fullSpawnOption(location), enemy)
+            end,
+        },
+        {
+            name = "two arguments only",
+            call = function()
+                return state:RODSpawnActor(enemyClass, transform)
+            end,
+        },
+    }
+
+    for index, shape in ipairs(shapes) do
+        -- Logged before the call: a native marshaling fault can take the process
+        -- down past pcall, and then this line names the shape that did it.
+        log(string.format("SPAWN TEST | %d/%d trying: %s",
+            index, #shapes, shape.name))
+        local ok, resultOrError = pcall(shape.call)
+        if ok then
+            local spawnOn = "unreadable"
+            pcall(function() spawnOn = tostring(resultOrError.SpawnOn) end)
+            log(string.format("SPAWN TEST | %d PASSED: %s | SpawnOn=%s",
+                index, shape.name, spawnOn))
+        else
+            log(string.format("SPAWN TEST | %d failed: %s | %s",
+                index, shape.name, summarizeSpawnCallError(resultOrError)))
+        end
+    end
+    log("SPAWN TEST | matrix complete")
+end
+
+RegisterConsoleCommandGlobalHandler(
+    "enemy_director_spawntest",
+    function()
+        -- Replies are not attempted here: the console writer is only valid for
+        -- this synchronous call, and the matrix runs on the game thread.
+        ExecuteInGameThread(function()
+            local ok, err = pcall(runSpawnTest)
+            if not ok then log("SPAWN TEST | aborted: " .. tostring(err)) end
+        end)
+        return true
+    end
+)
+
 RegisterConsoleCommandGlobalHandler(
     "enemy_director_status",
     function()
@@ -2160,7 +2710,7 @@ RegisterConsoleCommandGlobalHandler(
                 if state.owned then owned = owned + 1 else natural = natural + 1 end
             end
             log(string.format(
-                "STATUS | healthy=%s enabled=%s paused=%s fault=%s natural=%d extras=%d queued=%d pending=%d classes=%d",
+                "STATUS | healthy=%s enabled=%s paused=%s fault=%s natural=%d extras=%d queued=%d pending=%d classes=%d spawning=%s",
                 tostring(configHealthy),
                 tostring(CONFIG ~= nil and CONFIG.ENABLED),
                 tostring(worldPaused),
@@ -2169,7 +2719,8 @@ RegisterConsoleCommandGlobalHandler(
                 owned,
                 #spawnQueue,
                 #pendingSpawns,
-                #classOrder
+                #classOrder,
+                spawningProvenInert and "INERT (multiplication off)" or "on"
             ))
         end)
         return true
@@ -2182,4 +2733,5 @@ if not configHealthy or CONFIG == nil then
     error("[" .. MOD_NAME .. "] CONFIG ERROR | initial canonical configuration rejected")
 end
 poll()
-log("READY | waiting for the playable world; console: enemy_director_status")
+log("READY | waiting for the playable world; console: enemy_director_status"
+    .. " | enemy_director_spawntest")

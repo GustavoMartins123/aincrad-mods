@@ -116,7 +116,7 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/45)
 **Baseline:** `SpeedMod v8 Stablized 45 8
 2026-07-20T00-09Z 3CxMATjay.zip`  
 **Original script version:** v7.11  
-**Integrated script version:** v7.17
+**Integrated script version:** v7.18
 
 ### Added
 
@@ -157,6 +157,18 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/45)
 
 ### Fixed
 
+- Fixed a tick error that disabled part of the mod:
+  `attempt to perform arithmetic on a function value (local 'x')` in
+  `getHorizontalVelocity`. A component axis read through UE4SS does not always
+  come back as a number — a stale component, or a name colliding with the
+  wrapper's metatable, yields a function. A function is truthy, so the
+  `velocity.X or 0.0` fallbacks never fired, and the arithmetic sat outside the
+  `pcall` that was meant to contain it. The Lua error then took a UE4SS hook with
+  it (`Ref was not function ... removing hook!`), so one bad read silently
+  disabled part of the mod. Every axis in `getHorizontalVelocity`,
+  `getHorizontalAcceleration` and `getActorLocation` is now type-checked for a
+  finite number rather than only nil-checked; both call sites already handled the
+  nil result.
 - Fixed permanent-looking startup failure when the hero or movement component
   did not exist yet. The poll now remains active until both become valid.
 - Fixed per-frame `JUMP READY` log flooding caused by UE4SS returning different
@@ -498,7 +510,7 @@ Changed above.
 **Original archive:** None of the six Nexus baselines contains ModMenu or
 `ModMenuBridge.lua`
 
-**Current script version:** v1.5.2
+**Current script version:** v1.7.1
 
 ### Added
 
@@ -577,7 +589,7 @@ Changed above.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v1.4.13
+**Current script version:** v1.7.1
 
 ### Added
 
@@ -633,35 +645,143 @@ Changed above.
 
 ### Fixed
 
-- Fixed every spawn failing and pausing the director on the first attempt in each
-  world. Two regressions had been introduced together by a refactor that read as
-  a simplification, and each produced a different error:
-  1. `[UFunction::call_ufunction_from_lua] Tried calling function without both
-     UFunction and calling context`. `RODSpawnActor` had been cached by indexing
-     the game state (`rodGameState.RODSpawnActor`) instead of resolving it with
-     `StaticFindObject("/Script/ROD.RODGameState:RODSpawnActor")`. Indexing a
-     UObject with a function name returns a callable already bound to that
-     object, not a `UFunction`, so it cannot be handed to `UObject:CallFunction`.
-     It answers `IsValid()` truthily, so the contract logged itself as acquired
-     and could never be used.
-  2. `[push_objectproperty] Error: ... :InInstigator`. The six arguments had been
-     rebuilt positionally from the order the header prints. A UFunction's
-     parameter properties do not necessarily enumerate in declaration order, and
-     here they do not: passing them in header order landed the
-     collision-handling enum on `InInstigator`.
+- Fixed enemy multiplication producing nothing. Commit `2cd07a9` rewrote the
+  spawn path and changed two things at once; both had to be undone:
+  1. `UGameplayStatics::BeginDeferredActorSpawnFromClass` +
+     `FinishSpawningActor` was replaced with `ARODGameState:RODSpawnActor`, which
+     cannot be called from Lua on this build. Every argument was verified correct
+     and in the declared order, the `FTransform` was rebuilt natively, and
+     `InInstigator` was tried as both an actor and null; the rejection never
+     moved off `[push_objectproperty] ... :InInstigator`. The
+     `FRODSpawnActorOption` table is the only thing left between the two calls,
+     and no readable property in the game holds a real one to borrow.
+     `ARODInGamePlayerController:ServerDebugEnemySpawn`, tried as a third option,
+     returns without error and creates nothing despite having a real native
+     symbol.
+  2. `SPAWN_Z_OFFSET_CM` was deleted, so the spawn point sat exactly on the
+     ground. A character capsule created flush with the surface fails its
+     collision check and no actor appears — this alone would have been enough to
+     make multiplication silently stop.
 
-  The first is fixed: `RODSpawnActor` is called on the game state directly. The
-  second is not yet, and the pre-refactor design cannot be restored to fix it —
-  it read the parameter order with `ForEachProperty`, which is a `UStruct` method
-  that this build's Lua binding does not expose on a `UFunction` (the call is
-  nil). So that older code never ran either; replacing it with a positional list
-  swapped one failure for another.
+  The deferred pair is restored, and it also returns the actor it created, so
+  ownership is exact again and `takePendingSpawn` claims by object identity
+  rather than by proximity.
+- Fixed spawned enemies standing inert. A deferred spawn produces the pawn and
+  nothing else, so the enemy arrives as a model without logic.
 
-  Two read-only diagnostics were added instead of a third guess. `SPAWN PROBE`
-  registers a hook on `RODSpawnActor` and reports, once, what the engine itself
-  passes when the game spawns something naturally. `SPAWN ARGS` logs, once, what
-  this mod passes. Lining the two up names the misplaced argument directly rather
-  than inferring it from a marshaling error.
+  Possession is not the gap — that was measured and ruled out. These Blueprints
+  carry `AutoPossessAI = 3` (`PlacedInWorldOrSpawned`), the engine attaches an
+  `AIC_*` controller by itself, and `SpawnDefaultController` was a no-op with the
+  same controller present before and after. Having a controller is not the same
+  as having started.
+
+  What the game's own path does and `GameplayStatics` does not is the rest of
+  `FRODSpawnActorOption`: `IsStartBehaviorTree` and the initial state. On
+  `ARODEnemyCharacter` those are `StartAI(DetectFlag)` and `StartBehaviorTree()`,
+  now called once the enemy reports itself initialized rather than immediately
+  after creation — an enemy whose assets are still resolving has nothing for a
+  behaviour tree to run. `DetectFlag` mirrors the option struct's `IsNodetect`,
+  which this mod sets false. The first activation of a session logs
+  `SPAWN ACTIVATION` with the controller and both call results.
+- Supplied the last two pieces of `FRODSpawnActorOption` that the
+  `GameplayStatics` path never provides. `InitialStateLoc` corresponds to
+  `ProwlFirstPosition`, the anchor the idle/patrol logic works around; on an
+  actor created outside the game's own spawn call it stays at the origin, so a
+  spawned enemy's whole notion of where it belongs was `(0,0,0)` on the far side
+  of the map. It is now seeded with the spawn position, along with
+  `ProwlGoalPosition` and a cleared `ProwlGoalPositionFlag`. `DisableDetectFlag`
+  is the matching half for perception and nothing was clearing it, so the enemy
+  had no reason to look for anyone — the reported "I am invisible to them". The
+  activation log now reports both plus `DetectStartFlagN`.
+
+  This is also the leading candidate for the repeating worker-thread crash:
+  `EXCEPTION_ACCESS_VIOLATION` reading `0x8` appeared twice with a **byte-for-byte
+  identical** call stack (`+1592357 → +15920f8 → +1592a8c → +140a342 → …`), on
+  Foreground Worker #1 and later Background Worker #13. A reproducible single
+  work item, not noise, and prowl/navigation maths against an origin anchor fits
+  it. Unproven — the frames still cannot be symbolicated.
+- Narrowed boss protection to the mission's own boss. `EnemyRole_Boss` is worn
+  by field elites too — `BP_E001004`, a big boar, carries it — so treating that
+  role as "boss" pulled ordinary elites out of the spawn catalog entirely and
+  left them unmutated. Protection now keys on staging that only a real boss owns:
+  `GoldenGateBoss`, or a non-null `BossEventSequence` /
+  `BossFinisherLevelSequence`. The role is still recorded in the snapshot for
+  diagnostics but no longer decides anything by itself, and the log line is now
+  `MISSION BOSS PROTECTED`.
+
+  This also widens what `INCLUDE_BOSSES` gates: elites are ordinary enemies now,
+  so they are mutated and may be multiplied like any other species. Only the
+  mission boss is excluded from both.
+- Fixed spawned enemies never perceiving the player — invisible until hit, and
+  slow to react even then. Two `StartAI` functions exist and they are not the
+  same thing: `ARODEnemyCharacter:StartAI(DetectFlag)`, which was already being
+  called, is enough to get an enemy idling and patrolling, while perception lives
+  on the controller side. `ARODAIControllerBase:StartAI(ProcessedPawn)` binds the
+  possessed pawn into the perception system and `ApplyBindFunction` wires its
+  delegates; the engine auto-possesses the pawn but nothing calls those, because
+  the game's own path reaches them through `RODSpawnActor`. The controller is now
+  set up first, then the character, then the behaviour tree.
+- Fixed stutter introduced with distance recycling. `FindFirstOf` walks the
+  global object array and was being called twice per tick to locate the hero; it
+  is now resolved once and kept until it stops being valid. The nearby-origin
+  reconcile is `O(origins x states)` and ran every tick alongside it; it now runs
+  when recycling actually frees a slot, or on a 3-second cadence.
+- Added `DESPAWN_RADIUS` distance recycling. Origins on this map are actors
+  placed in the persistent level, so they never become invalid and
+  `cleanupInvalidStates` never fires for them: extras created in the first area
+  visited stayed alive forever, held the whole `MAX_ACTIVE_EXTRAS` budget, and no
+  new area ever received any. Owned extras beyond the radius from the hero are
+  now released, and each freed slot is handed back to its origin so returning
+  refills it. Origins within the radius are reconciled every tick, because a
+  persistent-level enemy is only discovered once per world and would otherwise
+  never re-issue.
+- Actors are no longer created while World Partition is streaming, gated on
+  `UWorldPartitionSubsystem::IsAllStreamingCompleted`. A deferred request is put
+  back at the head of the queue untouched, so it does not consume the navigation
+  budget. The gate fails open and says so once if the subsystem cannot be
+  resolved.
+
+  A third crash then arrived from the same family as the `NavigationPath` leak,
+  but on a spawned enemy's AI controller:
+  `Fatal world leaks detected ... (PendingKill) (async) AIC_E001001_C -> Outer =
+  PersistentLevel -> Outer = World`, on mission end. The controller had been
+  destroyed and still could not be collected. No callable `IsAsyncLoading`
+  predicate is exposed to Lua, so the creation moment cannot be gated precisely;
+  `IsAllStreamingCompleted` is World Partition cell state, which is related but
+  not the same condition. Distance recycling is the practical countermeasure —
+  it bounds how many owned actors are alive when the fatal check runs — but the
+  leak is **not solved**, and a long session in one place can still reach it.
+
+  This is a **mitigation, not a diagnosed fix**. Two crashes were seen under
+  heavy spawning — `EXCEPTION_ACCESS_VIOLATION` reading `0x8` on Foreground
+  Worker #1 at 169 s, and reading `0xa4` on Background Worker #3 at 671 s — in
+  two different work items sharing the same task-graph worker tail. Neither could
+  be symbolicated: `Data/mappings/native-symbols` covers only `exec*` UFunction
+  thunks and the frames land megabytes from the nearest one, and the crash
+  report's readable callstack carries no offsets. Creating actors mid-stream is
+  the one thing this mod does that fits both, and objects created on the game
+  thread during async loading are known to be born with
+  `EInternalObjectFlags::Async`.
+- Fixed `RANDOMIZE_EXTRA_SPECIES` permanently consuming a spawn slot on an
+  unlucky draw. One random pick landing on an entry that had become ineligible
+  was treated as "nothing can be spawned here": the slot was marked issued and
+  the failure was reported as an empty catalog. The draw now starts at a random
+  position and walks the catalog once before giving up, and the two distinct
+  failures — no spawnable species at all versus an origin species that is not
+  spawnable — are reported as themselves.
+- Added a give-up guard: after `UNMATCHED_SPAWN_GIVE_UP` consecutive created
+  actors that never complete initialization, the director logs one
+  `SPAWN DISABLED` line and stops queueing instead of repeating the same failure
+  every poll cycle. One successful claim clears it. `enemy_director_status`
+  reports the state, and mutation of existing enemies is never affected.
+
+### Fixed (unrelated, found while investigating)
+
+- The spawn object contract called `IsA` with class-path strings
+  (`owner:IsA("/Script/Engine.Actor")`). That overload is not dependable on this
+  build, so the gate meant to catch a wrong object before native marshaling was
+  answering from an unreliable comparison. It now resolves `Actor` and `Pawn`
+  with `StaticFindObject` and passes the UClass objects.
 
 ### Failure behavior
 

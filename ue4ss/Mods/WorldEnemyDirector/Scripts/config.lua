@@ -10,6 +10,13 @@ return {
     SPAWN_MULTIPLIER = 1,
     MAX_ACTIVE_EXTRAS = 48,
     SPAWN_RADIUS = 300.0,
+
+    -- How far you can get from an extra before the director takes it back,
+    -- in centimetres. Origins here are placed in the persistent level and
+    -- never unload, so without this the extras from the first area you
+    -- visit keep the whole budget forever and no new area gets any.
+    -- Freed slots are handed back to their origin, so returning refills.
+    DESPAWN_RADIUS = 6000.0,
     RANDOMIZE_EXTRA_SPECIES = false,
     INCLUDE_BOSSES = false,
 

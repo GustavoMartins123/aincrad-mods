@@ -1,9 +1,9 @@
-print("[SpeedMod] Loading TERRAIN RUNNER v7.17 - PERSISTENT MISSION LIFECYCLE...")
+print("[SpeedMod] Loading TERRAIN RUNNER v7.18 - PERSISTENT MISSION LIFECYCLE...")
 print("[SpeedMod] Startup is passive; lifecycle hooks arm only after the initial world settles.")
 print("[SpeedMod] Quest/map travel uses an extended post-load guard; ClientRestart uses tick-safe quarantine.")
 
 --========================================================--
---     TERRAIN RUNNER v7.17 - MOD STACK COMPATIBILITY   --
+--     TERRAIN RUNNER v7.18 - MOD STACK COMPATIBILITY   --
 --========================================================--
 -- Goals:
 --   * Preserve the transition/teleport crash protections.
@@ -867,17 +867,32 @@ local function getCombatEngagementSignal(hero)
     return false, "aggro only"
 end
 
+-- A component field read through UE4SS does not always come back as a number.
+-- When the component is stale, or when the name collides with something on the
+-- wrapper's metatable, the read yields a FUNCTION — which is truthy, so the
+-- `or 0.0` fallbacks below never fired and the value escaped into arithmetic
+-- outside the pcall that was meant to contain it:
+--
+--   main.lua:884: attempt to perform arithmetic on a function value (local 'x')
+--
+-- That Lua error then took a UE4SS hook with it ("Ref was not function ...
+-- removing hook!"), so a single bad read silently disabled part of the mod.
+-- Every axis is therefore type-checked, not just nil-checked.
+local function axisNumber(value)
+    if type(value) ~= "number" then return nil end
+    if value ~= value then return nil end
+    if value == math.huge or value == -math.huge then return nil end
+    return value
+end
+
 local function getHorizontalVelocity(movement)
     local ok, x, y = pcall(function()
         local velocity = movement.Velocity
-        if velocity == nil then
-            return 0.0, 0.0
-        end
-
-        return velocity.X or 0.0, velocity.Y or 0.0
+        if velocity == nil then return nil, nil end
+        return axisNumber(velocity.X), axisNumber(velocity.Y)
     end)
 
-    if not ok then
+    if not ok or x == nil or y == nil then
         return 0.0, 0.0, 0.0
     end
 
@@ -888,14 +903,11 @@ end
 local function getHorizontalAcceleration(movement)
     local ok, x, y = pcall(function()
         local acceleration = movement.Acceleration
-        if acceleration == nil then
-            return 0.0, 0.0
-        end
-
-        return acceleration.X or 0.0, acceleration.Y or 0.0
+        if acceleration == nil then return nil, nil end
+        return axisNumber(acceleration.X), axisNumber(acceleration.Y)
     end)
 
-    if not ok then
+    if not ok or x == nil or y == nil then
         return 0.0, 0.0, 0.0
     end
 
@@ -912,7 +924,13 @@ local function getActorLocation(hero)
         return nil, nil, nil
     end
 
-    return location.X or 0.0, location.Y or 0.0, location.Z or 0.0
+    local x = axisNumber(location.X)
+    local y = axisNumber(location.Y)
+    local z = axisNumber(location.Z)
+    if x == nil or y == nil or z == nil then
+        return nil, nil, nil
+    end
+    return x, y, z
 end
 
 -- ExecuteWithDelay does not guarantee an exact interval. os.clock is the

@@ -109,6 +109,18 @@ return {
     },
 
     {
+        mod = "FastTravelMod",
+        label = "Fast Travel",
+        summary = "Teleport to selected checkpoints and map pins",
+        apply = "menu",
+        settings = {
+            { key = "ENABLED", label = "Enabled", type = "bool", default = true },
+            { key = "DEBUG_LOGS", label = "Debug logging",
+              type = "bool", default = false },
+        },
+    },
+
+    {
         mod = "ExperienceNotifications",
         label = "XP Notifications",
         summary = "Show EXP earned from each enemy",
@@ -133,6 +145,10 @@ return {
               default = 48, min = 0, max = 200, step = 4, format = "%.0f" },
             { key = "SPAWN_RADIUS", label = "Spawn radius", type = "number",
               default = 300, min = 100, max = 1500, step = 50, format = "%.0f cm" },
+            -- Bounds mirror the DESPAWN_RADIUS rule in WorldEnemyDirector.
+            { key = "DESPAWN_RADIUS", label = "Despawn distance", type = "number",
+              default = 6000, min = 1500, max = 30000, step = 500,
+              format = "%.0f cm" },
             { key = "RANDOMIZE_EXTRA_SPECIES", label = "Random extra species",
               type = "bool", default = false },
             { key = "INCLUDE_BOSSES", label = "Mutate bosses",
