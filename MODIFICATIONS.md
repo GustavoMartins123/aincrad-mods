@@ -510,7 +510,7 @@ Changed above.
 **Original archive:** None of the six Nexus baselines contains ModMenu or
 `ModMenuBridge.lua`
 
-**Current script version:** v1.7.1
+**Current script version:** v1.7.2
 
 ### Added
 
@@ -589,7 +589,7 @@ Changed above.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v1.7.1
+**Current script version:** v1.7.2
 
 ### Added
 
@@ -683,6 +683,13 @@ Changed above.
   behaviour tree to run. `DetectFlag` mirrors the option struct's `IsNodetect`,
   which this mod sets false. The first activation of a session logs
   `SPAWN ACTIVATION` with the controller and both call results.
+- Fixed `ARODEnemyCharacter:StartAI`'s argument being passed inverted, which is
+  what made every extra blind. It was called as `StartAI(true)`, read as
+  "DetectFlag = yes, detect". Clearing `DisableDetectFlag` before the call and
+  reading it back after showed the write not surviving — false going in, true
+  coming out, with nothing between but that call — so the parameter is the option
+  struct's `IsNodetect`, not its opposite. It is now `StartAI(false)`, and
+  `DisableDetectFlag` is cleared last, after everything known to write it.
 - Supplied the last two pieces of `FRODSpawnActorOption` that the
   `GameplayStatics` path never provides. `InitialStateLoc` corresponds to
   `ProwlFirstPosition`, the anchor the idle/patrol logic works around; on an

@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.7.1"
+local MOD_VERSION = "1.7.2"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -1872,13 +1872,10 @@ local activationReported = false
 activateSpawnedEnemy = function(enemy, key, spawnPosition)
     if not isValid(enemy) then return end
 
-    -- InitialStateLoc, the last piece of FRODSpawnActorOption this path never
-    -- supplies. ProwlFirstPosition is the anchor the idle/patrol logic works
-    -- around, and on an actor created outside the game's own spawn call it is
-    -- left at the origin — so the enemy's whole notion of "where I belong" is
-    -- (0,0,0), on the far side of the map. DisableDetectFlag is the matching
-    -- half for perception: nothing clears it here, and while it is set the
-    -- enemy has no reason to look for anyone.
+    -- InitialStateLoc, which this path never supplies: ProwlFirstPosition is the
+    -- anchor the idle/patrol logic works around, and on an actor created outside
+    -- the game's own spawn call it stays at the origin, so the enemy's notion of
+    -- where it belongs was (0,0,0) on the far side of the map.
     if spawnPosition ~= nil then
         pcall(function()
             enemy.ProwlFirstPosition = spawnPosition
@@ -1886,9 +1883,6 @@ activateSpawnedEnemy = function(enemy, key, spawnPosition)
             enemy.ProwlGoalPositionFlag = false
         end)
     end
-    local clearedDetect = pcall(function()
-        enemy.DisableDetectFlag = false
-    end)
 
     local controller = nil
     pcall(function() controller = enemy.Controller end)
@@ -1915,11 +1909,23 @@ activateSpawnedEnemy = function(enemy, key, spawnPosition)
         end)
     end
 
-    -- DetectFlag mirrors the option struct's IsNodetect, which this mod sets
-    -- false: the extra should perceive the player like any other enemy.
-    local startedAI, aiError = pcall(function() enemy:StartAI(true) end)
+    -- StartAI's argument is inverted from what its name suggests.
+    --
+    -- It was being called as StartAI(true), reading "DetectFlag = yes, please
+    -- detect". Clearing DisableDetectFlag beforehand and reading it back
+    -- afterwards showed the write not surviving: the flag was false going in and
+    -- true coming out, with nothing between the two but this call. So the
+    -- parameter is the option struct's IsNodetect, not its opposite — passing
+    -- true is what was making every extra blind.
+    local startedAI, aiError = pcall(function() enemy:StartAI(false) end)
     local startedTree, treeResult = pcall(function()
         return enemy:StartBehaviorTree()
+    end)
+
+    -- Cleared last, after everything that is known to write it. Belt and braces:
+    -- the readback in the log is what says whether it stuck this time.
+    local clearedDetect = pcall(function()
+        enemy.DisableDetectFlag = false
     end)
 
     if not activationReported then

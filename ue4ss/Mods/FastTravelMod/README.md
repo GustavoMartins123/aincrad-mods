@@ -4,9 +4,10 @@ An independent **Echoes of Aincrad** mod that adds a **Fast Travel** entry to
 the Start Menu and turns the game's regular map into a destination selection
 screen.
 
-## Version 0.3.0 scope
+## Version 0.3.1 scope
 
-- opens the regular `WBP_Map_C` through `EMenuKind::MapMenu = 31`;
+- closes the Start Menu and opens the regular `WBP_Map_C` through the
+  controller's `OpenDirectingMapMenu()` action;
 - can be started from anywhere without requiring proximity to a terminal;
 - uses the map icon currently hovered by the cursor or focused by navigation;
 - accepts checkpoints, teleport terminals, safe areas, and map pins;
@@ -23,13 +24,14 @@ The contract was audited against the **1.0.3** game SDK/template.
 
 | Responsibility | Canonical contract |
 |---|---|
-| Open the map | `ARODPlayerState::OpenMenu(31)` |
+| Close the Start Menu | `ARODInGamePlayerController::EndMainMenu(true)` |
+| Open the map | `ARODInGamePlayerController::OpenDirectingMapMenu()` |
 | Widget | `URODMapMenuWidgetBase` / `WBP_Map_C` |
 | Selected icon | `MapItemWidget.CurrentTargetIconWidget` |
 | Icon type | `URODIconForMapWidgetBase::GetMapIconKind()` |
 | Destination position | `Location` argument of `URODMapMenuWidgetBase::UpdateIcon` |
 | Teleport | `ARODAvatarCharacter::ServerDebugTeleportGimmick(FVector)` |
-| Close the map | `URODWidgetBPFunctionLibrary::EndMenu` |
+| Close the map | `ARODInGamePlayerController::EndMapMenu(AllClose)` |
 
 ## Usage
 
@@ -72,7 +74,7 @@ bAccessingTerminal=false
 CurrentAcsGmkID=None
 ```
 
-This represents a completed but unclosed transaction. Version 0.3.0 recognizes
+This represents a completed but unclosed transaction. Version 0.3.1 recognizes
 only this exact combination, calls
 `ARODPlayerState::ServerCancelFastTravel()` to close it, and restores the
 camera. Any other `Decide` state is treated as an actual active travel
@@ -129,11 +131,12 @@ that could not be validated.
 
 The mod has one teleport route:
 
-1. open `WBP_Map_C`;
-2. identify the exact `CurrentTargetIconWidget`;
-3. require an allowed `EMapIconKind`;
-4. require the position captured for that same widget by `UpdateIcon`;
-5. call `ServerDebugTeleportGimmick` with that position.
+1. close the Start Menu through `EndMainMenu(true)`;
+2. open `WBP_Map_C` through `OpenDirectingMapMenu()`;
+3. identify the exact `CurrentTargetIconWidget`;
+4. require an allowed `EMapIconKind`;
+5. require the position captured for that same widget by `UpdateIcon`;
+6. call `ServerDebugTeleportGimmick` with that position.
 
 The mod does not:
 

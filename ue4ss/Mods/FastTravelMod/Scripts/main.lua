@@ -1,4 +1,4 @@
--- FastTravelMod v0.3.0
+-- FastTravelMod v0.3.1
 --
 -- Adds a native-styled Fast Travel row to Echoes of Aincrad's Start Menu and
 -- opens the game's ordinary WBP_Map screen in teleport mode. Confirming an
@@ -6,7 +6,9 @@
 --
 -- Runtime contract: SDK/template 1.0.3
 --   EMenuKind::MapMenu = 31
---   ARODPlayerState::OpenMenu(EMenuKind)
+--   ARODInGamePlayerController::EndMainMenu(true)
+--   ARODInGamePlayerController::OpenDirectingMapMenu()
+--   ARODInGamePlayerController::EndMapMenu(AllClose)
 --   URODMapMenuWidgetBase::UpdateIcon(...)
 --   ARODAvatarCharacter::ServerDebugTeleportGimmick(FVector)
 --   WBP_Map_C
@@ -16,7 +18,7 @@
 -- is unavailable, the operation stops and reports the error.
 
 local MOD_NAME = "FastTravelMod"
-local MOD_VERSION = "v0.3.0"
+local MOD_VERSION = "v0.3.1"
 local SUPPORTED_SDK = "Echoes of Aincrad 1.0.3"
 
 local MAIN_MENU_ICON_CLASS =
@@ -28,7 +30,6 @@ local MAIN_MENU_LIST_FRAGMENT = "WBP_Console_MainMenu_List_C"
 local MENU_ICON_FRAGMENT = "WBP_Console_MainMenu_MenuIcon_C"
 local MAP_WIDGET_FRAGMENT = "WBP_Map_C"
 
-local MENU_KIND_MAP = 31
 local FAST_TRAVEL_STATUS_DISABLE = 0
 local FAST_TRAVEL_STATUS_CANCEL = 1
 local FAST_TRAVEL_STATUS_DECIDE = 2
@@ -37,8 +38,10 @@ local ACCESSIBLE_STATUS_NONE = 0
 
 local MAX_NATIVE_MENU_ITEMS = 7
 local MENU_INJECTION_DELAY_MS = 250
-local OPEN_VERIFICATION_DELAY_MS = 1200
+local MAIN_MENU_CLOSE_DELAY_MS = 200
+local OPEN_VERIFICATION_DELAY_MS = 2500
 local TELEPORT_FINALIZE_DELAY_MS = 900
+local MENU_END_ALL_CLOSE = 2
 
 local ACCEPT_BUTTON = 1
 local BACK_BUTTON = 2
@@ -1205,10 +1208,10 @@ local function requestFastTravelOpen(source)
         return
     end
 
-    local playerState, playerStateError = resolveLocalPlayerState()
-    if playerState == nil then
+    local controller, controllerError = resolveLocalController()
+    if controller == nil then
         log("Fast Travel open failed closed: " ..
-            tostring(playerStateError))
+            tostring(controllerError))
         return
     end
 
@@ -1245,28 +1248,47 @@ local function requestFastTravelOpen(source)
     end
 
     teleportMapModeActive = true
-    log("opening teleport map from " .. tostring(source))
-    local opened, openError = pcall(function()
-        playerState:OpenMenu(MENU_KIND_MAP)
+    log("closing Start Menu before teleport map | source=" ..
+        tostring(source))
+    local closed, closeError = pcall(function()
+        controller:EndMainMenu(true)
     end)
-    if not opened then
+    if not closed then
         failPendingOpen(
             serial,
-            "OpenMenu(31) failed: " .. tostring(openError))
+            "EndMainMenu(true) failed: " .. tostring(closeError))
         return
     end
 
     local scheduled, scheduleError = pcall(function()
-        ExecuteWithDelay(OPEN_VERIFICATION_DELAY_MS, function()
+        ExecuteWithDelay(MAIN_MENU_CLOSE_DELAY_MS, function()
             ExecuteInGameThread(function()
-                verifyTeleportMapOpen(serial)
+                if serial ~= openSerial then return end
+                log("opening teleport map through OpenDirectingMapMenu")
+                local opened, openError = pcall(function()
+                    controller:OpenDirectingMapMenu()
+                end)
+                if not opened then
+                    failPendingOpen(
+                        serial,
+                        "OpenDirectingMapMenu failed: " ..
+                            tostring(openError))
+                    return
+                end
+                ExecuteWithDelay(
+                    OPEN_VERIFICATION_DELAY_MS,
+                    function()
+                        ExecuteInGameThread(function()
+                            verifyTeleportMapOpen(serial)
+                        end)
+                    end)
             end)
         end)
     end)
     if not scheduled then
         failPendingOpen(
             serial,
-            "map verification scheduling failed: " ..
+            "map opening sequence scheduling failed: " ..
                 tostring(scheduleError))
     end
 end
@@ -1429,10 +1451,7 @@ local function requestSelectedMapTeleport(mapWidget, source)
             local controller, controllerError =
                 resolveLocalController()
             if controller == nil then error(controllerError) end
-            local rodLibrary, libraryError =
-                resolveRodWidgetLibrary()
-            if rodLibrary == nil then error(libraryError) end
-            rodLibrary:EndMenu(controller)
+            controller:EndMapMenu(MENU_END_ALL_CLOSE)
         end
     end)
     if not closed then
@@ -1756,6 +1775,33 @@ requireHook(
         _, widgetParameter, buttonParameter
     )
         handleClick(widgetParameter, buttonParameter)
+    end)
+)
+
+requireHook(
+    "/Script/ROD.RODInGamePlayerController:OpenDirectingMapMenu",
+    guardedHookCallback("directing map open", function(selfParameter)
+        if not teleportMapModeActive then return end
+        local controller = hookValue(selfParameter)
+        if not isLocalWorldController(controller) then return end
+        log("native OpenDirectingMapMenu entered")
+    end)
+)
+
+requireHook(
+    "/Script/ROD.RODInGamePlayerController:DisplayMapMenu",
+    guardedHookCallback("map display", function(
+        selfParameter, overlapParameter
+    )
+        if not teleportMapModeActive then return end
+        local controller = hookValue(selfParameter)
+        if not isLocalWorldController(controller) then return end
+        local overlap = hookValue(overlapParameter)
+        if type(overlap) ~= "boolean" then
+            error("DisplayMapMenu overlap flag decode failed")
+        end
+        log("native DisplayMapMenu entered | overlapTerminalIcon=" ..
+            tostring(overlap))
     end)
 )
 
