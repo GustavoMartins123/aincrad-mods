@@ -1,4 +1,4 @@
--- FastTravelMod v0.3.1
+-- FastTravelMod v0.3.7
 --
 -- Adds a native-styled Fast Travel row to Echoes of Aincrad's Start Menu and
 -- opens the game's ordinary WBP_Map screen in teleport mode. Confirming an
@@ -7,7 +7,9 @@
 -- Runtime contract: SDK/template 1.0.3
 --   EMenuKind::MapMenu = 31
 --   ARODInGamePlayerController::EndMainMenu(true)
---   ARODInGamePlayerController::OpenDirectingMapMenu()
+--   UGameplayAbility::GetAbilitySystemComponentFromActorInfo()
+--   UGameplayAbility::AbilityTriggers
+--   URODAbilitySystemComponent::TryActivateAbilityWithPayloadFromClass(...)
 --   ARODInGamePlayerController::EndMapMenu(AllClose)
 --   URODMapMenuWidgetBase::UpdateIcon(...)
 --   ARODAvatarCharacter::ServerDebugTeleportGimmick(FVector)
@@ -18,7 +20,7 @@
 -- is unavailable, the operation stops and reports the error.
 
 local MOD_NAME = "FastTravelMod"
-local MOD_VERSION = "v0.3.1"
+local MOD_VERSION = "v0.3.7"
 local SUPPORTED_SDK = "Echoes of Aincrad 1.0.3"
 
 local MAIN_MENU_ICON_CLASS =
@@ -29,6 +31,8 @@ local MAIN_MENU_CLASS_FRAGMENT = "WBP_Console_MainMenu_C"
 local MAIN_MENU_LIST_FRAGMENT = "WBP_Console_MainMenu_List_C"
 local MENU_ICON_FRAGMENT = "WBP_Console_MainMenu_MenuIcon_C"
 local MAP_WIDGET_FRAGMENT = "WBP_Map_C"
+local MAIN_MENU_ABILITY_CLASS = "GA_AvatarMenu_Main_C"
+local MAP_MENU_ABILITY_CLASS = "GA_AvatarMenu_Map_C"
 
 local FAST_TRAVEL_STATUS_DISABLE = 0
 local FAST_TRAVEL_STATUS_CANCEL = 1
@@ -38,7 +42,8 @@ local ACCESSIBLE_STATUS_NONE = 0
 
 local MAX_NATIVE_MENU_ITEMS = 7
 local MENU_INJECTION_DELAY_MS = 250
-local MAIN_MENU_CLOSE_DELAY_MS = 200
+local MENU_TRANSITION_POLL_MS = 50
+local MENU_TRANSITION_TIMEOUT_MS = 3000
 local OPEN_VERIFICATION_DELAY_MS = 2500
 local TELEPORT_FINALIZE_DELAY_MS = 900
 local MENU_END_ALL_CLOSE = 2
@@ -104,6 +109,7 @@ local menuCloseBusy = false
 local teleportMapModeActive = false
 local mapTeleportBusy = false
 local mapIconDestinations = {}
+local pendingMapAbility = nil
 local lastNativeFastTravelStatus = nil
 local lastNativeAccessibleStatus = nil
 local lastNativeAccessingTerminal = nil
@@ -303,6 +309,207 @@ local function resolveLocalHero()
         return nil, "local hero is not RODHeroCharacter"
     end
     return hero, nil
+end
+
+local function findAbilityObjects(className)
+    local objects = nil
+    local queryOk, queryError = pcall(function()
+        objects = FindAllOf(className)
+    end)
+    if not queryOk or type(objects) ~= "table" then
+        error(tostring(className) .. " query failed: " ..
+            tostring(queryError))
+    end
+
+    local validObjects = {}
+    for _, object in ipairs(objects) do
+        if isValid(object) then
+            validObjects[#validObjects + 1] = object
+        end
+    end
+    if #validObjects == 0 then
+        error(tostring(className) .. " has no valid loaded objects")
+    end
+    return validObjects
+end
+
+local function resolveOwnedAbility(className, abilitySystem)
+    local abilitySystemName = objectName(abilitySystem)
+    if abilitySystemName == nil then
+        error("local Ability System identity is unavailable")
+    end
+
+    local ownedAbilities = {}
+    for _, ability in ipairs(findAbilityObjects(className)) do
+        local ownerAbilitySystem = nil
+        local ownerOk, ownerError = pcall(function()
+            ownerAbilitySystem =
+                ability:GetAbilitySystemComponentFromActorInfo()
+        end)
+        if not ownerOk then
+            error(string.format(
+                "%s owner query failed for %s: %s",
+                tostring(className),
+                tostring(objectName(ability)),
+                tostring(ownerError)))
+        end
+        if isValid(ownerAbilitySystem)
+            and objectName(ownerAbilitySystem) == abilitySystemName then
+            ownedAbilities[#ownedAbilities + 1] = ability
+        end
+    end
+
+    if #ownedAbilities ~= 1 then
+        error(string.format(
+            "expected one %s owned by the local Ability System, found %d",
+            tostring(className),
+            #ownedAbilities))
+    end
+    return ownedAbilities[1]
+end
+
+local function isOwnedAbilityClassActive(className, abilitySystem)
+    local ability = resolveOwnedAbility(className, abilitySystem)
+    local active = nil
+    local queryOk, queryError = pcall(function()
+        active = ability:BP_IsActive()
+    end)
+    if not queryOk or type(active) ~= "boolean" then
+        error(string.format(
+            "%s BP_IsActive query failed for %s: %s",
+            tostring(className),
+            tostring(objectName(ability)),
+            tostring(queryError)))
+    end
+    return active
+end
+
+local function resolveMapAbilityContract()
+    local hero, heroError = resolveLocalHero()
+    if hero == nil then return nil, heroError end
+
+    local abilitySystem = nil
+    local abilityReadOk, abilityReadError = pcall(function()
+        abilitySystem = hero.AbilitySystem
+    end)
+    if not abilityReadOk or not isValid(abilitySystem) then
+        return nil, "local RODAbilitySystemComponent is unavailable: " ..
+            tostring(abilityReadError)
+    end
+
+    local abilityClass =
+        StaticFindObject("/Script/ROD.RODAbilitySystemComponent")
+    if not isValid(abilityClass) then
+        return nil,
+            "RODAbilitySystemComponent class fingerprint is unavailable"
+    end
+    local classOk, classMatches = pcall(function()
+        return abilitySystem:IsA(abilityClass)
+    end)
+    if not classOk or classMatches ~= true then
+        return nil, "hero AbilitySystem is not RODAbilitySystemComponent"
+    end
+
+    local mapAbility = nil
+    local mapAbilityClass = nil
+    local mapAbilityClassName = nil
+    local mapAbilityTriggerTag = nil
+    local mapAbilityTriggerTagName = nil
+    local mapAbilityPayload = nil
+    local contractOk, contractError = pcall(function()
+        mapAbility = resolveOwnedAbility(
+            MAP_MENU_ABILITY_CLASS,
+            abilitySystem)
+        mapAbilityClass = mapAbility:GetClass()
+        if not isValid(mapAbilityClass) then
+            error(MAP_MENU_ABILITY_CLASS ..
+                " generated class is unavailable")
+        end
+        mapAbilityClassName = objectName(mapAbilityClass)
+        if mapAbilityClassName == nil
+            or string.find(
+                mapAbilityClassName,
+                MAP_MENU_ABILITY_CLASS,
+                1,
+                true) == nil then
+            error("map ability generated class fingerprint mismatch: " ..
+                tostring(mapAbilityClassName))
+        end
+
+        local tagLibrary = StaticFindObject(
+            "/Script/GameplayTags.Default__BlueprintGameplayTagLibrary")
+        if not isValid(tagLibrary) then
+            error("BlueprintGameplayTagLibrary default object is unavailable")
+        end
+
+        local eventTriggers = {}
+        local triggers = mapAbility.AbilityTriggers
+        if triggers == nil then
+            error(MAP_MENU_ABILITY_CLASS ..
+                " AbilityTriggers is unavailable")
+        end
+        local triggersOk, triggersError = pcall(function()
+            triggers:ForEach(function(_, element)
+                local trigger = element:get()
+                if trigger == nil then
+                    error("AbilityTriggers element decode failed")
+                end
+                if tonumber(trigger.TriggerSource) == 0 then
+                    eventTriggers[#eventTriggers + 1] =
+                        trigger.TriggerTag
+                end
+            end)
+        end)
+        if not triggersOk then
+            error("AbilityTriggers query failed: " ..
+                tostring(triggersError))
+        end
+        if #eventTriggers ~= 1 then
+            error(string.format(
+                "%s must expose exactly one GameplayEvent trigger; found %d",
+                MAP_MENU_ABILITY_CLASS,
+                #eventTriggers))
+        end
+
+        mapAbilityTriggerTag = eventTriggers[1]
+        if tagLibrary:IsGameplayTagValid(
+            mapAbilityTriggerTag) ~= true then
+            error(MAP_MENU_ABILITY_CLASS ..
+                " GameplayEvent trigger tag is invalid")
+        end
+        mapAbilityTriggerTagName = exactFNameString(
+            mapAbilityTriggerTag.TagName,
+            MAP_MENU_ABILITY_CLASS .. " trigger TagName")
+
+        mapAbilityPayload = mapAbility.CurrentEventData
+        if mapAbilityPayload == nil then
+            error(MAP_MENU_ABILITY_CLASS ..
+                " CurrentEventData payload is unavailable")
+        end
+
+        local mainMenuActive =
+            isOwnedAbilityClassActive(
+                MAIN_MENU_ABILITY_CLASS,
+                abilitySystem)
+        if not mainMenuActive then
+            error(MAIN_MENU_ABILITY_CLASS ..
+                " has no active ability instance")
+        end
+    end)
+    if not contractOk then
+        return nil, "map gameplay ability contract failed: " ..
+            tostring(contractError)
+    end
+
+    return {
+        abilitySystem = abilitySystem,
+        mapAbility = mapAbility,
+        mapAbilityClass = mapAbilityClass,
+        mapAbilityClassName = mapAbilityClassName,
+        mapAbilityTriggerTag = mapAbilityTriggerTag,
+        mapAbilityTriggerTagName = mapAbilityTriggerTagName,
+        mapAbilityPayload = mapAbilityPayload,
+    }, nil
 end
 
 local function resolveWorldGameState()
@@ -1155,6 +1362,25 @@ end
 
 local function failPendingOpen(serial, reason)
     if serial ~= nil and serial ~= openSerial then return end
+    local abilityToCancel = pendingMapAbility
+    pendingMapAbility = nil
+    if isValid(abilityToCancel) then
+        local active = false
+        local activeOk = pcall(function()
+            active = abilityToCancel:BP_IsActive() == true
+        end)
+        if activeOk and active then
+            local cancelOk, cancelError = pcall(function()
+                abilityToCancel:K2_CancelAbility()
+            end)
+            if cancelOk then
+                log("map ability rollback completed")
+            else
+                log("MAP ABILITY ROLLBACK ERROR | " ..
+                    tostring(cancelError))
+            end
+        end
+    end
     openBusy = false
     teleportMapModeActive = false
     mapTeleportBusy = false
@@ -1189,9 +1415,96 @@ local function verifyTeleportMapOpen(serial)
         return
     end
     openBusy = false
+    pendingMapAbility = nil
     teleportMapWidgetKey = objectName(presented[1])
     teleportMapModeActive = true
     log("teleport map presented; select an eligible icon and confirm")
+end
+
+local function activateTeleportMapAbility(serial, contract)
+    if serial ~= openSerial then return end
+
+    local activated = nil
+    local activationOk, activationError = pcall(function()
+        activated =
+            contract.abilitySystem:
+                TryActivateAbilityWithPayloadFromClass(
+                contract.mapAbilityClass,
+                contract.mapAbilityTriggerTag,
+                contract.mapAbilityPayload)
+    end)
+    if not activationOk then
+        failPendingOpen(
+            serial,
+            "map gameplay ability activation failed: " ..
+                tostring(activationError))
+        return
+    end
+    if activated ~= true then
+        failPendingOpen(
+            serial,
+            "map gameplay event activation was rejected: " ..
+                contract.mapAbilityTriggerTagName)
+        return
+    end
+
+    pendingMapAbility = contract.mapAbility
+    log("map gameplay ability activated | ability=" ..
+        tostring(objectName(contract.mapAbility)) ..
+        " | class=" .. contract.mapAbilityClassName ..
+        " | trigger=" .. contract.mapAbilityTriggerTagName)
+    local scheduled, scheduleError = pcall(function()
+        ExecuteWithDelay(
+            OPEN_VERIFICATION_DELAY_MS,
+            function()
+                ExecuteInGameThread(function()
+                    verifyTeleportMapOpen(serial)
+                end)
+            end)
+    end)
+    if not scheduled then
+        failPendingOpen(
+            serial,
+            "map verification scheduling failed: " ..
+                tostring(scheduleError))
+    end
+end
+
+local function waitForMainMenuAbilityEnd(
+    serial, contract, elapsedMs
+)
+    if serial ~= openSerial then return end
+
+    local transitionOk, transitionError = xpcall(function()
+        local mainMenuActive =
+            isOwnedAbilityClassActive(
+                MAIN_MENU_ABILITY_CLASS,
+                contract.abilitySystem)
+        if not mainMenuActive then
+            activateTeleportMapAbility(serial, contract)
+            return
+        end
+
+        if elapsedMs >= MENU_TRANSITION_TIMEOUT_MS then
+            error(MAIN_MENU_ABILITY_CLASS .. " remained active for " ..
+                tostring(elapsedMs) .. " ms")
+        end
+
+        ExecuteWithDelay(MENU_TRANSITION_POLL_MS, function()
+            ExecuteInGameThread(function()
+                waitForMainMenuAbilityEnd(
+                    serial,
+                    contract,
+                    elapsedMs + MENU_TRANSITION_POLL_MS)
+            end)
+        end)
+    end, debug.traceback)
+    if not transitionOk then
+        failPendingOpen(
+            serial,
+            "menu ability transition failed: " ..
+                tostring(transitionError))
+    end
 end
 
 local function requestFastTravelOpen(source)
@@ -1221,6 +1534,7 @@ local function requestFastTravelOpen(source)
     teleportMapWidgetKey = nil
     mapTeleportBusy = false
     mapIconDestinations = {}
+    pendingMapAbility = nil
 
     local state = nil
     local stateOk, stateError =
@@ -1247,6 +1561,33 @@ local function requestFastTravelOpen(source)
         return
     end
 
+    local abilityContract, abilityContractError =
+        resolveMapAbilityContract()
+    if abilityContract == nil then
+        failPendingOpen(
+            serial,
+            "map ability contract unavailable: " ..
+                tostring(abilityContractError))
+        return
+    end
+
+    local alreadyActiveOk, alreadyActiveError = xpcall(function()
+        local mapMenuActive =
+            isOwnedAbilityClassActive(
+                MAP_MENU_ABILITY_CLASS,
+                abilityContract.abilitySystem)
+        if mapMenuActive then
+            error(MAP_MENU_ABILITY_CLASS .. " is already active")
+        end
+    end, debug.traceback)
+    if not alreadyActiveOk then
+        failPendingOpen(
+            serial,
+            "map ability precondition failed: " ..
+                tostring(alreadyActiveError))
+        return
+    end
+
     teleportMapModeActive = true
     log("closing Start Menu before teleport map | source=" ..
         tostring(source))
@@ -1260,37 +1601,8 @@ local function requestFastTravelOpen(source)
         return
     end
 
-    local scheduled, scheduleError = pcall(function()
-        ExecuteWithDelay(MAIN_MENU_CLOSE_DELAY_MS, function()
-            ExecuteInGameThread(function()
-                if serial ~= openSerial then return end
-                log("opening teleport map through OpenDirectingMapMenu")
-                local opened, openError = pcall(function()
-                    controller:OpenDirectingMapMenu()
-                end)
-                if not opened then
-                    failPendingOpen(
-                        serial,
-                        "OpenDirectingMapMenu failed: " ..
-                            tostring(openError))
-                    return
-                end
-                ExecuteWithDelay(
-                    OPEN_VERIFICATION_DELAY_MS,
-                    function()
-                        ExecuteInGameThread(function()
-                            verifyTeleportMapOpen(serial)
-                        end)
-                    end)
-            end)
-        end)
-    end)
-    if not scheduled then
-        failPendingOpen(
-            serial,
-            "map opening sequence scheduling failed: " ..
-                tostring(scheduleError))
-    end
+    log("waiting for " .. MAIN_MENU_ABILITY_CLASS .. " to end")
+    waitForMainMenuAbilityEnd(serial, abilityContract, 0)
 end
 
 local function scheduleFastTravelOpen(source)

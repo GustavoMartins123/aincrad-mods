@@ -4,10 +4,11 @@ An independent **Echoes of Aincrad** mod that adds a **Fast Travel** entry to
 the Start Menu and turns the game's regular map into a destination selection
 screen.
 
-## Version 0.3.1 scope
+## Version 0.3.7 scope
 
-- closes the Start Menu and opens the regular `WBP_Map_C` through the
-  controller's `OpenDirectingMapMenu()` action;
+- resolves the map ability owned by the local hero's Ability System, closes the
+  Start Menu, waits for `GA_AvatarMenu_Main_C` to end, and activates the regular
+  map with the ability's own `GameplayEvent` trigger;
 - can be started from anywhere without requiring proximity to a terminal;
 - uses the map icon currently hovered by the cursor or focused by navigation;
 - accepts checkpoints, teleport terminals, safe areas, and map pins;
@@ -25,7 +26,11 @@ The contract was audited against the **1.0.3** game SDK/template.
 | Responsibility | Canonical contract |
 |---|---|
 | Close the Start Menu | `ARODInGamePlayerController::EndMainMenu(true)` |
-| Open the map | `ARODInGamePlayerController::OpenDirectingMapMenu()` |
+| Observe menu transition | `GA_AvatarMenu_Main_C::BP_IsActive()` |
+| Resolve ability ownership | `UGameplayAbility::GetAbilitySystemComponentFromActorInfo()` |
+| Resolve activation trigger | Local `GA_AvatarMenu_Map_C::AbilityTriggers` |
+| Open the map | `URODAbilitySystemComponent::TryActivateAbilityWithPayloadFromClass(...)` |
+| Map ability | `GA_AvatarMenu_Map_C` |
 | Widget | `URODMapMenuWidgetBase` / `WBP_Map_C` |
 | Selected icon | `MapItemWidget.CurrentTargetIconWidget` |
 | Icon type | `URODIconForMapWidgetBase::GetMapIconKind()` |
@@ -74,7 +79,7 @@ bAccessingTerminal=false
 CurrentAcsGmkID=None
 ```
 
-This represents a completed but unclosed transaction. Version 0.3.1 recognizes
+This represents a completed but unclosed transaction. Version 0.3.7 recognizes
 only this exact combination, calls
 `ARODPlayerState::ServerCancelFastTravel()` to close it, and restores the
 camera. Any other `Decide` state is treated as an actual active travel
@@ -132,11 +137,17 @@ that could not be validated.
 The mod has one teleport route:
 
 1. close the Start Menu through `EndMainMenu(true)`;
-2. open `WBP_Map_C` through `OpenDirectingMapMenu()`;
-3. identify the exact `CurrentTargetIconWidget`;
-4. require an allowed `EMapIconKind`;
-5. require the position captured for that same widget by `UpdateIcon`;
-6. call `ServerDebugTeleportGimmick` with that position.
+2. wait until `GA_AvatarMenu_Main_C::BP_IsActive()` returns false for every
+   loaded instance;
+3. require exactly one `GA_AvatarMenu_Map_C` owned by the local hero's Ability
+   System, require exactly one `GameplayEvent` trigger on that ability, and
+   activate its exact generated class with that trigger through the same
+   Ability System;
+4. require `GA_AvatarMenu_Map_C` to construct `WBP_Map_C`;
+5. identify the exact `CurrentTargetIconWidget`;
+6. require an allowed `EMapIconKind`;
+7. require the position captured for that same widget by `UpdateIcon`;
+8. call `ServerDebugTeleportGimmick` with that position.
 
 The mod does not:
 
@@ -145,9 +156,12 @@ The mod does not:
 - write `FastTravelStatus`, `PSAcsGmkStatus`, or `bAccessingTerminal`;
 - directly modify the actor location;
 - use another icon's coordinates when the selection cannot be resolved;
+- call `OpenDirectingMapMenu` directly without its owning gameplay ability;
 - open another widget when `WBP_Map_C` fails.
 
 If any canonical step fails, no teleport request is sent.
+If map construction fails after ability activation, the mod cancels that exact
+ability to restore the pre-open state.
 
 ## Compatibility with the other menu mods
 
