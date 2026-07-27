@@ -1,43 +1,39 @@
-print("[SpeedMod] Loading TERRAIN RUNNER v7.18 - PERSISTENT MISSION LIFECYCLE...")
-print("[SpeedMod] Startup is passive; lifecycle hooks arm only after the initial world settles.")
-print("[SpeedMod] Quest/map travel uses an extended post-load guard; ClientRestart uses tick-safe quarantine.")
+print("[SpeedMod] Loading TERRAIN RUNNER v7.19 - STATE MACHINE READINESS & HOT-PATH OPTIMIZATION...")
+print("[SpeedMod] Startup lifecycle hooks arm immediately; readiness state machine activates upon world stability.")
+print("[SpeedMod] Quest/map travel uses dynamic readiness stability guard; ClientRestart uses tick-safe quarantine.")
 
 --========================================================--
---     TERRAIN RUNNER v7.18 - MOD STACK COMPATIBILITY   --
+--     TERRAIN RUNNER v7.19 - MOD STACK COMPATIBILITY   --
 --========================================================--
 -- Goals:
---   * Preserve the transition/teleport crash protections.
---   * Begin accelerating immediately when native sprint starts.
---   * Reach useful speed much sooner without extreme one-frame jumps.
---   * Ignore brief sprint-detector dips so straight-line sprinting does
---     not randomly decelerate and rebuild from zero.
---   * Base added distance on a held native-sprint reference speed rather
---     than a single fluctuating velocity sample.
---   * Measure only the game's native movement between injected offsets and
---     use that rise/run as the terrain grade for the next swept offset.
---   * Preserve the proven sprint-entry detector exactly; terrain logic only
---     affects direction and short hold behavior after sprint is active.
+--   * Dynamic state-machine readiness based on consecutive world & hero stability.
+--   * Cache Hero and MovementComponent references per world generation.
+--   * Fast-path baseline identity checks to avoid per-tick C++ reflection.
+--   * Preserve transition safety during map changes, teleports, and sleep transitions.
+--   * Preserve sprint-entry detection and grade-aligned swept offsets.
+--   * Preserve external config loading, fail-closed semantics, and console commands.
 --========================================================--
 
--- Polling. Only one game-thread callback may be outstanding at a time.
+-- Polling intervals. Only one game-thread callback may be outstanding at a time.
 local ACTIVE_TICK_MS = 16
 local IDLE_TICK_MS = 25
 local LOADING_POLL_MS = 250
 
--- Transition safety.
+-- Transition safety & Readiness thresholds.
 local POST_TRANSITION_GRACE_MS = 1250
 local TELEPORT_GRACE_MS = 750
 local TELEPORT_DISTANCE_THRESHOLD = 3000.0
 
--- Proven pause timings adapted from AutoPickup/AutoRiposte.
+-- Readiness stability: requires N consecutive stable samples of hero & movement before activating.
+local STABILITY_SAMPLES_REQUIRED = 3
+
+-- State transition pause durations.
 local QUEST_QUIET_SEC = 4.0
 local SLEEP_QUIET_SEC = 10.0
 local SLEEP_DEBOUNCE_SEC = 10.0
-local RESTART_SETTLE_SEC = 5.0
-local TRAVEL_RESTART_SETTLE_SEC = 10.0
+local RESTART_SETTLE_SEC = 2.0
 local TRAVEL_TIMEOUT_MS = 30000
-local STARTUP_COMPAT_DELAY_MS = 8000
-local RESTART_QUARANTINE_SEC = 10.0
+local MAX_RESTART_QUARANTINE_SEC = 5.0
 
 --========================================================--
 --                  EXTERNAL CONFIG LOADER                --
@@ -234,11 +230,11 @@ local MAX_UPWARD_OFFSET_PER_TICK = 16.0
 local MAX_DOWNWARD_OFFSET_PER_TICK = 18.0
 local MIN_INPUT_ACCELERATION = 10.0
 
-
 -- Console spam can create hitching. Leave false for normal use.
 local DEBUG_LOGS = false
 
 local cachedHero = nil
+local cachedMovement = nil
 local jumpMovement = nil
 local jumpMovementKey = nil
 local nativeJumpZVelocity = nil
@@ -256,6 +252,7 @@ local disabledStateReported = false
 local boostReadyReported = false
 local nativeJogCap = nil
 local clockErrorReported = false
+local stabilitySamples = 0
 
 local extraMultiplier = 0.0
 local wasSprinting = false
@@ -395,10 +392,18 @@ end
 local readNumber
 
 local function resolveMovementComponent(hero)
+    if isValidObj(cachedMovement) then
+        return cachedMovement, nil
+    end
+
     local resolved, component = pcall(function()
         return hero:GetMovementComponent()
     end)
-    if resolved and isValidObj(component) then return component, nil end
+    if resolved and isValidObj(component) then
+        cachedMovement = component
+        return component, nil
+    end
+    cachedMovement = nil
     if not resolved then return nil, tostring(component) end
     return nil, "GetMovementComponent returned an invalid component"
 end
@@ -454,6 +459,11 @@ local function resolveCanonicalMovementBaseline(hero, movement)
 end
 
 local function bindCanonicalMovementBaseline(hero, movement)
+    -- Fast path: reuse cached baseline identity if the movement component reference is unchanged across ticks.
+    if movementBaselineKey ~= nil and nativeJogCap ~= nil and cachedMovement == movement then
+        return true
+    end
+
     local identityOk, currentIdentity = pcall(function()
         return movement:GetFullName()
     end)
@@ -538,6 +548,8 @@ local function resolveHero()
     if isValidObj(cachedHero) then
         heroWaitingReported = false
         log("Hero found")
+    else
+        cachedMovement = nil
     end
 
     return cachedHero
@@ -668,6 +680,14 @@ end
 local function applyJumpHeight(hero, movement)
     if not isValidObj(hero) or not isValidObj(movement) then return false end
 
+    -- Fast path: reuse cached jump state if target configuration and component reference are unchanged.
+    if jumpMovement == movement and jumpWriteSupported == true and jumpReadySignature ~= nil then
+        local currentSignature = string.format("%s|%.6f", jumpMovementKey or "", CONFIG.JUMP_HEIGHT_MULTIPLIER)
+        if jumpReadySignature == currentSignature then
+            return true
+        end
+    end
+
     local identityOk, movementIdentity = pcall(function()
         return movement:GetFullName()
     end)
@@ -788,10 +808,8 @@ local function applyLiveJumpSetting()
     applyJumpHeight(hero, movement)
 end
 
--- Combat lock intentionally ignores generic "current target" proximity.
--- The old version could flip lock on/off dozens of times as aggro targets
--- were assigned and cleared. Deliberate lock-on or a recently attacked enemy
--- are stronger signals that the player is actually fighting.
+-- Combat lock evaluates active lock-on target or recent melee engagement
+-- rather than passive aggro proximity to avoid rapid oscillation.
 local COMBAT_ATTACK_TARGET_DISTANCE = 1800.0
 local COMBAT_ENTER_CONFIRM_MS = 200
 local COMBAT_EXIT_CONFIRM_MS = 1000
@@ -867,17 +885,6 @@ local function getCombatEngagementSignal(hero)
     return false, "aggro only"
 end
 
--- A component field read through UE4SS does not always come back as a number.
--- When the component is stale, or when the name collides with something on the
--- wrapper's metatable, the read yields a FUNCTION — which is truthy, so the
--- `or 0.0` fallbacks below never fired and the value escaped into arithmetic
--- outside the pcall that was meant to contain it:
---
---   main.lua:884: attempt to perform arithmetic on a function value (local 'x')
---
--- That Lua error then took a UE4SS hook with it ("Ref was not function ...
--- removing hook!"), so a single bad read silently disabled part of the mod.
--- Every axis is therefore type-checked, not just nil-checked.
 local function axisNumber(value)
     if type(value) ~= "number" then return nil end
     if value ~= value then return nil end
@@ -976,6 +983,8 @@ end
 
 local function resetState()
     cachedHero = nil
+    cachedMovement = nil
+    stabilitySamples = 0
     -- World teardown owns the old movement component. Discard its reference;
     -- writing into a component being destroyed is unsafe.
     clearJumpTracking()
@@ -1324,22 +1333,53 @@ local function rememberPostOffsetLocation(hero)
 end
 
 local function tick(stepMs)
+    -- Readiness State Machine: verify host hero & movement component across N consecutive samples before arming injection.
     if not startupCompatReady then
+        local hero = resolveHero()
+        local movement = nil
+        if isValidObj(hero) then
+            movement = resolveMovementComponent(hero)
+        end
+
+        if isValidObj(hero) and isValidObj(movement) then
+            stabilitySamples = stabilitySamples + 1
+            if stabilitySamples >= STABILITY_SAMPLES_REQUIRED then
+                startupCompatReady = true
+                quietUntil = math.max(quietUntil, os.clock() + 0.5)
+                postTransitionGraceMs = POST_TRANSITION_GRACE_MS
+                print(string.format(
+                    "[SpeedMod] READINESS STABLE | Hero & movement verified across %d samples | Movement armed",
+                    STABILITY_SAMPLES_REQUIRED
+                ))
+            end
+        else
+            stabilitySamples = 0
+        end
         return
     end
 
-    -- ClientRestart can fire during fragile quest-start/world-replacement work.
-    -- The hook itself only sets primitive pause flags. We do not run a delayed
-    -- Lua callback near the native restart chain. Instead, the normal tick loop
-    -- releases the quarantine later, resets cached movement state, and only then
-    -- allows hero discovery/movement to resume.
+    -- Dynamic Restart Quarantine: automatically releases as soon as world stability is re-verified across samples.
     if restartPending then
-        if os.clock() < restartReleaseClock then
-            return
+        local hero = resolveHero()
+        local movement = nil
+        if isValidObj(hero) then
+            movement = resolveMovementComponent(hero)
         end
 
-        restartPending = false
-        onWorldReady("ClientRestart(tick-quarantine)", 0.0)
+        local clockPassed = os.clock() >= restartReleaseClock
+        local worldStable = isValidObj(hero) and isValidObj(movement)
+
+        if worldStable then
+            stabilitySamples = stabilitySamples + 1
+        else
+            stabilitySamples = 0
+        end
+
+        if clockPassed or stabilitySamples >= STABILITY_SAMPLES_REQUIRED then
+            restartPending = false
+            onWorldReady("ClientRestart(stability-readiness)", 0.0)
+            return
+        end
         return
     end
 
@@ -1391,6 +1431,7 @@ local function tick(stepMs)
             warn("WAITING FOR HERO | movement poll remains active")
         end
         cachedHero = nil
+        cachedMovement = nil
         clearAcceleration()
         lastClockSeconds = nil
         nextPollMs = LOADING_POLL_MS
@@ -1406,6 +1447,7 @@ local function tick(stepMs)
                 " | poll remains active")
         end
         cachedHero = nil
+        cachedMovement = nil
         clearAcceleration()
         lastClockSeconds = nil
         nextPollMs = LOADING_POLL_MS
@@ -1495,6 +1537,7 @@ local function tick(stepMs)
     local locationX, locationY, locationZ = getActorLocation(hero)
     if locationX == nil then
         cachedHero = nil
+        cachedMovement = nil
         clearAcceleration()
         lastClockSeconds = nil
         return
@@ -1677,12 +1720,13 @@ local function tick(stepMs)
                 deltaZ
             ) then
                 clearAcceleration()
-                if not rememberPostOffsetLocation(hero) then cachedHero = nil end
+                if not rememberPostOffsetLocation(hero) then cachedHero = nil cachedMovement = nil end
                 return
             end
 
             if not rememberPostOffsetLocation(hero) then
                 cachedHero = nil
+                cachedMovement = nil
                 clearAcceleration()
                 return
             end
@@ -1726,42 +1770,41 @@ end
 local function poll()
     local delayMs = LOADING_POLL_MS
 
-    if startupCompatReady then
-        if not restartPending and not mapLeaving then
-            delayMs = nextPollMs
-        end
+    if not restartPending and not mapLeaving then
+        delayMs = nextPollMs
+    end
 
-        -- Back-pressure: never stack callbacks while the game thread is busy.
-        -- During restart quarantine we still queue the lightweight tick so it can
-        -- release the quarantine after the clock deadline; movement remains blocked.
-        if not tickQueued then
-            tickQueued = true
+    -- Back-pressure: never stack callbacks while the game thread is busy.
+    -- During restart quarantine we still queue the lightweight tick so it can
+    -- release the quarantine after the clock deadline; movement remains blocked.
+    if not tickQueued then
+        tickQueued = true
 
-            local queuedGeneration = lifecycleGeneration
-            local queuedStepMs = delayMs
+        local queuedGeneration = lifecycleGeneration
+        local queuedStepMs = delayMs
 
-            ExecuteInGameThread(function()
-                tickQueued = false
+        ExecuteInGameThread(function()
+            tickQueued = false
 
-                if (mapLeaving and not restartPending) or
-                   queuedGeneration ~= lifecycleGeneration then
-                    return
-                end
+            if (mapLeaving and not restartPending) or
+               queuedGeneration ~= lifecycleGeneration then
+                return
+            end
 
-                local handler = debug and debug.traceback or tostring
-                local ok, err = xpcall(function()
-                    tick(queuedStepMs)
-                end, handler)
+            local handler = debug and debug.traceback or tostring
+            local ok, err = xpcall(function()
+                tick(queuedStepMs)
+            end, handler)
 
-                if not ok then
-                    warn("Tick error:")
-                    print(tostring(err))
-                    cachedHero = nil
-                    clearAcceleration()
-                    lastClockSeconds = nil
-                end
-            end)
-        end
+            if not ok then
+                warn("Tick error:")
+                print(tostring(err))
+                cachedHero = nil
+                cachedMovement = nil
+                clearAcceleration()
+                lastClockSeconds = nil
+            end
+        end)
     end
 
     ExecuteWithDelay(delayMs, poll)
@@ -1900,7 +1943,7 @@ requireLifecycleHook(
         restartPending = true
         restartReleaseClock = math.max(
             restartReleaseClock,
-            os.clock() + RESTART_QUARANTINE_SEC
+            os.clock() + MAX_RESTART_QUARANTINE_SEC
         )
     end,
     "ClientRestart(quarantine)"
@@ -1908,21 +1951,14 @@ requireLifecycleHook(
 
 end
 
--- Compatibility startup:
--- Do not join the game's initial ClientRestart/native hook cascade. Several
--- companion mods also initialize there. SpeedMod stays fully dormant until
--- the first world has had time to settle, then arms its lifecycle hooks and
--- waits through an additional quiet/grace window before movement injection.
-ExecuteWithDelay(STARTUP_COMPAT_DELAY_MS, function()
-    registerLifecycleHooks()
-    startupCompatReady = true
-    quietUntil = math.max(quietUntil, os.clock() + 2.0)
-    postTransitionGraceMs = POST_TRANSITION_GRACE_MS
-    print(
-        "[SpeedMod] COMPAT READY | lifecycle hooks armed after startup | " ..
-        "movement remains paused for settle/grace"
-    )
-end)
+-- Lifecycle Registration:
+-- Arm lifecycle hooks immediately upon loading so map transitions and player state events are captured.
+registerLifecycleHooks()
+startupCompatReady = false
+print(
+    "[SpeedMod] COMPAT READY | lifecycle hooks armed immediately | " ..
+    "waiting for hero stability (3 samples)"
+)
 
 local function consoleReply(ar, message)
     local text = "[SpeedMod] " .. tostring(message)
@@ -2015,4 +2051,4 @@ else
     warn("Console command unavailable: " .. tostring(commandError))
 end
 
-ExecuteWithDelay(1500, poll)
+ExecuteWithDelay(100, poll)
