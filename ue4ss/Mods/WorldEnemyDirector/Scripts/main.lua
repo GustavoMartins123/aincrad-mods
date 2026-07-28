@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.7.2"
+local MOD_VERSION = "1.7.3"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -44,6 +44,10 @@ local NAV_ATTEMPTS_PER_PASS = 1
 local NAV_MAX_ATTEMPTS = 12
 local NAV_MIN_SEPARATION_CM = 150.0
 local MAX_DISCOVERY_PER_TICK = 2
+-- 12 attempts, 250 ms apart: three seconds of grace for a streaming enemy to
+-- finish initialising before it is reported as broken.
+local SNAPSHOT_RETRY_LIMIT = 12
+local SNAPSHOT_RETRY_BACKOFF_MS = 250
 local GAMEPLAY_MOD_ADDITIVE = 0
 local SPAWN_ON_SERVER = 0
 local INITIAL_STATE_PROWL = 0
@@ -1684,8 +1688,40 @@ local function takePendingSpawn(actorKey)
     return nil
 end
 
+-- Snapshot failures that mean "not ready yet" rather than "broken". An enemy
+-- streaming in during a world transition is visible before its mesh, its fields
+-- and its GAS attribute set have finished initialising. Fast travel made this
+-- common rather than rare: a whole cell's worth of enemies arrives at once, and
+-- the log filled with "required GAS attribute is absent: MaxHealth" for enemies
+-- that were perfectly fine a second later.
+local TRANSIENT_SNAPSHOT_PREFIXES = {
+    "required skeletal mesh is unavailable",
+    "required enemy fields are unreadable",
+    "required enemy AbilitySystem is unavailable",
+    "required GAS attribute is absent",
+    "GetAllAttributes failed",
+}
+
+local function snapshotErrorIsTransient(message)
+    if type(message) ~= "string" then return false end
+    for _, prefix in ipairs(TRANSIENT_SNAPSHOT_PREFIXES) do
+        if message:find(prefix, 1, true) == 1 then return true end
+    end
+    return false
+end
+
 local function registerEnemy(enemy, reused, queued)
     if not isValid(enemy) then return end
+
+    -- Re-queued items carry a wall-clock gate. Without it the retry budget is
+    -- spent within a few frames, which is far too fast for an ability system to
+    -- finish coming up.
+    if queued ~= nil and queued.retryAtMs ~= nil
+        and elapsedMs < queued.retryAtMs then
+        objectQueue[#objectQueue + 1] = queued
+        return
+    end
+
     local key = objectKey(enemy)
     if key == nil or key:find("Default__", 1, true) ~= nil then return end
     local operational, lifecycleError = enemyOperational(enemy)
@@ -1737,13 +1773,20 @@ local function registerEnemy(enemy, reused, queued)
     end
     local baseline, snapshotError = snapshotEnemy(enemy)
     if baseline == nil then
-        if request == nil and queued ~= nil and (snapshotError == "required skeletal mesh is unavailable" or snapshotError == "required enemy fields are unreadable") then
+        if request == nil and queued ~= nil
+            and snapshotErrorIsTransient(snapshotError) then
             local retryCount = (queued.retryCount or 0) + 1
-            if retryCount <= 5 then
+            if retryCount <= SNAPSHOT_RETRY_LIMIT then
                 queued.retryCount = retryCount
+                queued.retryAtMs = elapsedMs + SNAPSHOT_RETRY_BACKOFF_MS
                 objectQueue[#objectQueue + 1] = queued
                 return
             end
+            log("ENEMY ERROR | " .. key .. " | " .. snapshotError ..
+                " | still absent after " .. SNAPSHOT_RETRY_LIMIT ..
+                " retries over " ..
+                (SNAPSHOT_RETRY_LIMIT * SNAPSHOT_RETRY_BACKOFF_MS) .. " ms")
+            return
         end
         log("ENEMY ERROR | " .. key .. " | " .. snapshotError)
         if request ~= nil then

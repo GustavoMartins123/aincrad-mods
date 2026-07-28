@@ -30,6 +30,20 @@ return {
     --                   fast travel UI, so it is opt-in rather than default.
     MAP_TARGET = "fasttravel",
 
+    -- Escape hatch. A viewport change such as Alt+Enter can leave the map screen
+    -- up with its input dead: Cancelar does nothing and nothing in the game
+    -- closes it. This key force-closes it and resets the mod's state. It is a
+    -- UE4SS keybind, so it is processed outside the game's input and still works
+    -- when the screen has stopped responding. Same as "fasttravel close".
+    -- Any name from UE4SS's Key table; empty disables the binding.
+    FORCE_CLOSE_KEY = "F8",
+
+    -- Diagnostic. Logs which map icon the cursor is currently resolved to, with
+    -- its kind and hover state. Pins cannot be confirmed on the fast travel
+    -- screen and the cause is not yet known -- SnapMapIconKinds was ruled out,
+    -- since it already lists pin kinds. This is how the real cause gets found.
+    CURSOR_PROBE_KEY = "F7",
+
     -- Only used when MAP_TARGET is "map".
     -- The FName handed to ARODAvatarCharacter::ActivateFPCameraMenuAbility as
     -- MenuKey. It selects the opening level sequence in GA_AvatarMenu_Map_C's

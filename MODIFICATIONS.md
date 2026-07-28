@@ -597,7 +597,7 @@ Changed above.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v1.7.2
+**Current script version:** v1.7.3
 
 ### Added
 
@@ -653,6 +653,17 @@ Changed above.
 
 ### Fixed
 
+- Fixed a burst of `required GAS attribute is absent: MaxHealth` errors after
+  fast travel. An enemy streaming in during a world transition is visible before
+  its ability system has published its attribute set, and a whole cell's worth
+  arrives at once, so what was a rare race became routine once fast travel
+  worked. The discovery queue already retried two snapshot failures — missing
+  skeletal mesh and unreadable fields — but matched them by exact string, so the
+  GAS cases fell through to being reported as broken enemies. Retry now covers
+  every "not ready yet" snapshot failure by prefix, and the budget is 12 attempts
+  spaced 250 ms apart by a wall-clock gate rather than 5 attempts that were spent
+  within a few frames. An enemy that is still incomplete after three seconds is
+  reported with that fact stated.
 - Fixed enemy multiplication producing nothing. Commit `2cd07a9` rewrote the
   spawn path and changed two things at once; both had to be undone:
   1. `UGameplayStatics::BeginDeferredActorSpawnFromClass` +
@@ -815,7 +826,7 @@ work, and emits one concise world fault. It is not retried every poll cycle.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v0.9.1
+**Current script version:** v0.11.0
 
 ### Added
 
@@ -900,6 +911,23 @@ work, and emits one concise world fault. It is not retried every poll cycle.
   target (read back at 0 cm). Both dead ends are recorded in the source so they
   are not tried again. Arrival is still verified from the world, since a teleport
   into unstreamed World Partition cells remains possible.
+- Fixed the confirmed icon being read from the wrong widget.
+  `URODMenuWidgetBase::CurrentFocusWidget` is the menu's focused child, which on
+  a map screen is the map, never an icon; that is why every pin attempt reported
+  "focused widget is not a map icon". The cursor's icon is
+  `URODMapItemWidgetBase::CurrentTargetIconWidget`.
+- Fixed a viewport change, such as Alt+Enter, trapping the player on the map
+  screen. The screen survives unfocused: its cursor keeps tracking the mouse,
+  Confirmar stays greyed, Cancelar does nothing, and nothing in the game closes
+  it — the Start Menu cannot be reached from there, so no in-game recovery
+  exists. The escape hatch is therefore a UE4SS keybind (`FORCE_CLOSE_KEY`,
+  default F8), processed outside the game's input, which force-dismisses the
+  screen, hands input back through
+  `URODWidgetBPFunctionLibrary::SetCurrentMenuInputActionEnable` and resets the
+  component's state. `fasttravel close` does the same from the console.
+  Separately, `teleportMapModeActive` had been blocking every later open for the
+  rest of the session; it is now validated against the screen it refers to and
+  cleared when stale.
 - Fixed the Fast Travel row appearing in town, where it can only fail. The row is
   no longer injected when the current world holds no accessible gimmick carrying
   an ID, which is the real question and hardcodes no map name. It is re-evaluated
@@ -943,17 +971,17 @@ work, and emits one concise world fault. It is not retried every poll cycle.
 
 ### Known limitations
 
-- Pins cannot be confirmed on the fast travel screen, by that screen's own
-  design. Two attempts to change this were made and both removed: v0.8.0 forced
-  the icons on with `URODMenuItemWidgetBase::SetInactive(false)` and
-  `URODMenuWidgetBase::AddOperableChildWidget`, which fights the screen's declared
-  purpose and risks the checkpoint selection that works; v0.8.1 added an icon
-  census to gather evidence, which measured the wrong population —
-  `FindAllOf("WBP_MapIcon_C")` returns a pool of roughly 390 unmounted widgets for
-  a screen showing about twenty, and reported `canHover=0` even for the 67
-  `SafeArea` icons that are demonstrably selectable. Both are gone.
-  `fasttravel pin <index>` travels to any pin listed by `fasttravel pins`,
-  regardless of screen.
+- **Pins still cannot be confirmed on the fast travel screen, and the cause is
+  not known.** `URODMapItemWidgetBase::SnapMapIconKinds` was the leading theory
+  and has been ruled out by measurement: that screen's array already contained
+  `32` (`InstantPin1`) and `27`–`31` (`PillarPin1`–`5`) before anything was
+  appended, so pins were already snappable and the cursor still would not stop on
+  one. The append is kept, since it completes the set with the remaining pin
+  kinds and any real fix needs them, but it is not the mechanism. `CURSOR_PROBE_KEY`
+  (default F7) reports what `CurrentTargetIconWidget` holds at the moment it is
+  pressed — kind, `GetCanHoverIcon`, `GetInactive`, `Timestamp` — which is the
+  evidence needed to locate the real gate. `fasttravel pin <index>` travels to
+  any pin and depends on none of this.
 - The reference-map selection pipeline (`resolveSelectedMapIcon`, the `UpdateIcon`
   destination cache, the `MapDecidedEvent` / `MapClickEvent` interception) is
   original to this component and has never run end to end, because until v0.7.0

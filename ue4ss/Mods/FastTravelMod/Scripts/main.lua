@@ -1,4 +1,4 @@
--- FastTravelMod v0.9.1
+-- FastTravelMod v0.11.0
 --
 -- TWO MAPS, ONE OF THEM WRONG
 --
@@ -22,7 +22,14 @@
 -- made it the default for that reason and that was a mistake: it trades a
 -- working fast travel screen for an unproven confirm interception on a screen
 -- that is not the game's fast travel UI. It is opt-in via MAP_TARGET now.
--- Pins are served by the "fasttravel pin <index>" console command.
+--
+-- PINS ON THE FAST TRAVEL SCREEN
+--
+-- The screen does not lock pins out; it simply does not list them in the array
+-- its cursor snaps by. URODMapItemWidgetBase::SnapMapIconKinds is that array,
+-- and v0.10.0 appends the pin kinds to the instance this screen builds. Nothing
+-- foreign is introduced -- the icons, the cursor and the snap list are all the
+-- game's, given a wider list to work from. See injectPinSnapKinds.
 --
 -- Natively the second is opened by GA_AvatarMenu_AccessTerminal_C, which needs a
 -- real terminal actor as its Target. This mod instead constructs the widget and
@@ -74,8 +81,8 @@
 --   ARODGameState::MapPins (FRODMapPin::Pos)
 --   WBP_MapIcon_C
 --   URODIconForMapWidgetBase::GetMapIconKind / GetCanHoverIcon / Timestamp
---   URODMenuItemWidgetBase::GetInactive
---   URODMenuWidgetBase::CurrentFocusWidget
+--   URODMapItemWidgetBase::SnapMapIconKinds / CurrentTargetIconWidget
+--   URODWidgetBPFunctionLibrary::SetCurrentMenuInputActionEnable
 --   AActor::K2_TeleportTo(FVector, FRotator)
 --   WBP_Map_FastTravel_C
 --
@@ -114,7 +121,7 @@
 -- is unavailable, the operation stops and reports the error.
 
 local MOD_NAME = "FastTravelMod"
-local MOD_VERSION = "v0.9.1"
+local MOD_VERSION = "v0.11.0"
 local SUPPORTED_SDK = "Echoes of Aincrad 1.0.3"
 
 local MAIN_MENU_ICON_CLASS =
@@ -210,6 +217,8 @@ local CONFIG = {
     DEBUG_LOGS = false,
     MAP_MENU_KEY = "",
     MAP_TARGET = "fasttravel",
+    FORCE_CLOSE_KEY = "F8",
+    CURSOR_PROBE_KEY = "F7",
 }
 
 local runtimeHealthy = true
@@ -332,6 +341,8 @@ local function applySettings(settings)
     local stringKeys = {
         MAP_MENU_KEY = true,
         MAP_TARGET = true,
+        FORCE_CLOSE_KEY = true,
+        CURSOR_PROBE_KEY = true,
     }
     for key in pairs(settings) do
         if booleanKeys[key] ~= true and stringKeys[key] ~= true then
@@ -357,6 +368,14 @@ local function applySettings(settings)
     CONFIG.DEBUG_LOGS = settings.DEBUG_LOGS
     CONFIG.MAP_MENU_KEY = settings.MAP_MENU_KEY or ""
     CONFIG.MAP_TARGET = mapTarget
+    -- Keys are read once at load; the bindings are registered there and are not
+    -- re-registered on a live settings change.
+    if settings.FORCE_CLOSE_KEY ~= nil then
+        CONFIG.FORCE_CLOSE_KEY = settings.FORCE_CLOSE_KEY
+    end
+    if settings.CURSOR_PROBE_KEY ~= nil then
+        CONFIG.CURSOR_PROBE_KEY = settings.CURSOR_PROBE_KEY
+    end
     runtimeHealthy = true
 end
 
@@ -1710,6 +1729,115 @@ local function failPendingOpen(serial, reason)
     log("FAST TRAVEL ERROR | " .. tostring(reason))
 end
 
+--========================================================--
+--            MAKING PINS SNAPPABLE BY INJECTION          --
+--========================================================--
+-- SnapMapIconKinds is the array the cursor stops by, and the theory was that
+-- this screen's copy omitted pins. It does not. Measured on open:
+--
+--   PIN SNAP | SnapMapIconKinds 21 -> 26
+--   had [16, 17, 14, 15, 49, 18, 45, 46, 35, 20, 32, 27, 11, 12, 48, 19,
+--        28, 29, 30, 31, 51]
+--
+-- 32 is InstantPin1 and 27..31 are PillarPin1..5. Pins were already snappable
+-- and the cursor still would not stop on one, so this array is not the gate and
+-- appending to it was never going to be the fix. The append is kept only because
+-- it completes the set with the remaining pin kinds, which any real fix needs
+-- anyway; it is not presented as the mechanism.
+--
+-- Where the gate actually is remains unknown. The cursor probe keybind reports
+-- what CurrentTargetIconWidget holds at the moment it is pressed, which is the
+-- measurement that would settle it.
+
+-- URODMapMenuWidgetBase declares MapItemWidget. URODFastTravelMenuWidget does not:
+-- it builds one from FieldClass into MapWidgetCanvas, so for that screen the
+-- canvas children are where it lives.
+local function resolveMapItemWidget(mapWidget)
+    if not isValid(mapWidget) then return nil, "no map screen" end
+
+    local direct = nil
+    pcall(function() direct = mapWidget.MapItemWidget end)
+    if isValid(direct) then return direct, nil end
+
+    local itemClass = StaticFindObject("/Script/ROD.RODMapItemWidgetBase")
+    if not isValid(itemClass) then
+        return nil, "RODMapItemWidgetBase class fingerprint is unavailable"
+    end
+
+    local canvas = nil
+    pcall(function() canvas = mapWidget.MapWidgetCanvas end)
+    if not isValid(canvas) then
+        return nil, "MapWidgetCanvas is unavailable"
+    end
+
+    local found = nil
+    pcall(function()
+        local count = canvas:GetChildrenCount()
+        for index = 0, count - 1 do
+            local child = canvas:GetChildAt(index)
+            if isValid(child) and child:IsA(itemClass) then
+                found = child
+                break
+            end
+        end
+    end)
+    if isValid(found) then return found, nil end
+    return nil, "no RODMapItemWidgetBase under MapWidgetCanvas"
+end
+
+local function injectPinSnapKinds(mapWidget)
+    local item, itemError = resolveMapItemWidget(mapWidget)
+    if item == nil then
+        log("PIN SNAP | map item unavailable: " .. tostring(itemError))
+        return
+    end
+
+    local snap = nil
+    local readOk, readError = pcall(function()
+        snap = item.SnapMapIconKinds
+    end)
+    if not readOk or snap == nil then
+        log("PIN SNAP | SnapMapIconKinds unavailable: " .. tostring(readError))
+        return
+    end
+
+    local existing = {}
+    local before = {}
+    local count = 0
+    pcall(function() count = #snap end)
+    for index = 1, count do
+        local kind = nil
+        pcall(function() kind = tonumber(snap[index]) end)
+        if kind ~= nil then
+            existing[kind] = true
+            before[#before + 1] = tostring(kind)
+        end
+    end
+
+    -- Index-assign one past the end: the growth path proven on this UE4SS build.
+    local added = {}
+    for kind in pairs(MAP_PIN_ICON_KINDS) do
+        if existing[kind] ~= true then
+            local at = 0
+            pcall(function() at = #snap end)
+            if pcall(function() snap[at + 1] = kind end) then
+                existing[kind] = true
+                added[#added + 1] = string.format(
+                    "%d(%s)", kind, tostring(ELIGIBLE_MAP_ICON_KINDS[kind]))
+            end
+        end
+    end
+
+    local after = 0
+    pcall(function() after = #snap end)
+    log(string.format(
+        "PIN SNAP | SnapMapIconKinds %d -> %d | had [%s] | added [%s]",
+        count,
+        after,
+        table.concat(before, ", "),
+        #added == 0 and "nothing" or table.concat(added, ", ")))
+end
+
 local function verifyTeleportMapOpen(serial)
     if serial ~= openSerial then return end
 
@@ -1765,6 +1893,7 @@ local function verifyTeleportMapOpen(serial)
     log(string.format(
         "map screen presented | %s | select an eligible icon and confirm",
         tostring(fragment)))
+    injectPinSnapKinds(presented[1])
 end
 
 local function activateTeleportMapAbility(serial, contract)
@@ -2037,8 +2166,25 @@ local function requestFastTravelOpen(source)
         return
     end
     if teleportMapModeActive then
-        log("Fast Travel open refused: teleport map is already active")
-        return
+        -- Alt+Enter, and anything else that rebuilds the viewport, can leave the
+        -- screen up but unfocused: the icons keep tracking the mouse and nothing
+        -- closes it. The flag then blocks every later open, which is the "estado
+        -- todo errado" part. If the screen it refers to is gone or no longer
+        -- presented, the flag is stale -- clear it and carry on rather than
+        -- refusing for the rest of the session.
+        if isValid(teleportMapWidget)
+            and isPresentedTeleportMapWidget(teleportMapWidget) then
+            log("Fast Travel open refused: teleport map is already active")
+            return
+        end
+        log("stale teleport map state cleared: the screen it referred to is " ..
+            "no longer presented")
+        teleportMapModeActive = false
+        teleportMapWidget = nil
+        teleportMapWidgetKey = nil
+        mapTeleportBusy = false
+        mapIconDestinations = {}
+        openSerial = openSerial + 1
     end
 
     local controller, controllerError = resolveLocalController()
@@ -2572,6 +2718,30 @@ local function dismissFastTravelScreen()
     end
 end
 
+-- Everything the mod believes about the screen, reset. Separated from
+-- dismissFastTravelScreen because the escape hatch has to work when the screen
+-- is already unreachable and dismissing it may not take.
+local function forceCloseMapScreen(source)
+    log("forced map dismissal | source=" .. tostring(source))
+    pcall(dismissFastTravelScreen)
+    pcall(function()
+        local rodLibrary = resolveRodWidgetLibrary()
+        local controller = resolveLocalController()
+        if rodLibrary ~= nil and controller ~= nil then
+            -- The screen survives with its input dead, so hand input back to
+            -- whatever menu remains rather than leaving the player with none.
+            rodLibrary:SetCurrentMenuInputActionEnable(controller, true)
+        end
+    end)
+    teleportMapModeActive = false
+    teleportMapWidget = nil
+    teleportMapWidgetKey = nil
+    mapTeleportBusy = false
+    openBusy = false
+    mapIconDestinations = {}
+    openSerial = openSerial + 1
+end
+
 -- A confirmed pin reaches ServerDecideFastTravel with ID=None, because a pin has
 -- no terminal ID to decide on. The focused widget is what says which pin it was.
 -- URODIconForMapWidgetBase and FRODMapPin both carry a Timestamp, which is the
@@ -2579,11 +2749,20 @@ end
 local function focusedPinDestination()
     if not isValid(teleportMapWidget) then return nil, "no map screen tracked" end
 
+    -- URODMenuWidgetBase::CurrentFocusWidget is the menu's focused child, which
+    -- on a map screen is the map itself, never an icon. The cursor's icon lives
+    -- on the map item as CurrentTargetIconWidget. Reading the wrong one is what
+    -- made every pin attempt report "focused widget is not a map icon".
+    local item, itemError = resolveMapItemWidget(teleportMapWidget)
+    if item == nil then return nil, tostring(itemError) end
+
     local icon = nil
     pcall(function()
-        icon = weakObject(teleportMapWidget.CurrentFocusWidget)
+        icon = weakObject(item.CurrentTargetIconWidget)
     end)
-    if not isValid(icon) then return nil, "no focused widget on the map" end
+    if not isValid(icon) then
+        return nil, "the cursor is not on an icon"
+    end
 
     local kind, timestamp
     local probed = pcall(function()
@@ -3448,6 +3627,19 @@ local commandOk, commandError = pcall(function()
             -- selected on it. FRODMapPin carries a world Pos, though, so the
             -- destination itself is available: this travels to a pin by its
             -- index in "fasttravel pins".
+            -- The escape hatch for a screen left unfocused by a viewport change.
+            if subcommand == "close" then
+                reply("Force-closing the map screen; see the UE4SS console.")
+                ExecuteInGameThread(function()
+                    local ok, closeError =
+                        xpcall(forceCloseMapScreen, debug.traceback, "console")
+                    if not ok then
+                        log("FORCED CLOSE ERROR | " .. tostring(closeError))
+                    end
+                end)
+                return true
+            end
+
             if subcommand == "pin" then
                 local index = tonumber(params[2])
                 if index == nil or index < 1 then
@@ -3560,8 +3752,8 @@ local commandOk, commandError = pcall(function()
             end
 
             reply(
-                "Usage: fasttravel status | open | pins | pin <index> | " ..
-                "terminals | menukeys")
+                "Usage: fasttravel status | open | close | pins | " ..
+                "pin <index> | terminals | menukeys")
             return true
         end
     )
@@ -3571,6 +3763,92 @@ if not commandOk then
         "] console command registration failed: " ..
         tostring(commandError))
 end
+
+--========================================================--
+--                  STUCK-SCREEN ESCAPE                   --
+--========================================================--
+-- A viewport change -- Alt+Enter reproduces it -- leaves the screen up with its
+-- cursor live and its input dead: Cancelar does nothing, Confirmar stays greyed,
+-- and nothing in the game closes it. Recovering through the Start Menu is
+-- impossible because the Start Menu cannot be reached from there.
+--
+-- So the way out must not go through the game's input at all. A UE4SS keybind is
+-- processed outside it, which is the whole reason this exists rather than a
+-- console command alone.
+
+-- Reading Key.X directly would throw outside a pcall if the enum is missing on
+-- some UE4SS build, taking the mod down before anything else registers.
+local function keyCode(name)
+    local ok, code = pcall(function() return Key[name] end)
+    if ok and type(code) == "number" then return code end
+    return nil
+end
+
+local function bindKey(name, label, action)
+    if name == nil or name == "" then return end
+    local code = keyCode(name)
+    if code == nil then
+        log("keybind unavailable: Key." .. tostring(name) .. " does not exist")
+        return
+    end
+    local ok, bindError = pcall(function()
+        RegisterKeyBind(code, function()
+            ExecuteInGameThread(function()
+                local ran, actionError = xpcall(action, debug.traceback)
+                if not ran then
+                    log(label .. " keybind failed: " .. tostring(actionError))
+                end
+            end)
+        end)
+    end)
+    if not ok then
+        log("keybind registration failed for " .. tostring(name) .. ": " ..
+            tostring(bindError))
+    else
+        log("keybind ready | " .. tostring(name) .. " = " .. label)
+    end
+end
+
+bindKey(CONFIG.FORCE_CLOSE_KEY, "force close map", function()
+    forceCloseMapScreen("keybind")
+end)
+
+-- The pin gate is not in SnapMapIconKinds, which already listed pins. This
+-- reports what the cursor is actually resolving to at the instant it is pressed,
+-- which is the evidence needed to find where the gate really is.
+bindKey(CONFIG.CURSOR_PROBE_KEY, "map cursor probe", function()
+    if not isValid(teleportMapWidget) then
+        log("CURSOR PROBE | no map screen is tracked")
+        return
+    end
+    local item, itemError = resolveMapItemWidget(teleportMapWidget)
+    if item == nil then
+        log("CURSOR PROBE | map item unavailable: " .. tostring(itemError))
+        return
+    end
+
+    local icon = nil
+    pcall(function() icon = weakObject(item.CurrentTargetIconWidget) end)
+    if not isValid(icon) then
+        log("CURSOR PROBE | map item=" .. tostring(objectName(item)) ..
+            " | CurrentTargetIconWidget is empty (cursor on nothing)")
+        return
+    end
+
+    local kind, canHover, inactive, timestamp
+    pcall(function() kind = tonumber(icon:GetMapIconKind()) end)
+    pcall(function() canHover = icon:GetCanHoverIcon() end)
+    pcall(function() inactive = icon:GetInactive() end)
+    pcall(function() timestamp = tonumber(icon.Timestamp) end)
+    log(string.format(
+        "CURSOR PROBE | icon=%s | kind=%s (%s) | canHover=%s | inactive=%s | timestamp=%s",
+        tostring(objectName(icon)),
+        tostring(kind),
+        tostring(kind ~= nil and ELIGIBLE_MAP_ICON_KINDS[kind] or "other"),
+        tostring(canHover),
+        tostring(inactive),
+        tostring(timestamp)))
+end)
 
 do
     local attachment, attachmentError = MOD_MENU_BRIDGE.attach({
