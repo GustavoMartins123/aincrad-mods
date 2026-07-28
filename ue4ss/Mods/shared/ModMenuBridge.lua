@@ -103,9 +103,12 @@ function Bridge.readSettings(_modName, scriptDir)
             transactionInProgress = true,
         }
     end
+    local revPath = scriptDir .. "runtime.rev"
+    local revText, _ = readExactFile(revPath, false)
     local configText, configReadError = readExactFile(configPath, true)
     local runtimeText, runtimeReadError = readExactFile(runtimePath, false)
     local fingerprint =
+        tostring(revText or "") .. "\0" ..
         tostring(configText or "") .. "\0" ..
         tostring(runtimeText or "") .. "\0" ..
         tostring(configReadError or "") .. "\0" ..
@@ -199,6 +202,7 @@ function Bridge.attach(options)
     end
 
     local lastFingerprint = nil
+    local lastRevText = nil
     local lastFailure = nil
 
     local function dispatchFailure(message)
@@ -221,10 +225,20 @@ function Bridge.attach(options)
     end
 
     local function refresh(force, isInitial)
+        local revPath = scriptDir .. "runtime.rev"
+        local revText, _ = readExactFile(revPath, false)
+        if not force and revText ~= nil and revText == lastRevText then
+            return false
+        end
+
         local settings, fingerprint, info =
             Bridge.readSettings(modName, scriptDir)
-        if not force and fingerprint == lastFingerprint then return false end
+        if not force and fingerprint == lastFingerprint then
+            lastRevText = revText
+            return false
+        end
         lastFingerprint = fingerprint
+        lastRevText = revText
 
         if settings == nil then
             -- ModMenu publishes runtime.lua under an explicit transaction

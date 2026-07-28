@@ -851,6 +851,8 @@ end
 
 expandGimmicksInRange = function(hero, scanRange)
     local expanded = 0
+    local startTime = os.clock()
+    local MAX_BATCH_SEC = 0.002
     for _, className in ipairs(GIMMICK_FIND_CLASSES) do
         local found = FindAllOf(className)
         if found then
@@ -864,8 +866,10 @@ expandGimmicksInRange = function(hero, scanRange)
                         end
                     end
                 end
+                if os.clock() - startTime > MAX_BATCH_SEC then break end
             end
         end
+        if os.clock() - startTime > MAX_BATCH_SEC then break end
     end
     return expanded
 end

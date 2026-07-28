@@ -332,6 +332,20 @@ local function safetyNet()
     ExecuteWithDelay(CONFIG.SAFETY_NET_MS, safetyNet)
 end
 
+local RETRY_DELAYS_MS = { 100, 250, 500, 1000, 2000 }
+
+local function applyProgressiveRetry(index)
+    index = index or 1
+    ExecuteInGameThread(function()
+        applyAll()
+        if modActive ~= true and index <= #RETRY_DELAYS_MS then
+            ExecuteWithDelay(RETRY_DELAYS_MS[index], function()
+                applyProgressiveRetry(index + 1)
+            end)
+        end
+    end)
+end
+
 local function onRespawnPath()
     heroCache, switchedHeroKey, gcCache = nil, nil, nil
     heroWaitingReported = false
@@ -341,7 +355,7 @@ local function onRespawnPath()
     heroSwitchErrorReported = false
     gameConfigWaitingReported = false
     gameConfigReadyReported = false
-    ExecuteWithDelay(1000, function() ExecuteInGameThread(applyAll) end)
+    applyProgressiveRetry(1)
 end
 
 RegisterHook("/Script/Engine.PlayerController:ClientRestart", onRespawnPath)
@@ -374,7 +388,7 @@ do
     end
 end
 
-ExecuteWithDelay(2000, function() ExecuteInGameThread(applyAll) end)
+applyProgressiveRetry(1)
 ExecuteWithDelay(CONFIG.SAFETY_NET_MS, safetyNet)
 print(string.format("[norescue] loaded | enabled=%s | DeathLandingHeight=%.0f | safety net %dms",
     tostring(CONFIG.ENABLED), CONFIG.DEATH_LANDING_HEIGHT, CONFIG.SAFETY_NET_MS))

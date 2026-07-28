@@ -270,6 +270,9 @@ local function writeRuntimeTransaction(path, contents)
         )
     end
 
+    local revPath = path:gsub("runtime%.lua$", "runtime.rev")
+    writeFile(revPath, tostring(os.time()) .. "." .. tostring(math.random(1000, 9999)))
+
     return true, nil
 end
 
@@ -393,7 +396,11 @@ function Store.resetMod(modName)
     if existing == nil then return true, nil end
 
     local removed, removeError = os.remove(path)
-    if removed == true then return true, nil end
+    if removed == true then
+        local revPath = path:gsub("runtime%.lua$", "runtime.rev")
+        writeFile(revPath, tostring(os.time()) .. "." .. tostring(math.random(1000, 9999)))
+        return true, nil
+    end
     return false, "could not remove runtime.lua: " .. tostring(removeError)
 end
 

@@ -414,6 +414,66 @@ local function duplicateMenuEntries(src)
     if #results > 0 then log("dup[" .. tostring(src) .. "]: " .. table.concat(results, " | ")) end
 end
 
+local cachedQuestMenus = {}
+local cachedQuestItems = {}
+local cachedQuestRows  = {}
+local cachedQuestInfos = {}
+
+local function pruneValid(list)
+    local out = {}
+    for _, obj in ipairs(list) do
+        if isValid(obj) then out[#out + 1] = obj end
+    end
+    return out
+end
+
+local function getQuestMenus()
+    cachedQuestMenus = pruneValid(cachedQuestMenus)
+    if #cachedQuestMenus > 0 then return cachedQuestMenus end
+    local ok, list = pcall(FindAllOf, "WBP_Console_QuestMenu_C")
+    if ok and type(list) == "table" then cachedQuestMenus = list; return list end
+    return {}
+end
+
+local function getQuestItems()
+    cachedQuestItems = pruneValid(cachedQuestItems)
+    if #cachedQuestItems > 0 then return cachedQuestItems end
+    local ok, list = pcall(FindAllOf, "RODQuestMenuListViewItem")
+    if ok and type(list) == "table" then cachedQuestItems = list; return list end
+    return {}
+end
+
+local function getQuestRows()
+    cachedQuestRows = pruneValid(cachedQuestRows)
+    if #cachedQuestRows > 0 then return cachedQuestRows end
+    local ok, list = pcall(FindAllOf, "WBP_Console_ListItem_Quest_C")
+    if ok and type(list) == "table" then cachedQuestRows = list; return list end
+    return {}
+end
+
+local function getQuestInfos()
+    cachedQuestInfos = pruneValid(cachedQuestInfos)
+    if #cachedQuestInfos > 0 then return cachedQuestInfos end
+    local ok, list = pcall(FindAllOf, "WBP_Console_QuestMenu_Info_C")
+    if ok and type(list) == "table" then cachedQuestInfos = list; return list end
+    return {}
+end
+
+pcall(function()
+    NotifyOnNewObject("/Game/ROD/Widget/Console/Quest/WBP_Console_QuestMenu.WBP_Console_QuestMenu_C", function(obj)
+        if isValid(obj) then cachedQuestMenus[#cachedQuestMenus + 1] = obj end
+    end)
+    NotifyOnNewObject("/Script/ROD.RODQuestMenuListViewItem", function(obj)
+        if isValid(obj) then cachedQuestItems[#cachedQuestItems + 1] = obj end
+    end)
+    NotifyOnNewObject("/Game/ROD/Widget/Console/Quest/WBP_Console_ListItem_Quest.WBP_Console_ListItem_Quest_C", function(obj)
+        if isValid(obj) then cachedQuestRows[#cachedQuestRows + 1] = obj end
+    end)
+    NotifyOnNewObject("/Game/ROD/Widget/Console/Quest/WBP_Console_QuestMenu_Info.WBP_Console_QuestMenu_Info_C", function(obj)
+        if isValid(obj) then cachedQuestInfos[#cachedQuestInfos + 1] = obj end
+    end)
+end)
+
 local function renameQuestParams(src)
     local names = CONFIG.FREE_ROAM_QUESTS
     if next(names) == nil then return end
@@ -432,7 +492,7 @@ local function renameQuestParams(src)
     end
     step("rename[" .. tostring(src) .. "] begin")
     pcall(function()
-        local menus = FindAllOf("WBP_Console_QuestMenu_C")
+        local menus = getQuestMenus()
         step("menus: " .. tostring(menus and #menus or 0))
         for mi, menu in ipairs(menus or {}) do
             if not isValid(menu) then goto nextMenu end
@@ -454,7 +514,7 @@ local function renameQuestParams(src)
     end)
     -- each row's bound item object (what rows re-stamp from)
     pcall(function()
-        local items = FindAllOf("RODQuestMenuListViewItem")
+        local items = getQuestItems()
         step("items: " .. tostring(items and #items or 0))
         for ii, item in ipairs(items or {}) do
             step("item [" .. ii .. "]")
@@ -468,7 +528,7 @@ local function renameQuestParams(src)
     local rowsSet = 0
     if next(originals) ~= nil then
         pcall(function()
-            local rows = FindAllOf("WBP_Console_ListItem_Quest_C")
+            local rows = getQuestRows()
             step("rows: " .. tostring(rows and #rows or 0))
             for ri, row in ipairs(rows or {}) do
                 step("row [" .. ri .. "]")
@@ -499,7 +559,7 @@ local function infoPanelSweep(src)
     local names = CONFIG.FREE_ROAM_QUESTS
     if next(names) == nil then return end
     pcall(function()
-        local infos = FindAllOf("WBP_Console_QuestMenu_Info_C")
+        local infos = getQuestInfos()
         local seen, stamped = {}, 0
         for _, info in ipairs(infos or {}) do
             pcall(function()

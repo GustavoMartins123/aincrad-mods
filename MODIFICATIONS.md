@@ -109,6 +109,8 @@ the original Nexus archive:
 The gameplay mods, ModMenu, and `ModMenuBridge.lua` were added around the
 unchanged loader. They are not modifications to the UE4SS binaries.
 
+`ModMenuBridge.lua` and `ModMenu/store.lua` include a fast-path settings revision system (`runtime.rev`), eliminating continuous I/O and Lua parsing on idle polling ticks by inspecting a lightweight revision token before reading full configuration tables.
+
 ## Terrain Runner SpeedMod
 
 **Origin:** [Terrain Runner SpeedMod on Nexus
@@ -813,16 +815,26 @@ work, and emits one concise world fault. It is not retried every poll cycle.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v0.4.0
+**Current script version:** v0.5.1
 
 ### Added
 
 - A native-styled "Fast Travel" row in the Start Menu, injected with the game's
   own `WBP_Console_MainMenu_MenuIcon_C` wrapper so the rail keeps its focus
   order and other mods' injected rows stay reachable.
-- The game's ordinary `WBP_Map_C` screen as the destination picker. Checkpoint,
-  teleport gate, safe-area and hero/pillar/instant pin icons are eligible;
-  confirming a selected one teleports through the hero's native server RPC.
+- The game's own `WBP_Map_FastTravel_C` destination picker as the target screen,
+  opened as a Start Menu submenu with `UWidgetBlueprintLibrary::Create` followed
+  by `URODWidgetBPFunctionLibrary`'s `DebugOpenMenu` + `OpenMenu`, with
+  `ParentMenu` and `MenuKind` stamped on the widget beforehand.
+- A read-back of `URODWidgetData::MenuWidgetMap` before opening, logging which
+  widget class the menu system maps that kind to on this build.
+- Observation hooks on the fast travel screen's own input path
+  (`OnDetailMapTermialIconClickDelegate`, `OnInputClickEvent`,
+  `EndOpenAnimEvent`) and on `ARODPlayerState::ServerDecideFastTravel`. They
+  record and consume nothing. Unlike the mod's functional hooks they are
+  registered softly: losing one costs a diagnostic, not the feature.
+- A `MAP_TARGET` setting in `config.lua` selecting `"fasttravel"` (default) or
+  `"map"`, keeping the reference-map path available for diagnosis.
 - Observation of `ARODAvatarCharacter::ActivateFPCameraMenuAbility`, recording
   the event tag, menu key and target for every first-person-camera menu the game
   opens. A `fasttravel menukeys` console report prints what has been observed
@@ -832,15 +844,40 @@ work, and emits one concise world fault. It is not retried every poll cycle.
 
 ### Changed
 
-- The map is now opened through
+- The Fast Travel row now opens `WBP_Map_FastTravel_C` instead of `WBP_Map_C`.
+- The reference-map path is now opened through
   `ARODAvatarCharacter::ActivateFPCameraMenuAbility(EventTag, MenuKey, Target)`
   instead of
   `URODAbilitySystemComponent::TryActivateAbilityWithPayloadFromClass` with a
   blank `FGameplayEventData`.
 - `GA_AvatarMenu_Map_C`'s `CurrentEventData` is no longer read as a precondition.
   Nothing consumed it once the payload stopped being the activation vehicle.
+- Open verification scans for both map widgets rather than one, so a run that
+  lands on the wrong screen reports `MAP SCREEN MISMATCH` instead of reporting
+  that nothing opened.
+- The Start Menu is no longer closed before the fast travel screen opens. The
+  screen is a submenu of it, which is what makes Back return there.
+  `EndMainMenu(true)` and the wait on `GA_AvatarMenu_Main_C` now belong only to
+  the `MAP_TARGET = "map"` path.
 
 ### Fixed
+
+- Fixed the Fast Travel row opening the wrong screen. `WBP_Map_C`
+  (`URODMapMenuWidgetBase`) is the reference map headed "Mapa / Detalhes da Área
+  de Missão"; it draws pins and markers but exposes no terminal-selection
+  delegate. The destination picker is `WBP_Map_FastTravel_C`
+  (`URODFastTravelMenuWidget`), which carries
+  `OnDetailMapTermialIconClickDelegate` and is what a terminal opens. Natively
+  that screen comes from `GA_AvatarMenu_AccessTerminal_C`, whose `Target` is a
+  real terminal actor; constructing the widget directly reaches the same screen,
+  so no terminal is impersonated.
+- Fixed the fast travel screen never being constructed.
+  `ARODPlayerState::OpenMenu(EMenuKind)` is not the local UI entry point: with
+  the kind confirmed correct in the same run — `MENU WIDGET MAP | EMenuKind 66 ->
+  WBP_Map_FastTravel_C` — the call returned and the verification found "0
+  presented of 0 constructed". The open now uses the `Create` +
+  `DebugOpenMenu` + `OpenMenu` sequence already measured to work for the
+  Equipment screen.
 
 - Fixed the map never appearing. `GA_AvatarMenu_Map_C` derives from
   `GA_AvatarMenu_FirstPersonCamera_C`, which resolves its opening level sequence
@@ -855,15 +892,25 @@ work, and emits one concise world fault. It is not retried every poll cycle.
 
 ### Known limitations
 
+- **The teleport half is not yet adapted to the new screen.** The selection and
+  confirm pipeline — `resolveSelectedMapIcon`, the `UpdateIcon` destination
+  cache, and the `MapDecidedEvent` / `MapClickEvent` interception — is built on
+  `URODMapMenuWidgetBase` members that `URODFastTravelMenuWidget` does not share.
+  Against the fast travel screen those hooks stay inert by construction, and the
+  screen's own native behaviour runs untouched. Whether that native behaviour
+  already teleports on its own is the open question: `WBP_Map_FastTravel_C`
+  carries a `NotTeleportMessageWindowText` and the player state reports
+  `FastTravelStatus=Disable` away from a terminal, so it may well refuse. The
+  observation hooks answer it in one session — a `FT MAP | native
+  ServerDecideFastTravel` line means the game does it all; a terminal click with
+  no such line means the mod has to.
 - The menu key sent to `ActivateFPCameraMenuAbility` is resolved rather than
   configured: the ability's own `LevelSequenceMap` keys first, then keys observed
-  from the game's own menu activations, then `MAP_MENU_KEY`. Which source wins on
-  this build is not yet measured — the first run that opens the Start Menu logs
-  `NATIVE FP MENU`, and a failed open logs `MAP ABILITY STATE` with the ability's
-  `CurrentMenuKey` read back. Those two lines decide it.
-- Teleporting uses `ServerDebugTeleportGimmick(FVector)` with the icon's native
-  map position. It is not the native `ServerDecideFastTravel(ID)` transaction, so
-  no `FastTravelStatus` is written and no terminal is impersonated.
+  from the game's own menu activations, then `MAP_MENU_KEY`. This affects only
+  `MAP_TARGET = "map"`.
+- Teleporting, where the mod performs it, uses `ServerDebugTeleportGimmick(FVector)`
+  with the icon's native map position. It is not the native
+  `ServerDecideFastTravel(ID)` transaction, so no `FastTravelStatus` is written.
 
 ## New Experience Notifications component
 

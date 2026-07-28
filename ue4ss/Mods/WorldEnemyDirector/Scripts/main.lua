@@ -205,7 +205,10 @@ local function validateSettings(base, runtime)
     return merged, nil
 end
 
+local RUNTIME_REV_PATH = SCRIPT_DIR .. "runtime.rev"
+
 local function loadSettings()
+    local revContents, _ = readFile(RUNTIME_REV_PATH, false)
     local transactionContents, transactionReadError =
         readFile(RUNTIME_LOCK_PATH, false)
     if transactionReadError ~= nil then
@@ -226,6 +229,11 @@ local function loadSettings()
         return nil, nil, "cannot read runtime.lua: " .. runtimeReadError
     end
 
+    local digest = tostring(revContents or "") .. "\0" .. configContents .. "\0" .. (runtimeContents or "")
+    if digest == configDigest and configHealthy then
+        return nil, digest, nil, false
+    end
+
     local base, baseError = evaluateTable(configContents, CONFIG_PATH)
     if base == nil then return nil, nil, baseError end
 
@@ -238,7 +246,6 @@ local function loadSettings()
 
     local merged, validationError = validateSettings(base, runtime)
     if merged == nil then return nil, nil, validationError end
-    local digest = configContents .. "\0" .. (runtimeContents or "")
     return merged, digest, nil, false
 end
 
@@ -2308,6 +2315,7 @@ local function checkSettings(force)
 
     local settings, digest, settingsError, transactionInProgress = loadSettings()
     if transactionInProgress then return end
+    if digest == configDigest and configHealthy then return end
     if settings == nil then
         local failureDigest = "ERROR:" .. tostring(settingsError)
         if configDigest ~= failureDigest then
@@ -2318,7 +2326,6 @@ local function checkSettings(force)
         configHealthy = false
         return
     end
-    if digest == configDigest and configHealthy then return end
     applyNewSettings(settings, digest)
 end
 
@@ -2335,14 +2342,20 @@ end
 -- FindFirstOf walks the global object array. Doing that twice a tick was enough
 -- to be felt as stutter, so the hero is resolved once and kept until it stops
 -- being valid, which is also when travel invalidates it.
-local function resolveHeroLocation()
+local function resolveHeroObject()
     if not isValid(cachedHero) then
         cachedHero = nil
         local ok, hero = pcall(FindFirstOf, "RODWorldHeroCharacter")
         if not ok or not isValid(hero) then return nil end
         cachedHero = hero
     end
-    return actorLocation(cachedHero)
+    return cachedHero
+end
+
+local function resolveHeroLocation()
+    local hero = resolveHeroObject()
+    if not isValid(hero) then return nil end
+    return actorLocation(hero)
 end
 
 local function recycleDistantExtras()
@@ -2404,7 +2417,7 @@ local function tick(stepMs)
     checkSettings(CONFIG == nil)
 
     if worldPaused then
-        local hero = resolveHero()
+        local hero = resolveHeroObject()
         local controller = resolveLocalController()
         local heroReady = isValid(hero)
         local clockPassed = (resumeAtMs ~= nil and elapsedMs >= resumeAtMs)
@@ -2450,10 +2463,13 @@ local function tick(stepMs)
         if not requestWorldScan() then return end
     end
 
+    local discoveryStartTime = os.clock()
+    local MAX_DISCOVERY_SEC = 0.002
     for _ = 1, MAX_DISCOVERY_PER_TICK do
         local queued = table.remove(objectQueue, 1)
         if queued == nil then break end
         registerEnemy(queued.object, queued.reused)
+        if os.clock() - discoveryStartTime > MAX_DISCOVERY_SEC then break end
     end
     if discoveryBatch
         and #objectQueue == 0

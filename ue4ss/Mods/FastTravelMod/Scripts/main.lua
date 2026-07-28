@@ -1,4 +1,28 @@
--- FastTravelMod v0.4.0
+-- FastTravelMod v0.5.1
+--
+-- TWO MAPS, ONE OF THEM WRONG
+--
+-- The game has two map screens and they are not interchangeable:
+--
+--   WBP_Map_C            : URODMapMenuWidgetBase    -- the reference map, headed
+--                          "Mapa / Detalhes da Area de Missao". Opened by the
+--                          GA_AvatarMenu_Map_C first-person-camera ability.
+--   WBP_Map_FastTravel_C : URODFastTravelMenuWidget -- the destination picker,
+--                          the screen a terminal opens. EMenuKind::FastTravelMenu
+--                          = 66, and it carries OnDetailMapTermialIconClickDelegate.
+--
+-- v0.4.0 opened the first one. It is the wrong screen: it draws pins and markers
+-- but has no terminal-selection delegate at all.
+--
+-- Natively the second is opened by GA_AvatarMenu_AccessTerminal_C, which needs a
+-- real terminal actor as its Target. This mod instead constructs the widget and
+-- hands it to the menu manager, so no terminal is impersonated.
+--
+-- ARODPlayerState::OpenMenu(66) looked like the one-call answer and is not: the
+-- menu kind resolved correctly (MENU WIDGET MAP confirmed EMenuKind 66 ->
+-- WBP_Map_FastTravel_C) and the call returned without constructing anything.
+-- The open now uses the Create + DebugOpenMenu + OpenMenu sequence that
+-- FieldEquipmentMod already relies on for its Equipment screen.
 --
 -- Adds a native-styled Fast Travel row to Echoes of Aincrad's Start Menu and
 -- opens the game's ordinary WBP_Map screen in teleport mode. Confirming an
@@ -43,7 +67,7 @@
 -- is unavailable, the operation stops and reports the error.
 
 local MOD_NAME = "FastTravelMod"
-local MOD_VERSION = "v0.4.0"
+local MOD_VERSION = "v0.5.1"
 local SUPPORTED_SDK = "Echoes of Aincrad 1.0.3"
 
 local MAIN_MENU_ICON_CLASS =
@@ -53,9 +77,23 @@ local MAIN_MENU_LIST_CLASS =
 local MAIN_MENU_CLASS_FRAGMENT = "WBP_Console_MainMenu_C"
 local MAIN_MENU_LIST_FRAGMENT = "WBP_Console_MainMenu_List_C"
 local MENU_ICON_FRAGMENT = "WBP_Console_MainMenu_MenuIcon_C"
-local MAP_WIDGET_FRAGMENT = "WBP_Map_C"
+-- Two different screens, and only one of them is the fast travel one.
+--   WBP_Map_C            : URODMapMenuWidgetBase    -- the reference map,
+--                          titled "Mapa / Detalhes da Area de Missao"
+--   WBP_Map_FastTravel_C : URODFastTravelMenuWidget -- the destination picker,
+--                          the screen a terminal opens
+local MAP_MENU_WIDGET_FRAGMENT = "WBP_Map_C"
+local FAST_TRAVEL_WIDGET_FRAGMENT = "WBP_Map_FastTravel_C"
+-- Read back from URODWidgetData::MenuWidgetMap for EMenuKind::FastTravelMenu on
+-- this build, so this path is confirmed rather than assumed.
+local FAST_TRAVEL_WIDGET_CLASS =
+    "/Game/ROD/Widget/Cockpit/Minimap/WBP_Map_FastTravel.WBP_Map_FastTravel_C"
 local MAIN_MENU_ABILITY_CLASS = "GA_AvatarMenu_Main_C"
 local MAP_MENU_ABILITY_CLASS = "GA_AvatarMenu_Map_C"
+
+-- EMenuKind::FastTravelMenu. The reference map is EMenuKind::MapMenu = 31, but
+-- it is opened through its gameplay ability rather than by kind.
+local MENU_KIND_FAST_TRAVEL_MENU = 66
 
 local FAST_TRAVEL_STATUS_DISABLE = 0
 local FAST_TRAVEL_STATUS_CANCEL = 1
@@ -117,6 +155,7 @@ local CONFIG = {
     ENABLED = true,
     DEBUG_LOGS = false,
     MAP_MENU_KEY = "",
+    MAP_TARGET = "fasttravel",
 }
 
 local runtimeHealthy = true
@@ -178,6 +217,19 @@ local function nameContains(object, fragment)
         and string.find(name, fragment, 1, true) ~= nil
 end
 
+-- Which of the two map screens this widget is, or nil. "WBP_Map_C" is not a
+-- substring of "WBP_Map_FastTravel_C", so these never answer for each other.
+local function mapScreenFragment(widget)
+    if not isValid(widget) then return nil end
+    if nameContains(widget, FAST_TRAVEL_WIDGET_FRAGMENT) then
+        return FAST_TRAVEL_WIDGET_FRAGMENT
+    end
+    if nameContains(widget, MAP_MENU_WIDGET_FRAGMENT) then
+        return MAP_MENU_WIDGET_FRAGMENT
+    end
+    return nil
+end
+
 local function hookValue(parameter)
     if parameter == nil then
         error("hook parameter is unavailable")
@@ -224,6 +276,7 @@ local function applySettings(settings)
     -- learned from the game, and the in-game menu has no text field.
     local stringKeys = {
         MAP_MENU_KEY = true,
+        MAP_TARGET = true,
     }
     for key in pairs(settings) do
         if booleanKeys[key] ~= true and stringKeys[key] ~= true then
@@ -240,9 +293,15 @@ local function applySettings(settings)
             error(key .. " must be a string")
         end
     end
+    local mapTarget = settings.MAP_TARGET or "fasttravel"
+    if mapTarget ~= "fasttravel" and mapTarget ~= "map" then
+        error("MAP_TARGET must be \"fasttravel\" or \"map\"")
+    end
+
     CONFIG.ENABLED = settings.ENABLED
     CONFIG.DEBUG_LOGS = settings.DEBUG_LOGS
     CONFIG.MAP_MENU_KEY = settings.MAP_MENU_KEY or ""
+    CONFIG.MAP_TARGET = mapTarget
     runtimeHealthy = true
 end
 
@@ -1448,8 +1507,7 @@ local function consumeButton(buttonParameter)
 end
 
 local function isPresentedTeleportMapWidget(widget)
-    if not isValid(widget)
-        or not nameContains(widget, MAP_WIDGET_FRAGMENT) then
+    if mapScreenFragment(widget) == nil then
         return false
     end
 
@@ -1536,36 +1594,55 @@ end
 
 local function verifyTeleportMapOpen(serial)
     if serial ~= openSerial then return end
-    local ok, widgets = pcall(function()
-        return FindAllOf(MAP_WIDGET_FRAGMENT)
-    end)
-    if not ok or type(widgets) ~= "table" then
-        logMapAbilityState("no widget")
-        failPendingOpen(
-            serial,
-            "WBP_Map_C was not constructed")
+
+    -- Both screens are scanned, not just the wanted one, so a run that opens
+    -- the reference map by mistake says so instead of reporting nothing at all.
+    local presented = {}
+    local constructed = 0
+    for _, fragment in ipairs({
+        FAST_TRAVEL_WIDGET_FRAGMENT, MAP_MENU_WIDGET_FRAGMENT
+    }) do
+        local ok, widgets = pcall(function()
+            return FindAllOf(fragment)
+        end)
+        if ok and type(widgets) == "table" then
+            for _, widget in ipairs(widgets) do
+                constructed = constructed + 1
+                if isPresentedTeleportMapWidget(widget) then
+                    presented[#presented + 1] = widget
+                end
+            end
+        end
+    end
+
+    if #presented ~= 1 then
+        logMapAbilityState("map screen not presented")
+        failPendingOpen(serial, string.format(
+            "expected one presented map screen, found %d presented of %d " ..
+                "constructed (%s / %s)",
+            #presented,
+            constructed,
+            FAST_TRAVEL_WIDGET_FRAGMENT,
+            MAP_MENU_WIDGET_FRAGMENT))
         return
     end
 
-    local presented = {}
-    for _, widget in ipairs(widgets) do
-        if isPresentedTeleportMapWidget(widget) then
-            presented[#presented + 1] = widget
-        end
+    local fragment = mapScreenFragment(presented[1])
+    if fragment ~= FAST_TRAVEL_WIDGET_FRAGMENT then
+        log(string.format(
+            "MAP SCREEN MISMATCH | opened %s, wanted %s",
+            tostring(fragment),
+            FAST_TRAVEL_WIDGET_FRAGMENT))
     end
-    if #presented ~= 1 then
-        logMapAbilityState("widget not presented")
-        failPendingOpen(serial, string.format(
-            "expected one presented %s, found %d",
-            MAP_WIDGET_FRAGMENT, #presented))
-        return
-    end
+
     openBusy = false
     pendingMapAbility = nil
     pendingMapContract = nil
     teleportMapWidgetKey = objectName(presented[1])
     teleportMapModeActive = true
-    log("teleport map presented; select an eligible icon and confirm")
+    log(string.format(
+        "map screen presented | %s | select an eligible icon and confirm",
+        tostring(fragment)))
 end
 
 local function activateTeleportMapAbility(serial, contract)
@@ -1634,6 +1711,140 @@ local function activateTeleportMapAbility(serial, contract)
     end
 end
 
+-- URODWidgetData::MenuWidgetMap is the table the menu system itself uses to turn
+-- an EMenuKind into a widget class. Reading it back is the difference between
+-- "66 should be the fast travel map" and knowing it on this build.
+local function reportMenuWidgetClass(menuKind)
+    local reported = "<unresolved>"
+    local ok, readError = pcall(function()
+        local widgetData = FindFirstOf("RODWidgetData")
+        if not isValid(widgetData) then
+            error("no loaded RODWidgetData")
+        end
+        local menuWidgetMap = widgetData.MenuWidgetMap
+        if menuWidgetMap == nil then
+            error("MenuWidgetMap is unavailable")
+        end
+        menuWidgetMap:ForEach(function(key, value)
+            if tonumber(key:get()) == menuKind then
+                local widgetClass = value:get()
+                if isValid(widgetClass) then
+                    reported = tostring(objectName(widgetClass))
+                end
+            end
+        end)
+    end)
+    if not ok then
+        log(string.format(
+            "MENU WIDGET MAP | EMenuKind %d unreadable: %s",
+            menuKind, tostring(readError)))
+        return nil
+    end
+    log(string.format(
+        "MENU WIDGET MAP | EMenuKind %d -> %s", menuKind, reported))
+    return reported
+end
+
+-- The fast travel screen is a plain menu, not a first-person-camera ability:
+-- natively a terminal opens it through GA_AvatarMenu_AccessTerminal_C, which
+-- needs a real terminal actor as its Target.
+--
+-- ARODPlayerState::OpenMenu(66) was tried first and does nothing observable:
+-- the log showed the kind resolving correctly and then "found 0 presented of 0
+-- constructed". It is not the local UI entry point.
+--
+-- What is measured to work on this build is the pair FieldEquipmentMod uses for
+-- its Equipment screen: construct the widget with UWidgetBlueprintLibrary::Create,
+-- stamp ParentMenu and MenuKind on it before the menu manager ever sees it, then
+-- hand it to RODWidgetBPFunctionLibrary's DebugOpenMenu + OpenMenu. ParentMenu is
+-- also what makes Back return to the Start Menu, so the Start Menu is left open
+-- instead of being torn down first.
+local function openFastTravelMenu(serial)
+    if serial ~= openSerial then return end
+
+    local controller, controllerError = resolveLocalController()
+    if controller == nil then
+        failPendingOpen(serial, tostring(controllerError))
+        return
+    end
+    local umgLibrary, umgError = resolveUmgLibrary()
+    if umgLibrary == nil then
+        failPendingOpen(serial, tostring(umgError))
+        return
+    end
+    local rodLibrary, rodError = resolveRodWidgetLibrary()
+    if rodLibrary == nil then
+        failPendingOpen(serial, tostring(rodError))
+        return
+    end
+
+    reportMenuWidgetClass(MENU_KIND_FAST_TRAVEL_MENU)
+
+    local widgetClass = StaticFindObject(FAST_TRAVEL_WIDGET_CLASS)
+    if not isValid(widgetClass) then
+        failPendingOpen(
+            serial,
+            FAST_TRAVEL_WIDGET_CLASS .. " is not loaded")
+        return
+    end
+
+    local parentMenu = nil
+    if activeContext ~= nil and isValid(activeContext.mainMenu) then
+        parentMenu = activeContext.mainMenu
+    end
+
+    -- Step-logged before the native calls: an access violation inside them takes
+    -- the process down with no Lua error left to catch.
+    log(string.format(
+        "MAP OPEN | Create + DebugOpenMenu + OpenMenu | kind=%d | parent=%s",
+        MENU_KIND_FAST_TRAVEL_MENU,
+        tostring(objectName(parentMenu))))
+
+    local widget = nil
+    local openedOk, openError = pcall(function()
+        widget = umgLibrary:Create(controller, widgetClass, controller)
+        if not isValid(widget) then
+            error("fast travel widget creation returned null")
+        end
+        if parentMenu ~= nil then
+            widget.ParentMenu = parentMenu
+        end
+        widget.MenuKind = MENU_KIND_FAST_TRAVEL_MENU
+
+        local handle = rodLibrary:DebugOpenMenu(controller, widget)
+        if handle == nil then
+            error("DebugOpenMenu returned no fast travel handle")
+        end
+        rodLibrary:OpenMenu(controller, handle)
+    end)
+    if not openedOk then
+        failPendingOpen(
+            serial,
+            "fast travel menu open failed: " .. tostring(openError))
+        return
+    end
+
+    log("fast travel widget constructed | " .. tostring(objectName(widget)))
+
+    local scheduled, scheduleError = pcall(function()
+        ExecuteWithDelay(
+            OPEN_VERIFICATION_DELAY_MS,
+            function()
+                ExecuteInGameThread(function()
+                    verifyTeleportMapOpen(serial)
+                end)
+            end)
+    end)
+    if not scheduled then
+        failPendingOpen(
+            serial,
+            "map verification scheduling failed: " ..
+                tostring(scheduleError))
+    end
+end
+
+-- Only reached with MAP_TARGET = "map". The fast travel path never closes the
+-- Start Menu, so it never waits on the Start Menu's ability.
 local function waitForMainMenuAbilityEnd(
     serial, contract, elapsedMs
 )
@@ -1726,6 +1937,16 @@ local function requestFastTravelOpen(source)
         return
     end
 
+    -- The fast travel screen opens as a submenu of the Start Menu, the way
+    -- Equipment does. Nothing is torn down, so there is no ability to wait on.
+    if CONFIG.MAP_TARGET ~= "map" then
+        teleportMapModeActive = true
+        log("opening fast travel map as a Start Menu submenu | source=" ..
+            tostring(source))
+        openFastTravelMenu(serial)
+        return
+    end
+
     local abilityContract, abilityContractError =
         resolveMapAbilityContract()
     if abilityContract == nil then
@@ -1786,8 +2007,9 @@ end
 
 local function resolveSelectedMapIcon(mapWidget)
     if not isValid(mapWidget)
-        or not nameContains(mapWidget, MAP_WIDGET_FRAGMENT) then
-        error("exact WBP_Map_C teleport map is unavailable")
+        or not nameContains(mapWidget, MAP_MENU_WIDGET_FRAGMENT) then
+        error("exact " .. MAP_MENU_WIDGET_FRAGMENT ..
+            " reference map is unavailable")
     end
 
     local mapItemWidget = nil
@@ -1959,7 +2181,7 @@ local function interceptMapTeleport(
 
     local mapWidget = hookValue(mapParameter)
     if not isValid(mapWidget)
-        or not nameContains(mapWidget, MAP_WIDGET_FRAGMENT) then
+        or not nameContains(mapWidget, MAP_MENU_WIDGET_FRAGMENT) then
         return
     end
 
@@ -1999,7 +2221,7 @@ local function cacheMapIconDestination(
 
     local mapWidget = hookValue(mapParameter)
     if not isValid(mapWidget)
-        or not nameContains(mapWidget, MAP_WIDGET_FRAGMENT) then
+        or not nameContains(mapWidget, MAP_MENU_WIDGET_FRAGMENT) then
         return
     end
 
@@ -2140,6 +2362,21 @@ local function requireHook(path, callback, postCallback)
     if not ok then
         error("[" .. MOD_NAME .. "] required hook unavailable: " ..
             path .. " / " .. tostring(hookError))
+    end
+end
+
+-- For observation only. These hooks exist to describe the native fast travel
+-- flow in the log; losing one costs a diagnostic, not the feature, so it must
+-- never take the mod down the way requireHook does.
+local function optionalHook(path, callback)
+    local ok, hookError = pcall(function()
+        RegisterHook(path, function(...)
+            pcall(callback, ...)
+        end)
+    end)
+    if not ok then
+        log("OBSERVATION HOOK UNAVAILABLE | " .. path ..
+            " | " .. tostring(hookError))
     end
 end
 
@@ -2306,6 +2543,54 @@ requireHook(
     end
 )
 
+-- The fast travel screen's own input path. Nothing here consumes or redirects
+-- anything: the open question is whether URODFastTravelMenuWidget already
+-- performs the teleport by itself once a terminal icon is confirmed, and these
+-- three lines plus ServerDecideFastTravel answer it from one session.
+optionalHook(
+    "/Script/ROD.RODFastTravelMenuWidget:OnDetailMapTermialIconClickDelegate",
+    function(selfParameter, widgetParameter, buttonParameter, typeParameter)
+        local clicked = hookValue(widgetParameter)
+        log(string.format(
+            "FT MAP | terminal icon click | icon=%s | button=%s | type=%s",
+            tostring(objectName(clicked)),
+            tostring(tonumber(hookValue(buttonParameter))),
+            tostring(tonumber(hookValue(typeParameter)))))
+        scheduleNativeTravelState("fast travel icon click", 250)
+    end
+)
+
+optionalHook(
+    "/Script/ROD.RODFastTravelMenuWidget:OnInputClickEvent",
+    function(selfParameter, widgetParameter, buttonParameter, typeParameter)
+        dbg(string.format(
+            "FT MAP | input click | widget=%s | button=%s | type=%s",
+            tostring(objectName(hookValue(widgetParameter))),
+            tostring(tonumber(hookValue(buttonParameter))),
+            tostring(tonumber(hookValue(typeParameter)))))
+    end
+)
+
+optionalHook(
+    "/Script/ROD.RODFastTravelMenuWidget:EndOpenAnimEvent",
+    function(selfParameter)
+        log("FT MAP | open animation finished | widget=" ..
+            tostring(objectName(hookValue(selfParameter))))
+    end
+)
+
+optionalHook(
+    "/Script/ROD.RODPlayerState:ServerDecideFastTravel",
+    function(selfParameter, idParameter)
+        local id = "<unreadable>"
+        pcall(function()
+            id = exactFNameString(
+                hookValue(idParameter), "ServerDecideFastTravel ID")
+        end)
+        log("FT MAP | native ServerDecideFastTravel | ID=" .. id)
+    end
+)
+
 requireHook(
     "/Script/ROD.RODInGamePlayerController:OpenDirectingMapMenu",
     guardedHookCallback("directing map open", function(selfParameter)
@@ -2401,8 +2686,7 @@ requireHook(
     "/Script/ROD.RODMenuWidgetBase:ClosedMenu",
     guardedHookCallback("ClosedMenu", function(selfParameter)
         local widget = hookValue(selfParameter)
-        if isValid(widget)
-            and nameContains(widget, MAP_WIDGET_FRAGMENT) then
+        if mapScreenFragment(widget) ~= nil then
             teleportMapWidgetKey = nil
             openBusy = false
             teleportMapModeActive = false
@@ -2416,22 +2700,27 @@ requireHook(
     end)
 )
 
-local notifyTeleportMapOk, notifyTeleportMapError = pcall(function()
-    NotifyOnNewObject(
-        "/Script/ROD.RODMapMenuWidgetBase",
-        function(widget)
-            if isValid(widget)
-                and nameContains(widget, MAP_WIDGET_FRAGMENT) then
+for _, notification in ipairs({
+    { class = "/Script/ROD.RODMapMenuWidgetBase",
+      label = "reference map" },
+    { class = "/Script/ROD.RODFastTravelMenuWidget",
+      label = "fast travel map" },
+}) do
+    local notifyOk, notifyError = pcall(function()
+        NotifyOnNewObject(notification.class, function(widget)
+            local fragment = mapScreenFragment(widget)
+            if fragment ~= nil then
                 teleportMapWidgetKey = objectName(widget)
-                dbg("constructed " .. tostring(teleportMapWidgetKey))
+                log("MAP SCREEN CONSTRUCTED | " .. notification.label ..
+                    " | " .. tostring(teleportMapWidgetKey))
             end
-        end
-    )
-end)
-if not notifyTeleportMapOk then
-    error("[" .. MOD_NAME ..
-        "] canonical teleport map widget notification failed: " ..
-        tostring(notifyTeleportMapError))
+        end)
+    end)
+    if not notifyOk then
+        error("[" .. MOD_NAME ..
+            "] canonical " .. notification.label ..
+            " widget notification failed: " .. tostring(notifyError))
+    end
 end
 
 local notifyMainMenuOk, notifyMainMenuError = pcall(function()
@@ -2560,10 +2849,11 @@ local commandOk, commandError = pcall(function()
 
             if subcommand == "status" then
                 reply(string.format(
-                    "%s %s | sdk=%s | enabled=%s | healthy=%s | opening=%s | teleportMode=%s | teleporting=%s | widget=%s | lastNativeFastTravel=%s | lastAccessible=%s | lastAccessingTerminal=%s | lastGimmickId=%s",
+                    "%s %s | sdk=%s | target=%s | enabled=%s | healthy=%s | opening=%s | teleportMode=%s | teleporting=%s | widget=%s | lastNativeFastTravel=%s | lastAccessible=%s | lastAccessingTerminal=%s | lastGimmickId=%s",
                     MOD_NAME,
                     MOD_VERSION,
                     SUPPORTED_SDK,
+                    tostring(CONFIG.MAP_TARGET),
                     tostring(CONFIG.ENABLED),
                     tostring(runtimeHealthy),
                     tostring(openBusy),
