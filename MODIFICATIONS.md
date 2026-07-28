@@ -815,7 +815,7 @@ work, and emits one concise world fault. It is not retried every poll cycle.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v0.7.0
+**Current script version:** v0.9.1
 
 ### Added
 
@@ -853,7 +853,14 @@ work, and emits one concise world fault. It is not retried every poll cycle.
 
 ### Changed
 
-- The Fast Travel row now opens `WBP_Map_FastTravel_C` instead of `WBP_Map_C`.
+- The Fast Travel row opens `WBP_Map_FastTravel_C`, the game's own fast travel
+  screen, where confirming a checkpoint is measured working end to end. It
+  declares its own scope in its banner — "Escolha para qual Área Segura ou
+  Terminal de Teletransporte você vai" — so map pins are drawn on it but cannot
+  be confirmed; `fasttravel pin <index>` serves those. `MAP_TARGET = "map"` opens
+  the reference map instead, whose cursor stops on every icon and is therefore
+  the only screen where a pin could be confirmed, at the cost of an unproven
+  confirm interception on a screen that is not the fast travel UI.
 - The reference-map path is now opened through
   `ARODAvatarCharacter::ActivateFPCameraMenuAbility(EventTag, MenuKey, Target)`
   instead of
@@ -880,20 +887,33 @@ work, and emits one concise world fault. It is not retried every poll cycle.
   that screen comes from `GA_AvatarMenu_AccessTerminal_C`, whose `Target` is a
   real terminal actor; constructing the widget directly reaches the same screen,
   so no terminal is impersonated.
-- Fixed the teleport not moving anything.
-  `ARODAvatarCharacter::ServerDebugTeleportGimmick(FVector)` was this component's
-  documented teleport and it does nothing observable: a complete `MOD TELEPORT`
-  line carrying a real `WarpOutTransforms[Hero1]` position was followed by no
-  movement. `ARODGameState` holds both a `DebugTeleportPos` field and its own
-  `ServerDebugTeleportGimmick`, so the avatar call appears to park a position for
-  a later gimmick warp rather than perform one. Movement now goes through
-  `ARODInGamePlayerController::ServerDebugTeleport(FVector)`, with
-  `AActor::K2_TeleportTo` as the fallback, and the hero's location is read back
-  afterwards so the log states which one actually moved it.
+- Fixed the teleport not moving anything. Two ROD debug teleports were tried in
+  the running game and neither moves the hero:
+  `ARODAvatarCharacter::ServerDebugTeleportGimmick(FVector)`, this component's
+  originally documented teleport, and
+  `ARODInGamePlayerController::ServerDebugTeleport(FVector)` — the latter
+  measured as `ServerDebugTeleport called=true` followed half a second later by
+  the hero still 23703 cm from the target. `ARODGameState` holds both a
+  `DebugTeleportPos` field and its own `ServerDebugTeleportGimmick`, so those
+  calls appear to park a position for a later gimmick warp rather than perform
+  one. Movement now uses `AActor::K2_TeleportTo`, which lands the hero on the
+  target (read back at 0 cm). Both dead ends are recorded in the source so they
+  are not tried again. Arrival is still verified from the world, since a teleport
+  into unstreamed World Partition cells remains possible.
+- Fixed the Fast Travel row appearing in town, where it can only fail. The row is
+  no longer injected when the current world holds no accessible gimmick carrying
+  an ID, which is the real question and hardcodes no map name. It is re-evaluated
+  on every Start Menu construction, so moving between town and a floor needs no
+  transition tracking, and the count is reported as `FAST TRAVEL AVAILABILITY`.
 - Fixed the town map producing three failed lookups per confirm. There the screen
   decides `ID=None`, because that world's `RODAccessibleGimmicks` holds two
   gimmicks of its own rather than the floor's terminals. It is now refused once,
   by name, instead of being treated as a missing terminal.
+- Fixed the pin census never running.
+  `ARODInGamePlayerController::UniqueIdMapIconMap` cannot be read from Lua: UE4SS
+  returns a `TrivialObject` with no `ForEach` for a `TMap<uint32, ...>`, unlike
+  the `TMap<EMenuKind, ...>` the menu-widget lookup walks successfully. The icons
+  are enumerated by widget class (`WBP_MapIcon_C`) instead.
 - Fixed confirming a destination hanging the screen. The native flow announces
   the choice with `ServerDecideFastTravel(ID)` and then waits for the server to
   move the hero; away from a terminal `FastTravelStatus` is `Disable`, the server
@@ -923,21 +943,32 @@ work, and emits one concise world fault. It is not retried every poll cycle.
 
 ### Known limitations
 
-- **Pins cannot be confirmed on this screen.** `WBP_Map_FastTravel_C` is a
-  terminal picker: only terminal icons reach
-  `OnDetailMapTermialIconClickDelegate`. As a working substitute,
-  `fasttravel pin <index>` travels to any pin listed by `fasttravel pins`, taking
-  the destination from `FRODMapPin::Pos`. Making pins clickable on the screen
-  itself needs the generic `OnInputClickEvent` to fire for them, which is now
-  logged at normal level so the next run shows whether it does.
-- The screen shows `<MISSING STRING TABLE ENTRY>` for its headline and icon
-  legend, as does FieldEquipmentMod's Equipment screen. The shared trait is that
-  both widgets are built with `UWidgetBlueprintLibrary::Create` rather than by
-  the game's menu factory. The specific theory that `Create` leaves
-  `UIManagerRef` and `PlayerControllerRef` null has been tested and is **wrong**:
-  UE4SS refuses to write either (`[push_weakobjectproperty] Operation::Set is not
-  supported`) and the read-back showed both already correctly populated. The
-  cause is elsewhere and is not yet identified.
+- Pins cannot be confirmed on the fast travel screen, by that screen's own
+  design. Two attempts to change this were made and both removed: v0.8.0 forced
+  the icons on with `URODMenuItemWidgetBase::SetInactive(false)` and
+  `URODMenuWidgetBase::AddOperableChildWidget`, which fights the screen's declared
+  purpose and risks the checkpoint selection that works; v0.8.1 added an icon
+  census to gather evidence, which measured the wrong population —
+  `FindAllOf("WBP_MapIcon_C")` returns a pool of roughly 390 unmounted widgets for
+  a screen showing about twenty, and reported `canHover=0` even for the 67
+  `SafeArea` icons that are demonstrably selectable. Both are gone.
+  `fasttravel pin <index>` travels to any pin listed by `fasttravel pins`,
+  regardless of screen.
+- The reference-map selection pipeline (`resolveSelectedMapIcon`, the `UpdateIcon`
+  destination cache, the `MapDecidedEvent` / `MapClickEvent` interception) is
+  original to this component and has never run end to end, because until v0.7.0
+  the map could not be opened and the teleport moved nothing. Both are fixed, and
+  it is now the default path, but its confirm interception is not yet confirmed
+  by a run.
+- `<MISSING STRING TABLE ENTRY>` labels appeared on the fast travel screen in
+  earlier sessions and no longer reproduce; the screen now renders its headline
+  and legend correctly. Nothing in this component is known to have fixed it, so
+  it is recorded as unexplained rather than resolved. The theory that
+  `UWidgetBlueprintLibrary::Create` leaves `UIManagerRef` and
+  `PlayerControllerRef` null was tested and is **wrong**: UE4SS refuses to write
+  either (`[push_weakobjectproperty] Operation::Set is not supported`) and the
+  read-back showed both already correctly populated. FieldEquipmentMod's
+  Equipment screen still shows the labels.
 - The old `WBP_Map_C` selection pipeline — `resolveSelectedMapIcon`, the
   `UpdateIcon` destination cache, and the `MapDecidedEvent` / `MapClickEvent`
   interception — reads `URODMapMenuWidgetBase` members that
@@ -947,7 +978,10 @@ work, and emits one concise world fault. It is not retried every poll cycle.
   configured: the ability's own `LevelSequenceMap` keys first, then keys observed
   from the game's own menu activations, then `MAP_MENU_KEY`. This affects only
   `MAP_TARGET = "map"`.
-- Fast Travel works from a floor map only, not from the town map.
+- Fast Travel works from a floor map only. In town the row is hidden rather than
+  offered and refused. Showing a floor's map from inside town would mean travel
+  between worlds, which is a different operation than moving the hero within one
+  and is not attempted.
 - The move is a position change, not the native fast travel transaction. No
   `FastTravelStatus` is written and no terminal is impersonated, so the arrival
   cutscene, fade and partner warp the native path would play do not happen.

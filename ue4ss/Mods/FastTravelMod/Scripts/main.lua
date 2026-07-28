@@ -1,4 +1,4 @@
--- FastTravelMod v0.7.0
+-- FastTravelMod v0.9.1
 --
 -- TWO MAPS, ONE OF THEM WRONG
 --
@@ -11,8 +11,18 @@
 --                          the screen a terminal opens. EMenuKind::FastTravelMenu
 --                          = 66, and it carries OnDetailMapTermialIconClickDelegate.
 --
--- v0.4.0 opened the first one. It is the wrong screen: it draws pins and markers
--- but has no terminal-selection delegate at all.
+-- The fast travel screen is the default and the one that works. It is the game's
+-- own fast travel UI and confirming a checkpoint on it is measured end to end.
+-- It states its own scope in its banner -- "Escolha para qual Area Segura ou
+-- Terminal de Teletransporte voce vai" -- so map pins are drawn on it for
+-- orientation and cannot be confirmed.
+--
+-- The reference map's cursor does stop on every icon, because that screen exists
+-- for placing markers, so in principle a pin could be confirmed there. v0.9.0
+-- made it the default for that reason and that was a mistake: it trades a
+-- working fast travel screen for an unproven confirm interception on a screen
+-- that is not the game's fast travel UI. It is opt-in via MAP_TARGET now.
+-- Pins are served by the "fasttravel pin <index>" console command.
 --
 -- Natively the second is opened by GA_AvatarMenu_AccessTerminal_C, which needs a
 -- real terminal actor as its Target. This mod instead constructs the widget and
@@ -42,8 +52,13 @@
 --
 -- Floor maps only. On the town map the screen decides ID=None: the town world's
 -- RODAccessibleGimmicks holds that world's own gimmicks, not the floor's
--- terminals, so there is nothing there to travel to. That case is refused with
--- one line rather than three failed lookups.
+-- terminals, so there is nothing there to travel to.
+--
+-- Rather than let that be discovered by failing, the Start Menu row is not
+-- injected at all when the current world holds no travel destination. The test
+-- is "how many accessible gimmicks carry an ID", which is the real question and
+-- hardcodes no map name, and it runs per Start Menu construction so walking
+-- between town and a floor needs no transition tracking.
 --
 -- Adds a native-styled Fast Travel row to Echoes of Aincrad's Start Menu and
 -- opens the game's fast travel map. Confirming a terminal teleports the hero.
@@ -57,7 +72,10 @@
 --   ARODGameState::RODAccessibleGimmicks
 --   ARODAccessibleGimmickBase::ID / WarpOutTransforms / AccessTransforms
 --   ARODGameState::MapPins (FRODMapPin::Pos)
---   ARODInGamePlayerController::ServerDebugTeleport(FVector)
+--   WBP_MapIcon_C
+--   URODIconForMapWidgetBase::GetMapIconKind / GetCanHoverIcon / Timestamp
+--   URODMenuItemWidgetBase::GetInactive
+--   URODMenuWidgetBase::CurrentFocusWidget
 --   AActor::K2_TeleportTo(FVector, FRotator)
 --   WBP_Map_FastTravel_C
 --
@@ -96,7 +114,7 @@
 -- is unavailable, the operation stops and reports the error.
 
 local MOD_NAME = "FastTravelMod"
-local MOD_VERSION = "v0.7.0"
+local MOD_VERSION = "v0.9.1"
 local SUPPORTED_SDK = "Echoes of Aincrad 1.0.3"
 
 local MAIN_MENU_ICON_CLASS =
@@ -166,6 +184,13 @@ local ELIGIBLE_MAP_ICON_KINDS = {
     [34] = "InstantPin3",
 }
 
+-- The pin half of the table above. WBP_Map_FastTravel_C is authored as a
+-- terminal picker, so these are the kinds it does not let the cursor stop on.
+local MAP_PIN_ICON_KINDS = {}
+for kind in pairs(ELIGIBLE_MAP_ICON_KINDS) do
+    if kind >= 24 then MAP_PIN_ICON_KINDS[kind] = true end
+end
+
 local VISIBLE = 0
 local COLLAPSED = 1
 local HIDDEN = 2
@@ -197,6 +222,7 @@ local inputLocked = false
 local openBusy = false
 local openSerial = 0
 local teleportMapWidgetKey = nil
+local teleportMapWidget = nil
 local menuCloseBusy = false
 local teleportMapModeActive = false
 local mapTeleportBusy = false
@@ -720,6 +746,48 @@ local function resolveWorldGameState()
     return gameState, nil
 end
 
+-- "Is there anywhere to travel from this world?"
+--
+-- On a floor the game state carries that floor's terminals. In town it carries
+-- the town's own couple of gimmicks, the screen decides ID=None, and opening it
+-- there can only fail -- measured, twice. Counting terminals that actually hold
+-- an ID is the semantic question and hardcodes no map name, so it keeps working
+-- on floors this build has not shipped yet.
+local function fastTravelAvailability()
+    local gameState, gameStateError = resolveWorldGameState()
+    if gameState == nil then return nil, tostring(gameStateError) end
+
+    local gimmicks = nil
+    local listOk, listError = pcall(function()
+        gimmicks = gameState.RODAccessibleGimmicks
+    end)
+    if not listOk or gimmicks == nil then
+        return nil, "RODAccessibleGimmicks is unavailable: " ..
+            tostring(listError)
+    end
+
+    local total = 0
+    pcall(function() total = #gimmicks end)
+
+    local travelable = 0
+    local sample = {}
+    for index = 1, total do
+        local gimmick = nil
+        pcall(function() gimmick = gimmicks[index] end)
+        if isValid(gimmick) then
+            local id = nil
+            pcall(function()
+                id = exactFNameString(gimmick.ID, "accessible gimmick ID")
+            end)
+            if id ~= nil and id ~= "None" then
+                travelable = travelable + 1
+                if #sample < 6 then sample[#sample + 1] = id end
+            end
+        end
+    end
+    return { travelable = travelable, total = total, sample = sample }, nil
+end
+
 local FAST_TRAVEL_STATUS_NAMES = {
     [FAST_TRAVEL_STATUS_DISABLE] = "Disable",
     [FAST_TRAVEL_STATUS_CANCEL] = "Cancel",
@@ -921,6 +989,7 @@ local function failCurrentMenu(reason)
     mapTeleportBusy = false
     mapIconDestinations = {}
     teleportMapWidgetKey = nil
+    teleportMapWidget = nil
     openSerial = openSerial + 1
     if activeContext ~= nil then
         activeContext.failed = true
@@ -1177,6 +1246,25 @@ local function injectFastTravelEntry(mainMenu)
         log("row injection refused: Start Menu identity is unavailable")
         return
     end
+    -- Evaluated per Start Menu construction, so walking from town to a floor and
+    -- back is picked up without any transition tracking.
+    local availability, availabilityError = fastTravelAvailability()
+    if availability == nil then
+        log("row injection refused: " .. tostring(availabilityError))
+        return
+    end
+    log(string.format(
+        "FAST TRAVEL AVAILABILITY | %d destination(s) of %d gimmick(s)%s",
+        availability.travelable,
+        availability.total,
+        #availability.sample == 0 and ""
+            or (" | " .. table.concat(availability.sample, ", "))))
+    if availability.travelable == 0 then
+        log("Fast Travel row omitted: this world has no travel destination." ..
+            " That is the town map; use a floor map.")
+        return
+    end
+
     if injectedMenuKey == menuKey then
         dbg("row already injected into " .. menuKey)
         return
@@ -1617,6 +1705,7 @@ local function failPendingOpen(serial, reason)
     mapTeleportBusy = false
     mapIconDestinations = {}
     teleportMapWidgetKey = nil
+    teleportMapWidget = nil
     openSerial = openSerial + 1
     log("FAST TRAVEL ERROR | " .. tostring(reason))
 end
@@ -1657,16 +1746,20 @@ local function verifyTeleportMapOpen(serial)
     end
 
     local fragment = mapScreenFragment(presented[1])
-    if fragment ~= FAST_TRAVEL_WIDGET_FRAGMENT then
+    local wanted = CONFIG.MAP_TARGET == "map"
+        and MAP_MENU_WIDGET_FRAGMENT
+        or FAST_TRAVEL_WIDGET_FRAGMENT
+    if fragment ~= wanted then
         log(string.format(
             "MAP SCREEN MISMATCH | opened %s, wanted %s",
             tostring(fragment),
-            FAST_TRAVEL_WIDGET_FRAGMENT))
+            wanted))
     end
 
     openBusy = false
     pendingMapAbility = nil
     pendingMapContract = nil
+    teleportMapWidget = presented[1]
     teleportMapWidgetKey = objectName(presented[1])
     teleportMapModeActive = true
     log(string.format(
@@ -1959,6 +2052,7 @@ local function requestFastTravelOpen(source)
     openSerial = openSerial + 1
     local serial = openSerial
     teleportMapWidgetKey = nil
+    teleportMapWidget = nil
     mapTeleportBusy = false
     mapIconDestinations = {}
     pendingMapAbility = nil
@@ -2131,17 +2225,24 @@ local function resolveSelectedMapIcon(mapWidget)
     return iconWidget, kind, kindName, destination
 end
 
--- ARODAvatarCharacter::ServerDebugTeleportGimmick was the mod's documented
--- teleport and it does not move the hero. Measured: a complete MOD TELEPORT line
--- with a real WarpOutTransforms[Hero1] position, followed by nothing. The name
--- explains it -- ARODGameState carries both a DebugTeleportPos field and its own
--- ServerDebugTeleportGimmick, so the avatar call looks like it parks a position
--- for a gimmick warp to consume later rather than performing one.
+-- TWO CANDIDATE TELEPORTS WERE TRIED IN THE GAME; ONE WORKS.
 --
--- ARODInGamePlayerController::ServerDebugTeleport(FVector) is the controller
--- level debug teleport and is tried first. AActor::K2_TeleportTo is the engine's
--- own and cannot silently do nothing, so it is the fallback. Which one actually
--- moved the hero is read back from the world rather than assumed.
+-- ARODAvatarCharacter::ServerDebugTeleportGimmick was this mod's documented
+-- teleport and moves nothing. ARODGameState carries both a DebugTeleportPos
+-- field and its own ServerDebugTeleportGimmick, so the avatar call looks like it
+-- parks a position for a later gimmick warp rather than performing one.
+--
+-- ARODInGamePlayerController::ServerDebugTeleport(FVector) also moves nothing.
+-- Measured directly: "ServerDebugTeleport called=true" and then, half a second
+-- later, the hero still 23703 cm from the target.
+--
+-- AActor::K2_TeleportTo is the engine's own and lands the hero on the target,
+-- read back at 0 cm. It is what this uses. The other two are recorded here so
+-- they are not tried again.
+--
+-- The arrival is still read back from the world rather than assumed, because a
+-- teleport into unstreamed World Partition cells is a real possibility and a
+-- silent failure is what cost this mod two sessions.
 local TELEPORT_VERIFY_DELAY_MS = 500
 local TELEPORT_ARRIVAL_TOLERANCE = 1500.0
 
@@ -2171,18 +2272,27 @@ local function planarDistance(a, b)
 end
 
 local function performTeleport(position, label)
-    local before = heroLocation()
+    local hero, heroError = resolveLocalHero()
+    if hero == nil then
+        log("FAST TRAVEL ERROR | " .. tostring(heroError))
+        return
+    end
 
-    local primaryOk, primaryError = pcall(function()
-        local controller, controllerError = resolveLocalController()
-        if controller == nil then error(controllerError) end
-        controller:ServerDebugTeleport(position)
+    local before = heroLocation()
+    local teleported, teleportError = pcall(function()
+        hero:K2_TeleportTo(position, hero:K2_GetActorRotation())
     end)
+    if not teleported then
+        log("FAST TRAVEL ERROR | K2_TeleportTo failed: " ..
+            tostring(teleportError))
+        return
+    end
+
     log(string.format(
-        "TELEPORT | %s | ServerDebugTeleport called=%s%s | target=(%.1f, %.1f, %.1f)",
+        "TELEPORT | %s | K2_TeleportTo | from=(%s) | target=(%.1f, %.1f, %.1f)",
         label,
-        tostring(primaryOk),
-        primaryOk and "" or (" | " .. tostring(primaryError)),
+        before == nil and "?" or string.format(
+            "%.1f, %.1f, %.1f", before.X, before.Y, before.Z),
         position.X, position.Y, position.Z))
 
     local scheduled, scheduleError = pcall(function()
@@ -2190,52 +2300,26 @@ local function performTeleport(position, label)
             ExecuteInGameThread(function()
                 local after = heroLocation()
                 local distance = planarDistance(after, position)
-                if distance ~= nil and distance <= TELEPORT_ARRIVAL_TOLERANCE then
+                if distance == nil then
+                    log("TELEPORT | " .. label ..
+                        " | arrival unverifiable; hero location unreadable")
+                    return
+                end
+                if distance <= TELEPORT_ARRIVAL_TOLERANCE then
                     log(string.format(
-                        "TELEPORT | %s | arrived via ServerDebugTeleport | %.0f cm from target",
+                        "TELEPORT | %s | arrived | %.0f cm from target",
                         label, distance))
-                    return
+                else
+                    log(string.format(
+                        "TELEPORT | %s | DID NOT ARRIVE | %.0f cm from target",
+                        label, distance))
                 end
-
-                log(string.format(
-                    "TELEPORT | %s | ServerDebugTeleport did not move the hero" ..
-                        " (%s cm away); falling back to K2_TeleportTo",
-                    label,
-                    distance == nil and "?" or string.format("%.0f", distance)))
-
-                local hero, heroError = resolveLocalHero()
-                if hero == nil then
-                    log("FAST TRAVEL ERROR | " .. tostring(heroError))
-                    return
-                end
-                local fallbackOk, fallbackError = pcall(function()
-                    hero:K2_TeleportTo(position, hero:K2_GetActorRotation())
-                end)
-                if not fallbackOk then
-                    log("FAST TRAVEL ERROR | K2_TeleportTo failed: " ..
-                        tostring(fallbackError))
-                    return
-                end
-
-                local settled = heroLocation()
-                local settledDistance = planarDistance(settled, position)
-                log(string.format(
-                    "TELEPORT | %s | K2_TeleportTo done | %s cm from target",
-                    label,
-                    settledDistance == nil and "?"
-                        or string.format("%.0f", settledDistance)))
             end)
         end)
     end)
     if not scheduled then
         log("FAST TRAVEL ERROR | teleport verification scheduling failed: " ..
             tostring(scheduleError))
-    end
-
-    if before ~= nil then
-        dbg(string.format(
-            "TELEPORT | %s | departed from (%.1f, %.1f, %.1f)",
-            label, before.X, before.Y, before.Z))
     end
 end
 
@@ -2249,6 +2333,7 @@ local function finalizeMapTeleport(source)
     mapIconDestinations = {}
     openBusy = false
     teleportMapWidgetKey = nil
+    teleportMapWidget = nil
     openSerial = openSerial + 1
 
     if not finalizeOk then
@@ -2458,6 +2543,100 @@ local function resolveTerminalDestination(idName)
         "no accessible gimmick among %d carries ID %s", count, idName)
 end
 
+-- The screen is waiting on a transaction that will never land, so it has to be
+-- dismissed here or it keeps the cursor and swallows input.
+local function dismissFastTravelScreen()
+    local dismissed, dismissError = pcall(function()
+        local rodLibrary, libraryError = resolveRodWidgetLibrary()
+        if rodLibrary == nil then error(libraryError) end
+        local controller, controllerError = resolveLocalController()
+        if controller == nil then error(controllerError) end
+        rodLibrary:EndMenu(controller)
+        controller:EndMainMenu(true)
+    end)
+    if not dismissed then
+        log("FAST TRAVEL ERROR | menu dismissal failed: " ..
+            tostring(dismissError))
+    end
+
+    local scheduled, scheduleError = pcall(function()
+        ExecuteWithDelay(TELEPORT_FINALIZE_DELAY_MS, function()
+            ExecuteInGameThread(function()
+                finalizeMapTeleport("fast travel map")
+            end)
+        end)
+    end)
+    if not scheduled then
+        log("FAST TRAVEL ERROR | teleport finalization scheduling failed: " ..
+            tostring(scheduleError))
+    end
+end
+
+-- A confirmed pin reaches ServerDecideFastTravel with ID=None, because a pin has
+-- no terminal ID to decide on. The focused widget is what says which pin it was.
+-- URODIconForMapWidgetBase and FRODMapPin both carry a Timestamp, which is the
+-- only field the two sides share, so that is the join.
+local function focusedPinDestination()
+    if not isValid(teleportMapWidget) then return nil, "no map screen tracked" end
+
+    local icon = nil
+    pcall(function()
+        icon = weakObject(teleportMapWidget.CurrentFocusWidget)
+    end)
+    if not isValid(icon) then return nil, "no focused widget on the map" end
+
+    local kind, timestamp
+    local probed = pcall(function()
+        kind = tonumber(icon:GetMapIconKind())
+        timestamp = tonumber(icon.Timestamp)
+    end)
+    if not probed or kind == nil then
+        return nil, "focused widget is not a map icon"
+    end
+    if MAP_PIN_ICON_KINDS[kind] ~= true then
+        return nil, string.format(
+            "focused icon kind %d (%s) is not a pin",
+            kind, tostring(ELIGIBLE_MAP_ICON_KINDS[kind] or "other"))
+    end
+
+    local gameState, gameStateError = resolveWorldGameState()
+    if gameState == nil then return nil, tostring(gameStateError) end
+
+    local matched = nil
+    local matchOk, matchError = pcall(function()
+        local pins = gameState.MapPins
+        local count = #pins
+        for index = 1, count do
+            local pin = pins[index]
+            if pin ~= nil and timestamp ~= nil
+                and tonumber(pin.Timestamp) == timestamp then
+                matched = {
+                    index = index,
+                    kind = kind,
+                    position = {
+                        X = tonumber(pin.Pos.X),
+                        Y = tonumber(pin.Pos.Y),
+                        Z = tonumber(pin.Pos.Z),
+                    },
+                }
+                return
+            end
+        end
+    end)
+    if not matchOk then
+        return nil, "MapPins scan failed: " .. tostring(matchError)
+    end
+    if matched == nil then
+        return nil, string.format(
+            "no map pin carries timestamp %s", tostring(timestamp))
+    end
+    if matched.position.X == nil or matched.position.Y == nil
+        or matched.position.Z == nil then
+        return nil, "matched pin position is not numeric"
+    end
+    return matched, nil
+end
+
 local function handleNativeFastTravelDecision(idName)
     local state = nil
     local stateOk, stateError = pcall(function()
@@ -2492,32 +2671,7 @@ local function handleNativeFastTravelDecision(idName)
 
     performTeleport(destination.position, "terminal " .. idName)
 
-    -- The screen is waiting on a transaction that will never land, so it has to
-    -- be dismissed here or it keeps the cursor and swallows input.
-    local dismissed, dismissError = pcall(function()
-        local rodLibrary, libraryError = resolveRodWidgetLibrary()
-        if rodLibrary == nil then error(libraryError) end
-        local controller, controllerError = resolveLocalController()
-        if controller == nil then error(controllerError) end
-        rodLibrary:EndMenu(controller)
-        controller:EndMainMenu(true)
-    end)
-    if not dismissed then
-        log("FAST TRAVEL ERROR | menu dismissal failed: " ..
-            tostring(dismissError))
-    end
-
-    local scheduled, scheduleError = pcall(function()
-        ExecuteWithDelay(TELEPORT_FINALIZE_DELAY_MS, function()
-            ExecuteInGameThread(function()
-                finalizeMapTeleport("fast travel map")
-            end)
-        end)
-    end)
-    if not scheduled then
-        log("FAST TRAVEL ERROR | teleport finalization scheduling failed: " ..
-            tostring(scheduleError))
-    end
+    dismissFastTravelScreen()
 end
 
 local function interceptMapTeleport(
@@ -2949,15 +3103,36 @@ optionalHook(
         -- the two gimmicks of the town world, not the floor's terminals, so
         -- there is nothing on that map this can travel to. Refused once, quietly,
         -- instead of three failed lookups.
+        -- ID=None is either a confirmed pin (which has no terminal ID) or the
+        -- town map, which has no terminals to decide on at all. The focused
+        -- widget tells the two apart.
         if id == "None" then
-            if not nativeDecisionBusy then
-                nativeDecisionBusy = true
-                ExecuteWithDelay(NATIVE_DECISION_COOLDOWN_MS, function()
-                    nativeDecisionBusy = false
+            if nativeDecisionBusy then return end
+            nativeDecisionBusy = true
+            ExecuteWithDelay(NATIVE_DECISION_COOLDOWN_MS, function()
+                nativeDecisionBusy = false
+            end)
+            ExecuteWithDelay(0, function()
+                ExecuteInGameThread(function()
+                    local pin, pinError = focusedPinDestination()
+                    if pin == nil then
+                        log("FAST TRAVEL | no destination decided (ID=None) | " ..
+                            tostring(pinError) ..
+                            " | Fast Travel needs a floor map, not the town map.")
+                        return
+                    end
+                    log(string.format(
+                        "MOD TELEPORT | pin %d kind=%s (%s) | pos=(%.1f, %.1f, %.1f)",
+                        pin.index,
+                        tostring(pin.kind),
+                        tostring(ELIGIBLE_MAP_ICON_KINDS[pin.kind]),
+                        pin.position.X, pin.position.Y, pin.position.Z))
+                    performTeleport(
+                        pin.position,
+                        string.format("pin %d", pin.index))
+                    dismissFastTravelScreen()
                 end)
-                log("FAST TRAVEL | this map decided no destination (ID=None)." ..
-                    " Fast Travel works from a floor map, not the town map.")
-            end
+            end)
             return
         end
         -- One confirm produces three of these about 200 ms apart. The gate is
@@ -3066,6 +3241,7 @@ requireHook(
         mapIconDestinations = {}
         openSerial = openSerial + 1
         teleportMapWidgetKey = nil
+        teleportMapWidget = nil
         pendingMapAbility = nil
         pendingMapContract = nil
         dbg("native restart completed; teleport map state cleared")
@@ -3078,6 +3254,7 @@ requireHook(
         local widget = hookValue(selfParameter)
         if mapScreenFragment(widget) ~= nil then
             teleportMapWidgetKey = nil
+            teleportMapWidget = nil
             openBusy = false
             teleportMapModeActive = false
             mapTeleportBusy = false
@@ -3408,6 +3585,7 @@ do
                 mapTeleportBusy = false
                 mapIconDestinations = {}
                 teleportMapWidgetKey = nil
+                teleportMapWidget = nil
                 openSerial = openSerial + 1
             end
             if activeContext ~= nil then
@@ -3436,6 +3614,7 @@ do
             mapTeleportBusy = false
             mapIconDestinations = {}
             teleportMapWidgetKey = nil
+            teleportMapWidget = nil
             openSerial = openSerial + 1
             if activeContext ~= nil then
                 setContextVisibility(activeContext, COLLAPSED)

@@ -681,51 +681,42 @@ local function readGasValue(gas, key)
     return value, nil
 end
 
-local function snapshotGas(enemy, className)
+local function snapshotGas(enemy)
     local okSystem, abilitySystem = pcall(function() return enemy.AbilitySystem end)
     if not okSystem or not isValid(abilitySystem) then
         return nil, "required enemy AbilitySystem is unavailable"
     end
 
-    local attributes = nil
-    if className ~= nil and gasAttributesByClass[className] ~= nil then
-        attributes = gasAttributesByClass[className]
-    else
-        local reflected = {}
-        local okAttributes, attributesError =
-            pcall(function() abilitySystem:GetAllAttributes(reflected) end)
-        if not okAttributes then
-            return nil, "GetAllAttributes failed: " .. tostring(attributesError)
-        end
+    local reflected = {}
+    local okAttributes, attributesError =
+        pcall(function() abilitySystem:GetAllAttributes(reflected) end)
+    if not okAttributes then
+        return nil, "GetAllAttributes failed: " .. tostring(attributesError)
+    end
 
-        local wanted = {}
-        for key, name in pairs(GAS_ATTRIBUTE_NAMES) do wanted[name] = key end
-        attributes = {}
-        for index = 1, #reflected do
-            local attribute, elementError =
-                gameplayAttributeFromArrayElement(reflected[index], index)
-            if attribute == nil then return nil, elementError end
-            local name, nameError = gameplayAttributeName(attribute)
-            if name == nil then
-                return nil, "attribute " .. tostring(index) .. ": " .. nameError
-            end
-            local key = wanted[name]
-            if key ~= nil then
-                if attributes[key] ~= nil then
-                    return nil, "duplicate GAS attribute " .. name
-                end
-                attributes[key] = attribute
-            end
+    local wanted = {}
+    for key, name in pairs(GAS_ATTRIBUTE_NAMES) do wanted[name] = key end
+    local attributes = {}
+    for index = 1, #reflected do
+        local attribute, elementError =
+            gameplayAttributeFromArrayElement(reflected[index], index)
+        if attribute == nil then return nil, elementError end
+        local name, nameError = gameplayAttributeName(attribute)
+        if name == nil then
+            return nil, "attribute " .. tostring(index) .. ": " .. nameError
         end
-
-        for key, name in pairs(GAS_ATTRIBUTE_NAMES) do
-            if attributes[key] == nil then
-                return nil, "required GAS attribute is absent: " .. name
+        local key = wanted[name]
+        if key ~= nil then
+            if attributes[key] ~= nil then
+                return nil, "duplicate GAS attribute " .. name
             end
+            attributes[key] = attribute
         end
+    end
 
-        if className ~= nil then
-            gasAttributesByClass[className] = attributes
+    for key, name in pairs(GAS_ATTRIBUTE_NAMES) do
+        if attributes[key] == nil then
+            return nil, "required GAS attribute is absent: " .. name
         end
     end
 
