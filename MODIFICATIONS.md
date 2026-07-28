@@ -826,7 +826,7 @@ work, and emits one concise world fault. It is not retried every poll cycle.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v0.11.0
+**Current script version:** v0.12.0
 
 ### Added
 
@@ -911,11 +911,22 @@ work, and emits one concise world fault. It is not retried every poll cycle.
   target (read back at 0 cm). Both dead ends are recorded in the source so they
   are not tried again. Arrival is still verified from the world, since a teleport
   into unstreamed World Partition cells remains possible.
-- Fixed the confirmed icon being read from the wrong widget.
-  `URODMenuWidgetBase::CurrentFocusWidget` is the menu's focused child, which on
-  a map screen is the map, never an icon; that is why every pin attempt reported
-  "focused widget is not a map icon". The cursor's icon is
-  `URODMapItemWidgetBase::CurrentTargetIconWidget`.
+- Fixed the hovered icon being read from the wrong widget, twice. It is not
+  `URODMenuWidgetBase::CurrentFocusWidget`, which on a map screen is the map
+  rather than an icon, and it is not the base
+  `URODMapItemWidgetBase::CurrentTargetIconWidget` either — the cursor probe read
+  that one as empty while hovering a pin. The fast travel screen builds a
+  `WBP_FieldMap_C`, a `URODFieldMapItemWidget`, which keeps its own
+  `CurrentStayTerminalIconWidget`. All candidates are now tried, and only a pin
+  kind is accepted from any of them so a tracked terminal cannot shadow the pin
+  the cursor is over.
+- Added a geometric fallback for the pin under the cursor, since
+  `CurrentStayTerminalIconWidget` is named for terminals and may be authored
+  never to hold a pin. `URODMapItemWidgetBase` exposes `CursorWidget` and
+  `PinIconWidgets`; their absolute screen positions are compared through
+  `UWidget::GetCachedGeometry` and `USlateBlueprintLibrary::LocalToAbsolute`, and
+  the nearest pin within 48 px is taken. This needs no cooperation from the
+  screen at all.
 - Fixed a viewport change, such as Alt+Enter, trapping the player on the map
   screen. The screen survives unfocused: its cursor keeps tracking the mouse,
   Confirmar stays greyed, Cancelar does nothing, and nothing in the game closes
@@ -977,11 +988,13 @@ work, and emits one concise world fault. It is not retried every poll cycle.
   `32` (`InstantPin1`) and `27`–`31` (`PillarPin1`–`5`) before anything was
   appended, so pins were already snappable and the cursor still would not stop on
   one. The append is kept, since it completes the set with the remaining pin
-  kinds and any real fix needs them, but it is not the mechanism. `CURSOR_PROBE_KEY`
-  (default F7) reports what `CurrentTargetIconWidget` holds at the moment it is
-  pressed — kind, `GetCanHoverIcon`, `GetInactive`, `Timestamp` — which is the
-  evidence needed to locate the real gate. `fasttravel pin <index>` travels to
-  any pin and depends on none of this.
+  kinds and any real fix needs them, but it is not the mechanism.
+  `CURSOR_PROBE_KEY` (default F7) reports every candidate field together —
+  `CurrentTargetIconWidget`, `CurrentStayTerminalIconWidget`, the
+  `PinIconWidgets` count and the nearest pin's distance in pixels — which is what
+  narrowed this from "the cursor stops on nothing" to "the mod was reading a
+  field this screen does not fill". `fasttravel pin <index>` travels to any pin
+  and depends on none of this.
 - The reference-map selection pipeline (`resolveSelectedMapIcon`, the `UpdateIcon`
   destination cache, the `MapDecidedEvent` / `MapClickEvent` interception) is
   original to this component and has never run end to end, because until v0.7.0

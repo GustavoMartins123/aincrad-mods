@@ -1,4 +1,4 @@
--- FastTravelMod v0.11.0
+-- FastTravelMod v0.12.0
 --
 -- TWO MAPS, ONE OF THEM WRONG
 --
@@ -81,7 +81,9 @@
 --   ARODGameState::MapPins (FRODMapPin::Pos)
 --   WBP_MapIcon_C
 --   URODIconForMapWidgetBase::GetMapIconKind / GetCanHoverIcon / Timestamp
---   URODMapItemWidgetBase::SnapMapIconKinds / CurrentTargetIconWidget
+--   URODMapItemWidgetBase::CursorWidget / PinIconWidgets / SnapMapIconKinds
+--   URODFieldMapItemWidget::CurrentStayTerminalIconWidget
+--   UWidget::GetCachedGeometry / USlateBlueprintLibrary::LocalToAbsolute
 --   URODWidgetBPFunctionLibrary::SetCurrentMenuInputActionEnable
 --   AActor::K2_TeleportTo(FVector, FRotator)
 --   WBP_Map_FastTravel_C
@@ -121,7 +123,7 @@
 -- is unavailable, the operation stops and reports the error.
 
 local MOD_NAME = "FastTravelMod"
-local MOD_VERSION = "v0.11.0"
+local MOD_VERSION = "v0.12.0"
 local SUPPORTED_SDK = "Echoes of Aincrad 1.0.3"
 
 local MAIN_MENU_ICON_CLASS =
@@ -1745,9 +1747,17 @@ end
 -- it completes the set with the remaining pin kinds, which any real fix needs
 -- anyway; it is not presented as the mechanism.
 --
--- Where the gate actually is remains unknown. The cursor probe keybind reports
--- what CurrentTargetIconWidget holds at the moment it is pressed, which is the
--- measurement that would settle it.
+-- The gate is not there. The cursor probe, pressed while hovering a pin, came
+-- back with CurrentTargetIconWidget empty on a WBP_FieldMap_C map item -- and
+-- WBP_FieldMap_C is a URODFieldMapItemWidget, which keeps its own hovered-icon
+-- field: CurrentStayTerminalIconWidget. The base field this mod was reading is
+-- simply not the one this screen fills.
+--
+-- That field is named for terminals, so it may never hold a pin at all. Rather
+-- than depend on the screen tracking something it may be authored never to
+-- track, the pin under the cursor is also found geometrically: PinIconWidgets
+-- lists the pin icons, CursorWidget is the cursor, and comparing their absolute
+-- screen positions needs no cooperation from the screen whatsoever.
 
 -- URODMapMenuWidgetBase declares MapItemWidget. URODFastTravelMenuWidget does not:
 -- it builds one from FieldClass into MapWidgetCanvas, so for that screen the
@@ -2746,23 +2756,128 @@ end
 -- no terminal ID to decide on. The focused widget is what says which pin it was.
 -- URODIconForMapWidgetBase and FRODMapPin both carry a Timestamp, which is the
 -- only field the two sides share, so that is the join.
+-- Absolute (screen) position of a widget's top-left. Absolute rather than slot
+-- position because the cursor and the icons need not share a canvas, and slot
+-- coordinates are only comparable within one.
+local function widgetAbsolutePosition(widget)
+    if not isValid(widget) then return nil end
+    local position = nil
+    pcall(function()
+        local slate =
+            StaticFindObject("/Script/UMG.Default__SlateBlueprintLibrary")
+        if not isValid(slate) then
+            error("SlateBlueprintLibrary default object is unavailable")
+        end
+        local absolute = slate:LocalToAbsolute(
+            widget:GetCachedGeometry(), { X = 0.0, Y = 0.0 })
+        position = { X = tonumber(absolute.X), Y = tonumber(absolute.Y) }
+    end)
+    if position == nil or position.X == nil or position.Y == nil then
+        return nil
+    end
+    return position
+end
+
+-- How close the cursor has to be to a pin icon, in absolute pixels, to count as
+-- pointing at it. Map icons render around 30 px, so this is roughly "touching".
+local PIN_CURSOR_TOLERANCE = 48.0
+
+local function nearestPinIconToCursor(item)
+    local cursor = nil
+    pcall(function() cursor = item.CursorWidget end)
+    local cursorAt = widgetAbsolutePosition(cursor)
+    if cursorAt == nil then
+        return nil, "the map cursor position is unreadable"
+    end
+
+    local pins = nil
+    pcall(function() pins = item.PinIconWidgets end)
+    if pins == nil then return nil, "PinIconWidgets is unavailable" end
+    local count = 0
+    pcall(function() count = #pins end)
+    if count == 0 then return nil, "the map item holds no pin icons" end
+
+    local best, bestDistance = nil, nil
+    for index = 1, count do
+        local icon = nil
+        pcall(function() icon = pins[index] end)
+        local at = widgetAbsolutePosition(icon)
+        if at ~= nil then
+            local dx = at.X - cursorAt.X
+            local dy = at.Y - cursorAt.Y
+            local distance = math.sqrt(dx * dx + dy * dy)
+            if bestDistance == nil or distance < bestDistance then
+                best, bestDistance = icon, distance
+            end
+        end
+    end
+    if best == nil then
+        return nil, string.format(
+            "none of the %d pin icon positions could be read", count)
+    end
+    if bestDistance > PIN_CURSOR_TOLERANCE then
+        return nil, string.format(
+            "nearest of %d pin icons is %.0f px from the cursor",
+            count, bestDistance)
+    end
+    return best, nil, bestDistance
+end
+
+-- Where the cursor's icon actually lives, in the order this screen fills them.
+--
+--   CurrentTargetIconWidget         URODMapItemWidgetBase, the base field.
+--                                   Measured empty on this screen.
+--   CurrentStayTerminalIconWidget   URODFieldMapItemWidget, which is what the
+--                                   fast travel screen builds (WBP_FieldMap_C).
+--                                   Its name says terminal, so it may never hold
+--                                   a pin.
+--   nearest PinIconWidgets entry    If the screen tracks no pin at all, the pin
+--                                   the cursor is over can still be found by
+--                                   comparing screen positions. This does not
+--                                   need the screen's cooperation.
+local function isPinIcon(icon)
+    local kind = nil
+    pcall(function() kind = tonumber(icon:GetMapIconKind()) end)
+    return kind ~= nil and MAP_PIN_ICON_KINDS[kind] == true
+end
+
+local function cursorIcon(item)
+    -- A tracked icon is only accepted if it is a pin. The stay field is named
+    -- for terminals, and a terminal there would otherwise shadow the pin the
+    -- cursor is actually over.
+    local icon = nil
+    pcall(function() icon = weakObject(item.CurrentTargetIconWidget) end)
+    if isValid(icon) and isPinIcon(icon) then
+        return icon, "CurrentTargetIconWidget"
+    end
+
+    pcall(function()
+        icon = weakObject(item.CurrentStayTerminalIconWidget)
+    end)
+    if isValid(icon) and isPinIcon(icon) then
+        return icon, "CurrentStayTerminalIconWidget"
+    end
+
+    local nearest, nearestError, distance = nearestPinIconToCursor(item)
+    if nearest ~= nil then
+        return nearest, string.format(
+            "nearest pin icon (%.0f px)", distance or -1)
+    end
+    return nil, nil, nearestError
+end
+
 local function focusedPinDestination()
     if not isValid(teleportMapWidget) then return nil, "no map screen tracked" end
 
-    -- URODMenuWidgetBase::CurrentFocusWidget is the menu's focused child, which
-    -- on a map screen is the map itself, never an icon. The cursor's icon lives
-    -- on the map item as CurrentTargetIconWidget. Reading the wrong one is what
-    -- made every pin attempt report "focused widget is not a map icon".
     local item, itemError = resolveMapItemWidget(teleportMapWidget)
     if item == nil then return nil, tostring(itemError) end
 
-    local icon = nil
-    pcall(function()
-        icon = weakObject(item.CurrentTargetIconWidget)
-    end)
+    local icon, iconSource, iconError = cursorIcon(item)
     if not isValid(icon) then
-        return nil, "the cursor is not on an icon"
+        return nil, "the cursor is not on a pin: " ..
+            tostring(iconError or "no icon reference")
     end
+    dbg("pin candidate found via " .. tostring(iconSource))
 
     local kind, timestamp
     local probed = pcall(function()
@@ -3827,27 +3942,50 @@ bindKey(CONFIG.CURSOR_PROBE_KEY, "map cursor probe", function()
         return
     end
 
-    local icon = nil
-    pcall(function() icon = weakObject(item.CurrentTargetIconWidget) end)
-    if not isValid(icon) then
-        log("CURSOR PROBE | map item=" .. tostring(objectName(item)) ..
-            " | CurrentTargetIconWidget is empty (cursor on nothing)")
-        return
-    end
+    -- Every field that could hold the hovered icon, reported together. The last
+    -- probe read only CurrentTargetIconWidget, found it empty, and that said
+    -- nothing about the other two.
+    local targetIcon, stayIcon = nil, nil
+    pcall(function() targetIcon = weakObject(item.CurrentTargetIconWidget) end)
+    pcall(function()
+        stayIcon = weakObject(item.CurrentStayTerminalIconWidget)
+    end)
 
-    local kind, canHover, inactive, timestamp
-    pcall(function() kind = tonumber(icon:GetMapIconKind()) end)
-    pcall(function() canHover = icon:GetCanHoverIcon() end)
-    pcall(function() inactive = icon:GetInactive() end)
-    pcall(function() timestamp = tonumber(icon.Timestamp) end)
+    local pinCount = -1
+    pcall(function() pinCount = #item.PinIconWidgets end)
+    local nearest, nearestError, distance = nearestPinIconToCursor(item)
+
     log(string.format(
-        "CURSOR PROBE | icon=%s | kind=%s (%s) | canHover=%s | inactive=%s | timestamp=%s",
-        tostring(objectName(icon)),
-        tostring(kind),
-        tostring(kind ~= nil and ELIGIBLE_MAP_ICON_KINDS[kind] or "other"),
-        tostring(canHover),
-        tostring(inactive),
-        tostring(timestamp)))
+        "CURSOR PROBE | item=%s | CurrentTargetIconWidget=%s | " ..
+            "CurrentStayTerminalIconWidget=%s | PinIconWidgets=%d | nearestPin=%s",
+        tostring(objectName(item)),
+        isValid(targetIcon) and tostring(objectName(targetIcon)) or "<empty>",
+        isValid(stayIcon) and tostring(objectName(stayIcon)) or "<empty>",
+        pinCount,
+        nearest ~= nil
+            and string.format("%.0f px away", distance or -1)
+            or tostring(nearestError)))
+
+    for label, icon in pairs({
+        target = targetIcon, stay = stayIcon, nearestPin = nearest
+    }) do
+        if isValid(icon) then
+            local kind, canHover, inactive, timestamp
+            pcall(function() kind = tonumber(icon:GetMapIconKind()) end)
+            pcall(function() canHover = icon:GetCanHoverIcon() end)
+            pcall(function() inactive = icon:GetInactive() end)
+            pcall(function() timestamp = tonumber(icon.Timestamp) end)
+            log(string.format(
+                "CURSOR PROBE | %s | kind=%s (%s) | canHover=%s | inactive=%s | timestamp=%s",
+                label,
+                tostring(kind),
+                tostring(kind ~= nil and ELIGIBLE_MAP_ICON_KINDS[kind]
+                    or "other"),
+                tostring(canHover),
+                tostring(inactive),
+                tostring(timestamp)))
+        end
+    end
 end)
 
 do
