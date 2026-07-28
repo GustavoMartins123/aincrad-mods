@@ -118,6 +118,8 @@ end
 
 local NOTIFY_PICKUP_CLASSES = {
     "/Game/ROD/Blueprints/Placement/Gimmick/PickUpItem/BP_PickUpItemBase.BP_PickUpItemBase_C",
+    "/Game/ROD/Blueprints/Placement/Gimmick/NatureItem/BP_NatureItemBase.BP_NatureItemBase_C",
+    "/Game/ROD/Blueprints/Placement/Gimmick/PickUpItem/BP_NatureItemBase.BP_NatureItemBase_C",
 }
 
 local VA_PICK_ITEM = 1
@@ -312,7 +314,6 @@ local function beginQuietOnly(reason, quietSec)
     initialScanDone = false
     quietSec = quietSec or 4.0
     pickupQuietUntil = os.clock() + quietSec
-    pcall(collectgarbage, "collect")
     print(string.format("[%s] quiet %.0fs (%s) — refs cleared, pickup stays on\n",
         MOD_NAME, quietSec, tostring(reason or "?")))
     dbg("beginQuietOnly/done", string.format("quietUntil=%.2f", pickupQuietUntil))

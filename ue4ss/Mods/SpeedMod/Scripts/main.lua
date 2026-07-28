@@ -556,34 +556,20 @@ local function resolveHero()
 end
 
 readNumber = function(object, propertyName)
-    if object == nil then
-        return nil
-    end
-
-    local ok, value = pcall(function()
-        return object[propertyName]
-    end)
-
-    if ok and type(value) == "number" then
+    if object == nil then return nil end
+    local value = object[propertyName]
+    if type(value) == "number" then
         return value
     end
-
     return nil
 end
 
 local function readBool(object, propertyName)
-    if object == nil then
-        return nil
-    end
-
-    local ok, value = pcall(function()
-        return object[propertyName]
-    end)
-
-    if ok and type(value) == "boolean" then
+    if object == nil then return nil end
+    local value = object[propertyName]
+    if type(value) == "boolean" then
         return value
     end
-
     return nil
 end
 

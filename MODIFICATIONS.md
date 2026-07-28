@@ -815,7 +815,7 @@ work, and emits one concise world fault. It is not retried every poll cycle.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v0.5.1
+**Current script version:** v0.7.0
 
 ### Added
 
@@ -828,11 +828,20 @@ work, and emits one concise world fault. It is not retried every poll cycle.
   `ParentMenu` and `MenuKind` stamped on the widget beforehand.
 - A read-back of `URODWidgetData::MenuWidgetMap` before opening, logging which
   widget class the menu system maps that kind to on this build.
-- Observation hooks on the fast travel screen's own input path
+- Teleporting from the destination the screen itself decided. The mod reads the
+  ID out of `ARODPlayerState::ServerDecideFastTravel`, matches it against
+  `ARODGameState::RODAccessibleGimmicks` by `ARODAccessibleGimmickBase::ID`, and
+  takes the arrival point from that actor's `WarpOutTransforms`, falling back to
+  `AccessTransforms[0]` and then to the actor's own location. The chosen source
+  and coordinates are logged as `MOD TELEPORT`.
+- A guard that leaves real terminal fast travel alone: the takeover runs only
+  while the mod's own screen is open and only when `FastTravelStatus` is not
+  `Enable` and `bAccessingTerminal` is false.
+- Hooks on the fast travel screen's own input path
   (`OnDetailMapTermialIconClickDelegate`, `OnInputClickEvent`,
-  `EndOpenAnimEvent`) and on `ARODPlayerState::ServerDecideFastTravel`. They
-  record and consume nothing. Unlike the mod's functional hooks they are
-  registered softly: losing one costs a diagnostic, not the feature.
+  `EndOpenAnimEvent`). These observe and consume nothing. Unlike the mod's
+  functional hooks they are registered softly: losing one costs a diagnostic,
+  not the feature.
 - A `MAP_TARGET` setting in `config.lua` selecting `"fasttravel"` (default) or
   `"map"`, keeping the reference-map path available for diagnosis.
 - Observation of `ARODAvatarCharacter::ActivateFPCameraMenuAbility`, recording
@@ -871,6 +880,28 @@ work, and emits one concise world fault. It is not retried every poll cycle.
   that screen comes from `GA_AvatarMenu_AccessTerminal_C`, whose `Target` is a
   real terminal actor; constructing the widget directly reaches the same screen,
   so no terminal is impersonated.
+- Fixed the teleport not moving anything.
+  `ARODAvatarCharacter::ServerDebugTeleportGimmick(FVector)` was this component's
+  documented teleport and it does nothing observable: a complete `MOD TELEPORT`
+  line carrying a real `WarpOutTransforms[Hero1]` position was followed by no
+  movement. `ARODGameState` holds both a `DebugTeleportPos` field and its own
+  `ServerDebugTeleportGimmick`, so the avatar call appears to park a position for
+  a later gimmick warp rather than perform one. Movement now goes through
+  `ARODInGamePlayerController::ServerDebugTeleport(FVector)`, with
+  `AActor::K2_TeleportTo` as the fallback, and the hero's location is read back
+  afterwards so the log states which one actually moved it.
+- Fixed the town map producing three failed lookups per confirm. There the screen
+  decides `ID=None`, because that world's `RODAccessibleGimmicks` holds two
+  gimmicks of its own rather than the floor's terminals. It is now refused once,
+  by name, instead of being treated as a missing terminal.
+- Fixed confirming a destination hanging the screen. The native flow announces
+  the choice with `ServerDecideFastTravel(ID)` and then waits for the server to
+  move the hero; away from a terminal `FastTravelStatus` is `Disable`, the server
+  does nothing, and the screen stays up with a live cursor. Measured as three
+  `ServerDecideFastTravel` calls roughly 200 ms apart for one confirm, no travel,
+  and a stuck screen. The mod now performs the travel from the announced ID and
+  dismisses the screen. The three repeats are collapsed by a gate set
+  synchronously in the hook, so only the first queues work.
 - Fixed the fast travel screen never being constructed.
   `ARODPlayerState::OpenMenu(EMenuKind)` is not the local UI entry point: with
   the kind confirmed correct in the same run — `MENU WIDGET MAP | EMenuKind 66 ->
@@ -892,25 +923,34 @@ work, and emits one concise world fault. It is not retried every poll cycle.
 
 ### Known limitations
 
-- **The teleport half is not yet adapted to the new screen.** The selection and
-  confirm pipeline — `resolveSelectedMapIcon`, the `UpdateIcon` destination
-  cache, and the `MapDecidedEvent` / `MapClickEvent` interception — is built on
-  `URODMapMenuWidgetBase` members that `URODFastTravelMenuWidget` does not share.
-  Against the fast travel screen those hooks stay inert by construction, and the
-  screen's own native behaviour runs untouched. Whether that native behaviour
-  already teleports on its own is the open question: `WBP_Map_FastTravel_C`
-  carries a `NotTeleportMessageWindowText` and the player state reports
-  `FastTravelStatus=Disable` away from a terminal, so it may well refuse. The
-  observation hooks answer it in one session — a `FT MAP | native
-  ServerDecideFastTravel` line means the game does it all; a terminal click with
-  no such line means the mod has to.
+- **Pins cannot be confirmed on this screen.** `WBP_Map_FastTravel_C` is a
+  terminal picker: only terminal icons reach
+  `OnDetailMapTermialIconClickDelegate`. As a working substitute,
+  `fasttravel pin <index>` travels to any pin listed by `fasttravel pins`, taking
+  the destination from `FRODMapPin::Pos`. Making pins clickable on the screen
+  itself needs the generic `OnInputClickEvent` to fire for them, which is now
+  logged at normal level so the next run shows whether it does.
+- The screen shows `<MISSING STRING TABLE ENTRY>` for its headline and icon
+  legend, as does FieldEquipmentMod's Equipment screen. The shared trait is that
+  both widgets are built with `UWidgetBlueprintLibrary::Create` rather than by
+  the game's menu factory. The specific theory that `Create` leaves
+  `UIManagerRef` and `PlayerControllerRef` null has been tested and is **wrong**:
+  UE4SS refuses to write either (`[push_weakobjectproperty] Operation::Set is not
+  supported`) and the read-back showed both already correctly populated. The
+  cause is elsewhere and is not yet identified.
+- The old `WBP_Map_C` selection pipeline — `resolveSelectedMapIcon`, the
+  `UpdateIcon` destination cache, and the `MapDecidedEvent` / `MapClickEvent`
+  interception — reads `URODMapMenuWidgetBase` members that
+  `URODFastTravelMenuWidget` does not share. It stays inert against the fast
+  travel screen by construction and is kept for `MAP_TARGET = "map"`.
 - The menu key sent to `ActivateFPCameraMenuAbility` is resolved rather than
   configured: the ability's own `LevelSequenceMap` keys first, then keys observed
   from the game's own menu activations, then `MAP_MENU_KEY`. This affects only
   `MAP_TARGET = "map"`.
-- Teleporting, where the mod performs it, uses `ServerDebugTeleportGimmick(FVector)`
-  with the icon's native map position. It is not the native
-  `ServerDecideFastTravel(ID)` transaction, so no `FastTravelStatus` is written.
+- Fast Travel works from a floor map only, not from the town map.
+- The move is a position change, not the native fast travel transaction. No
+  `FastTravelStatus` is written and no terminal is impersonated, so the arrival
+  cutscene, fade and partner warp the native path would play do not happen.
 
 ## New Experience Notifications component
 

@@ -1,4 +1,4 @@
--- FastTravelMod v0.5.1
+-- FastTravelMod v0.7.0
 --
 -- TWO MAPS, ONE OF THEM WRONG
 --
@@ -24,20 +24,49 @@
 -- The open now uses the Create + DebugOpenMenu + OpenMenu sequence that
 -- FieldEquipmentMod already relies on for its Equipment screen.
 --
+-- WHO PERFORMS THE TELEPORT
+--
+-- The screen decides the destination natively and announces it through
+-- ARODPlayerState::ServerDecideFastTravel(ID). Away from a terminal the player
+-- state sits at EFastTravelStatus::Disable, so the server does nothing with that
+-- decision and the screen hangs waiting. This mod therefore takes the ID the
+-- game chose, resolves it against ARODGameState::RODAccessibleGimmicks, and
+-- moves the hero itself. At a real terminal the native transaction is live and
+-- is left untouched.
+--
+-- The move does not go through ARODAvatarCharacter::ServerDebugTeleportGimmick,
+-- which this mod used to document as its teleport and which moves nothing. See
+-- the note above performTeleport.
+--
+-- WHERE IT WORKS
+--
+-- Floor maps only. On the town map the screen decides ID=None: the town world's
+-- RODAccessibleGimmicks holds that world's own gimmicks, not the floor's
+-- terminals, so there is nothing there to travel to. That case is refused with
+-- one line rather than three failed lookups.
+--
 -- Adds a native-styled Fast Travel row to Echoes of Aincrad's Start Menu and
--- opens the game's ordinary WBP_Map screen in teleport mode. Confirming an
--- eligible selected icon teleports through the hero's native server RPC.
+-- opens the game's fast travel map. Confirming a terminal teleports the hero.
 --
 -- Runtime contract: SDK/template 1.0.3
+--   EMenuKind::FastTravelMenu = 66
+--   UWidgetBlueprintLibrary::Create
+--   URODWidgetBPFunctionLibrary::DebugOpenMenu / OpenMenu / EndMenu
+--   URODWidgetData::MenuWidgetMap
+--   ARODPlayerState::ServerDecideFastTravel(ID)
+--   ARODGameState::RODAccessibleGimmicks
+--   ARODAccessibleGimmickBase::ID / WarpOutTransforms / AccessTransforms
+--   ARODGameState::MapPins (FRODMapPin::Pos)
+--   ARODInGamePlayerController::ServerDebugTeleport(FVector)
+--   AActor::K2_TeleportTo(FVector, FRotator)
+--   WBP_Map_FastTravel_C
+--
+--   MAP_TARGET = "map" only:
 --   EMenuKind::MapMenu = 31
---   ARODInGamePlayerController::EndMainMenu(true)
---   UGameplayAbility::GetAbilitySystemComponentFromActorInfo()
---   UGameplayAbility::AbilityTriggers
+--   ARODInGamePlayerController::EndMainMenu(true) / EndMapMenu(AllClose)
 --   ARODAvatarCharacter::ActivateFPCameraMenuAbility(EventTag, MenuKey, Target)
 --   UGA_AvatarMenu_FirstPersonCamera_C::LevelSequenceMap / CurrentMenuKey
---   ARODInGamePlayerController::EndMapMenu(AllClose)
 --   URODMapMenuWidgetBase::UpdateIcon(...)
---   ARODAvatarCharacter::ServerDebugTeleportGimmick(FVector)
 --   WBP_Map_C
 --
 -- HOW THE MAP IS OPENED, AND WHY IT USED TO FAIL
@@ -67,7 +96,7 @@
 -- is unavailable, the operation stops and reports the error.
 
 local MOD_NAME = "FastTravelMod"
-local MOD_VERSION = "v0.5.1"
+local MOD_VERSION = "v0.7.0"
 local SUPPORTED_SDK = "Echoes of Aincrad 1.0.3"
 
 local MAIN_MENU_ICON_CLASS =
@@ -1811,6 +1840,29 @@ local function openFastTravelMenu(serial)
         end
         widget.MenuKind = MENU_KIND_FAST_TRAVEL_MENU
 
+        -- Settled by measurement: Create already leaves PlayerControllerRef and
+        -- UIManagerRef populated here. v0.6.0 wrote them on the theory that they
+        -- were null and were the cause of the <MISSING STRING TABLE ENTRY>
+        -- labels. UE4SS rejected both writes outright --
+        -- "[push_weakobjectproperty] Operation::Set is not supported" -- and the
+        -- read-back still showed the correct UI manager and controller. The
+        -- theory is dead, so the writes are gone. The read-back is kept as a
+        -- debug line so a real regression in these refs stays visible.
+        local controllerRefName = "<unset>"
+        local uiManagerRefName = "<unset>"
+        pcall(function()
+            controllerRefName =
+                tostring(objectName(weakObject(widget.PlayerControllerRef)))
+        end)
+        pcall(function()
+            uiManagerRefName =
+                tostring(objectName(weakObject(widget.UIManagerRef)))
+        end)
+        dbg(string.format(
+            "WIDGET REFS | PlayerControllerRef=%s | UIManagerRef=%s",
+            controllerRefName,
+            uiManagerRefName))
+
         local handle = rodLibrary:DebugOpenMenu(controller, widget)
         if handle == nil then
             error("DebugOpenMenu returned no fast travel handle")
@@ -2079,6 +2131,114 @@ local function resolveSelectedMapIcon(mapWidget)
     return iconWidget, kind, kindName, destination
 end
 
+-- ARODAvatarCharacter::ServerDebugTeleportGimmick was the mod's documented
+-- teleport and it does not move the hero. Measured: a complete MOD TELEPORT line
+-- with a real WarpOutTransforms[Hero1] position, followed by nothing. The name
+-- explains it -- ARODGameState carries both a DebugTeleportPos field and its own
+-- ServerDebugTeleportGimmick, so the avatar call looks like it parks a position
+-- for a gimmick warp to consume later rather than performing one.
+--
+-- ARODInGamePlayerController::ServerDebugTeleport(FVector) is the controller
+-- level debug teleport and is tried first. AActor::K2_TeleportTo is the engine's
+-- own and cannot silently do nothing, so it is the fallback. Which one actually
+-- moved the hero is read back from the world rather than assumed.
+local TELEPORT_VERIFY_DELAY_MS = 500
+local TELEPORT_ARRIVAL_TOLERANCE = 1500.0
+
+local function heroLocation()
+    local hero, heroError = resolveLocalHero()
+    if hero == nil then return nil, tostring(heroError) end
+    local position = nil
+    local ok, readError = pcall(function()
+        local location = hero:K2_GetActorLocation()
+        position = {
+            X = tonumber(location.X),
+            Y = tonumber(location.Y),
+            Z = tonumber(location.Z),
+        }
+    end)
+    if not ok or position == nil or position.X == nil then
+        return nil, "hero location unreadable: " .. tostring(readError)
+    end
+    return position, nil
+end
+
+local function planarDistance(a, b)
+    if a == nil or b == nil then return nil end
+    local dx = a.X - b.X
+    local dy = a.Y - b.Y
+    return math.sqrt(dx * dx + dy * dy)
+end
+
+local function performTeleport(position, label)
+    local before = heroLocation()
+
+    local primaryOk, primaryError = pcall(function()
+        local controller, controllerError = resolveLocalController()
+        if controller == nil then error(controllerError) end
+        controller:ServerDebugTeleport(position)
+    end)
+    log(string.format(
+        "TELEPORT | %s | ServerDebugTeleport called=%s%s | target=(%.1f, %.1f, %.1f)",
+        label,
+        tostring(primaryOk),
+        primaryOk and "" or (" | " .. tostring(primaryError)),
+        position.X, position.Y, position.Z))
+
+    local scheduled, scheduleError = pcall(function()
+        ExecuteWithDelay(TELEPORT_VERIFY_DELAY_MS, function()
+            ExecuteInGameThread(function()
+                local after = heroLocation()
+                local distance = planarDistance(after, position)
+                if distance ~= nil and distance <= TELEPORT_ARRIVAL_TOLERANCE then
+                    log(string.format(
+                        "TELEPORT | %s | arrived via ServerDebugTeleport | %.0f cm from target",
+                        label, distance))
+                    return
+                end
+
+                log(string.format(
+                    "TELEPORT | %s | ServerDebugTeleport did not move the hero" ..
+                        " (%s cm away); falling back to K2_TeleportTo",
+                    label,
+                    distance == nil and "?" or string.format("%.0f", distance)))
+
+                local hero, heroError = resolveLocalHero()
+                if hero == nil then
+                    log("FAST TRAVEL ERROR | " .. tostring(heroError))
+                    return
+                end
+                local fallbackOk, fallbackError = pcall(function()
+                    hero:K2_TeleportTo(position, hero:K2_GetActorRotation())
+                end)
+                if not fallbackOk then
+                    log("FAST TRAVEL ERROR | K2_TeleportTo failed: " ..
+                        tostring(fallbackError))
+                    return
+                end
+
+                local settled = heroLocation()
+                local settledDistance = planarDistance(settled, position)
+                log(string.format(
+                    "TELEPORT | %s | K2_TeleportTo done | %s cm from target",
+                    label,
+                    settledDistance == nil and "?"
+                        or string.format("%.0f", settledDistance)))
+            end)
+        end)
+    end)
+    if not scheduled then
+        log("FAST TRAVEL ERROR | teleport verification scheduling failed: " ..
+            tostring(scheduleError))
+    end
+
+    if before ~= nil then
+        dbg(string.format(
+            "TELEPORT | %s | departed from (%.1f, %.1f, %.1f)",
+            label, before.X, before.Y, before.Z))
+    end
+end
+
 local function finalizeMapTeleport(source)
     local finalizeOk, finalizeError = xpcall(function()
         restorePlayableCamera(source)
@@ -2129,21 +2289,9 @@ local function requestSelectedMapTeleport(mapWidget, source)
         destination.position.Z,
         tostring(objectName(iconWidget))))
 
-    local hero, heroError = resolveLocalHero()
-    if hero == nil then
-        mapTeleportBusy = false
-        log("FAST TRAVEL ERROR | " .. tostring(heroError))
-        return
-    end
-    local teleported, teleportError = pcall(function()
-        hero:ServerDebugTeleportGimmick(destination.position)
-    end)
-    if not teleported then
-        mapTeleportBusy = false
-        log("FAST TRAVEL ERROR | ServerDebugTeleportGimmick failed: " ..
-            tostring(teleportError))
-        return
-    end
+    performTeleport(
+        destination.position,
+        string.format("%s icon", tostring(iconKindName)))
 
     local closed, closeError = pcall(function()
         if isPresentedTeleportMapWidget(mapWidget) then
@@ -2170,6 +2318,204 @@ local function requestSelectedMapTeleport(mapWidget, source)
     if not scheduled then
         mapTeleportBusy = false
         failCurrentMenu("teleport finalization scheduling failed: " ..
+            tostring(scheduleError))
+    end
+end
+
+--========================================================--
+--        NATIVE DECISION, MOD-PERFORMED TELEPORT         --
+--========================================================--
+-- Confirming a destination on WBP_Map_FastTravel_C calls
+-- ARODPlayerState::ServerDecideFastTravel(ID) and then waits for the server to
+-- move the hero. Away from a terminal the player state sits at
+-- EFastTravelStatus::Disable, so the server does nothing and the screen hangs
+-- with its cursor still live. That is exactly what was measured: three
+-- ServerDecideFastTravel calls about 200 ms apart for one confirm, no travel,
+-- and a stuck screen.
+--
+-- The decided ID is the useful part, and it is better than anything the old
+-- WBP_Map_C path had: ARODGameState keeps every ARODAccessibleGimmickBase in
+-- RODAccessibleGimmicks, each carrying its own ID and the transforms the game
+-- warps players to. The destination therefore comes from the terminal actor
+-- rather than from a screen-space icon position.
+--
+-- At a real terminal the native transaction works and must be left alone, so
+-- this runs only while the mod's own screen is open and only when the player
+-- state says the native path will not fire.
+
+local nativeDecisionBusy = false
+local NATIVE_DECISION_COOLDOWN_MS = 1500
+
+local function usableTranslation(source)
+    local position = nil
+    local ok = pcall(function()
+        position = {
+            X = tonumber(source.X),
+            Y = tonumber(source.Y),
+            Z = tonumber(source.Z),
+        }
+    end)
+    if not ok or position == nil
+        or position.X == nil or position.Y == nil or position.Z == nil then
+        return nil
+    end
+    -- A terminal at the world origin is a default-constructed transform, not a
+    -- place worth dropping the hero into.
+    if position.X == 0.0 and position.Y == 0.0 and position.Z == 0.0 then
+        return nil
+    end
+    return position
+end
+
+local function terminalDestination(gimmick)
+    local position = nil
+    local source = nil
+
+    pcall(function()
+        local warpOut = gimmick.WarpOutTransforms
+        if warpOut == nil then return end
+        warpOut:ForEach(function(key, value)
+            if position ~= nil then return end
+            local transform = value:get()
+            if transform == nil then return end
+            local candidate = usableTranslation(transform.Translation)
+            if candidate ~= nil then
+                position = candidate
+                local keyName = "?"
+                pcall(function()
+                    keyName = exactFNameString(key:get(), "WarpOutTransforms key")
+                end)
+                source = "WarpOutTransforms[" .. keyName .. "]"
+            end
+        end)
+    end)
+
+    if position == nil then
+        pcall(function()
+            local access = gimmick.AccessTransforms
+            if access == nil or #access < 1 then return end
+            local candidate = usableTranslation(access[1].Translation)
+            if candidate ~= nil then
+                position = candidate
+                source = "AccessTransforms[1]"
+            end
+        end)
+    end
+
+    if position == nil then
+        pcall(function()
+            local candidate = usableTranslation(gimmick:K2_GetActorLocation())
+            if candidate ~= nil then
+                position = candidate
+                source = "actor location"
+            end
+        end)
+    end
+
+    if position == nil then return nil end
+    return { position = position, source = source, gimmick = gimmick }
+end
+
+local function resolveTerminalDestination(idName)
+    local gameState, gameStateError = resolveWorldGameState()
+    if gameState == nil then return nil, tostring(gameStateError) end
+
+    local gimmicks = nil
+    local listOk, listError = pcall(function()
+        gimmicks = gameState.RODAccessibleGimmicks
+    end)
+    if not listOk or gimmicks == nil then
+        return nil, "RODAccessibleGimmicks is unavailable: " ..
+            tostring(listError)
+    end
+
+    local count = 0
+    pcall(function() count = #gimmicks end)
+    if count == 0 then
+        return nil, "RODAccessibleGimmicks is empty"
+    end
+
+    for index = 1, count do
+        local gimmick = nil
+        pcall(function() gimmick = gimmicks[index] end)
+        if isValid(gimmick) then
+            local gimmickId = nil
+            pcall(function()
+                gimmickId =
+                    exactFNameString(gimmick.ID, "accessible gimmick ID")
+            end)
+            if gimmickId == idName then
+                local destination = terminalDestination(gimmick)
+                if destination == nil then
+                    return nil, "terminal " .. idName ..
+                        " exposes no usable destination transform"
+                end
+                return destination, nil
+            end
+        end
+    end
+    return nil, string.format(
+        "no accessible gimmick among %d carries ID %s", count, idName)
+end
+
+local function handleNativeFastTravelDecision(idName)
+    local state = nil
+    local stateOk, stateError = pcall(function()
+        state = readNativeTravelState()
+    end)
+    if not stateOk then
+        log("FAST TRAVEL ERROR | native state unreadable at decision: " ..
+            tostring(stateError))
+        return
+    end
+    if state.fastTravelStatus == FAST_TRAVEL_STATUS_ENABLE
+        or state.accessingTerminal == true then
+        log("native Fast Travel is live; leaving the decision to the game" ..
+            " | ID=" .. idName)
+        return
+    end
+
+    local destination, destinationError = resolveTerminalDestination(idName)
+    if destination == nil then
+        log("FAST TRAVEL ERROR | " .. tostring(destinationError))
+        return
+    end
+
+    log(string.format(
+        "MOD TELEPORT | ID=%s | from=%s | pos=(%.1f, %.1f, %.1f) | actor=%s",
+        idName,
+        tostring(destination.source),
+        destination.position.X,
+        destination.position.Y,
+        destination.position.Z,
+        tostring(objectName(destination.gimmick))))
+
+    performTeleport(destination.position, "terminal " .. idName)
+
+    -- The screen is waiting on a transaction that will never land, so it has to
+    -- be dismissed here or it keeps the cursor and swallows input.
+    local dismissed, dismissError = pcall(function()
+        local rodLibrary, libraryError = resolveRodWidgetLibrary()
+        if rodLibrary == nil then error(libraryError) end
+        local controller, controllerError = resolveLocalController()
+        if controller == nil then error(controllerError) end
+        rodLibrary:EndMenu(controller)
+        controller:EndMainMenu(true)
+    end)
+    if not dismissed then
+        log("FAST TRAVEL ERROR | menu dismissal failed: " ..
+            tostring(dismissError))
+    end
+
+    local scheduled, scheduleError = pcall(function()
+        ExecuteWithDelay(TELEPORT_FINALIZE_DELAY_MS, function()
+            ExecuteInGameThread(function()
+                finalizeMapTeleport("fast travel map")
+            end)
+        end)
+    end)
+    if not scheduled then
+        log("FAST TRAVEL ERROR | teleport finalization scheduling failed: " ..
             tostring(scheduleError))
     end
 end
@@ -2560,10 +2906,14 @@ optionalHook(
     end
 )
 
+-- Logged rather than dbg'd on purpose. WBP_Map_FastTravel_C is a terminal
+-- picker: only terminal icons reach OnDetailMapTermialIconClickDelegate, which
+-- is why pins on it cannot be confirmed. This generic click is the one place a
+-- pin click could still surface, so what it delivers needs to be visible.
 optionalHook(
     "/Script/ROD.RODFastTravelMenuWidget:OnInputClickEvent",
     function(selfParameter, widgetParameter, buttonParameter, typeParameter)
-        dbg(string.format(
+        log(string.format(
             "FT MAP | input click | widget=%s | button=%s | type=%s",
             tostring(objectName(hookValue(widgetParameter))),
             tostring(tonumber(hookValue(buttonParameter))),
@@ -2582,12 +2932,52 @@ optionalHook(
 optionalHook(
     "/Script/ROD.RODPlayerState:ServerDecideFastTravel",
     function(selfParameter, idParameter)
-        local id = "<unreadable>"
+        local id = nil
         pcall(function()
             id = exactFNameString(
                 hookValue(idParameter), "ServerDecideFastTravel ID")
         end)
-        log("FT MAP | native ServerDecideFastTravel | ID=" .. id)
+        log("FT MAP | native ServerDecideFastTravel | ID=" ..
+            tostring(id))
+
+        if id == nil then return end
+        -- Only the mod's own screen is taken over; a real terminal keeps its
+        -- native transaction.
+        if not teleportMapModeActive then return end
+        -- "None" is the screen telling us it could not decide a destination.
+        -- It is what the city map produces: RODAccessibleGimmicks there holds
+        -- the two gimmicks of the town world, not the floor's terminals, so
+        -- there is nothing on that map this can travel to. Refused once, quietly,
+        -- instead of three failed lookups.
+        if id == "None" then
+            if not nativeDecisionBusy then
+                nativeDecisionBusy = true
+                ExecuteWithDelay(NATIVE_DECISION_COOLDOWN_MS, function()
+                    nativeDecisionBusy = false
+                end)
+                log("FAST TRAVEL | this map decided no destination (ID=None)." ..
+                    " Fast Travel works from a floor map, not the town map.")
+            end
+            return
+        end
+        -- One confirm produces three of these about 200 ms apart. The gate is
+        -- set here, synchronously, so the second and third never queue work.
+        if nativeDecisionBusy then return end
+        nativeDecisionBusy = true
+        ExecuteWithDelay(NATIVE_DECISION_COOLDOWN_MS, function()
+            nativeDecisionBusy = false
+        end)
+
+        ExecuteWithDelay(0, function()
+            ExecuteInGameThread(function()
+                local ok, handlerError =
+                    xpcall(handleNativeFastTravelDecision, debug.traceback, id)
+                if not ok then
+                    log("FAST TRAVEL ERROR | decision handling failed: " ..
+                        tostring(handlerError))
+                end
+            end)
+        end)
     end
 )
 
@@ -2877,6 +3267,54 @@ local commandOk, commandError = pcall(function()
                 return true
             end
 
+            -- WBP_Map_FastTravel_C only confirms terminals, so a pin cannot be
+            -- selected on it. FRODMapPin carries a world Pos, though, so the
+            -- destination itself is available: this travels to a pin by its
+            -- index in "fasttravel pins".
+            if subcommand == "pin" then
+                local index = tonumber(params[2])
+                if index == nil or index < 1 then
+                    reply("Usage: fasttravel pin <index from 'fasttravel pins'>")
+                    return true
+                end
+                reply("Pin travel scheduled; see the UE4SS console.")
+                ExecuteInGameThread(function()
+                    local ok, pinError = xpcall(function()
+                        local gameState, gameStateError = resolveWorldGameState()
+                        if gameState == nil then error(gameStateError) end
+                        local pins = gameState.MapPins
+                        local count = #pins
+                        if index > count then
+                            error(string.format(
+                                "pin %d does not exist; the map holds %d",
+                                index, count))
+                        end
+                        local pin = pins[index]
+                        if pin == nil then
+                            error("MapPins[" .. index .. "] is unavailable")
+                        end
+                        local position = {
+                            X = tonumber(pin.Pos.X),
+                            Y = tonumber(pin.Pos.Y),
+                            Z = tonumber(pin.Pos.Z),
+                        }
+                        if position.X == nil or position.Y == nil
+                            or position.Z == nil then
+                            error("pin position is not numeric")
+                        end
+                        performTeleport(
+                            position,
+                            string.format(
+                                "pin %d kind=%s",
+                                index, tostring(pin.Kind)))
+                    end, debug.traceback)
+                    if not ok then
+                        log("PIN TRAVEL ERROR | " .. tostring(pinError))
+                    end
+                end)
+                return true
+            end
+
             if subcommand == "menukeys" then
                 reply(
                     "Menu key report scheduled; output goes to the UE4SS console.")
@@ -2945,7 +3383,8 @@ local commandOk, commandError = pcall(function()
             end
 
             reply(
-                "Usage: fasttravel status | open | menukeys | terminals | pins")
+                "Usage: fasttravel status | open | pins | pin <index> | " ..
+                "terminals | menukeys")
             return true
         end
     )

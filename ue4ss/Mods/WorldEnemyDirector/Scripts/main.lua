@@ -402,7 +402,6 @@ local function scheduleReferenceCollection()
     gcScheduled = true
     ExecuteWithDelay(1, function()
         gcScheduled = false
-        collectgarbage("collect")
     end)
 end
 
@@ -1694,7 +1693,7 @@ local function takePendingSpawn(actorKey)
     return nil
 end
 
-local function registerEnemy(enemy, reused)
+local function registerEnemy(enemy, reused, queued)
     if not isValid(enemy) then return end
     local key = objectKey(enemy)
     if key == nil or key:find("Default__", 1, true) ~= nil then return end
@@ -1747,6 +1746,14 @@ local function registerEnemy(enemy, reused)
     end
     local baseline, snapshotError = snapshotEnemy(enemy)
     if baseline == nil then
+        if request == nil and queued ~= nil and (snapshotError == "required skeletal mesh is unavailable" or snapshotError == "required enemy fields are unreadable") then
+            local retryCount = (queued.retryCount or 0) + 1
+            if retryCount <= 5 then
+                queued.retryCount = retryCount
+                objectQueue[#objectQueue + 1] = queued
+                return
+            end
+        end
         log("ENEMY ERROR | " .. key .. " | " .. snapshotError)
         if request ~= nil then
             destroyPending(request, "required enemy state was unavailable")
@@ -2468,7 +2475,7 @@ local function tick(stepMs)
     for _ = 1, MAX_DISCOVERY_PER_TICK do
         local queued = table.remove(objectQueue, 1)
         if queued == nil then break end
-        registerEnemy(queued.object, queued.reused)
+        registerEnemy(queued.object, queued.reused, queued)
         if os.clock() - discoveryStartTime > MAX_DISCOVERY_SEC then break end
     end
     if discoveryBatch

@@ -24,6 +24,13 @@ local lastDisplayError = nil
 local acquisitionReadyReported = false
 local displayReadyReported = false
 
+pcall(function()
+    RegisterHook("/Script/Engine.PlayerController:ClientRestart", function()
+        cachedMessageLog = nil
+        cachedWidgetLibrary = nil
+    end)
+end)
+
 local function log(message)
     print(string.format("[%s] %s\n", MOD_NAME, tostring(message)))
 end
@@ -150,7 +157,16 @@ local function queueEnemyAcquisition(sourceParameter, acquisitionParameter)
     queueDisplay(amount)
 end
 
+local cachedMessageLog = nil
+local cachedWidgetLibrary = nil
+
 local function resolveNotificationUi()
+    if isValid(cachedMessageLog) and isValid(cachedWidgetLibrary) then
+        return cachedMessageLog, cachedWidgetLibrary, nil
+    end
+    cachedMessageLog = nil
+    cachedWidgetLibrary = nil
+
     local ok, messageLog, widgetLibrary = pcall(function()
         return FindFirstOf("RODInfoMessageLogWidget"),
             StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary")
@@ -165,7 +181,9 @@ local function resolveNotificationUi()
     if not isValid(widgetLibrary) then
         return nil, nil, "canonical WidgetBlueprintLibrary is unavailable"
     end
-    return messageLog, widgetLibrary, nil
+    cachedMessageLog = messageLog
+    cachedWidgetLibrary = widgetLibrary
+    return cachedMessageLog, cachedWidgetLibrary, nil
 end
 
 displayExperience = function(amount)
