@@ -41,7 +41,23 @@ end
 
 local function isValid(object)
     if object == nil then return false end
-    local ok, valid = pcall(function() return object:IsValid() end)
+    local kind = type(object)
+    if kind ~= "userdata" and kind ~= "table" then return false end
+    local ok, valid = pcall(function()
+        if type(object.get_address) == "function" then
+            local addr = object:get_address()
+            if addr == nil or addr == 0 then return false end
+        elseif type(object.GetAddress) == "function" then
+            local addr = object:GetAddress()
+            if addr == nil or addr == 0 then return false end
+        end
+        if type(object.IsValid) == "function" then
+            return object:IsValid()
+        elseif type(object.is_valid) == "function" then
+            return object:is_valid()
+        end
+        return true
+    end)
     return ok and valid == true
 end
 
@@ -123,9 +139,12 @@ end
 
 local function queueEnemyAcquisition(sourceParameter, acquisitionParameter)
     if CONFIG == nil or not CONFIG.ENABLED then return end
-    local source = readHookValue(sourceParameter, "Source")
-    if not isValid(source) then
-        error("ApplyAcquisition supplied an invalid Source")
+    local source
+    local okRead, readErr = pcall(function()
+        source = readHookValue(sourceParameter, "Source")
+    end)
+    if not okRead or not isValid(source) then
+        return
     end
 
     local okEnemy, isEnemy = pcall(function()
@@ -264,15 +283,17 @@ end
 requireHook(
     "/Script/ROD.RODGameState:ApplyAcquisition",
     function(_, sourceParameter, acquisitionParameter)
-        local ok, hookError = xpcall(
-            function()
-                queueEnemyAcquisition(sourceParameter, acquisitionParameter)
-            end,
-            debug.traceback
-        )
-        if not ok then
-            log("ACQUISITION HOOK ERROR | " .. tostring(hookError))
-        end
+        ExecuteInGameThread(function()
+            local ok, hookError = xpcall(
+                function()
+                    queueEnemyAcquisition(sourceParameter, acquisitionParameter)
+                end,
+                debug.traceback
+            )
+            if not ok then
+                log("ACQUISITION HOOK ERROR | " .. tostring(hookError))
+            end
+        end)
     end
 )
 

@@ -70,7 +70,23 @@ local isOpen = false
 
 local function isValid(object)
     if object == nil then return false end
-    local ok, valid = pcall(function() return object:IsValid() end)
+    local kind = type(object)
+    if kind ~= "userdata" and kind ~= "table" then return false end
+    local ok, valid = pcall(function()
+        if type(object.get_address) == "function" then
+            local addr = object:get_address()
+            if addr == nil or addr == 0 then return false end
+        elseif type(object.GetAddress) == "function" then
+            local addr = object:GetAddress()
+            if addr == nil or addr == 0 then return false end
+        end
+        if type(object.IsValid) == "function" then
+            return object:IsValid()
+        elseif type(object.is_valid) == "function" then
+            return object:is_valid()
+        end
+        return true
+    end)
     return ok and valid == true
 end
 
@@ -382,6 +398,8 @@ local function destroyPanel()
     canvas = nil
     rowWidgets = {}
     titleWidgets = nil
+    host = nil
+    styleSource = nil
 end
 
 local function buildPanel()
@@ -713,15 +731,13 @@ function Panel.open()
 end
 
 function Panel.close()
-    if not isOpen then return end
     isOpen = false
     destroyPanel()
-    -- Each opening starts from a deterministic collapsed model. Persisting the
-    -- previous expansion made Enter collapse a mod that visually looked newly
-    -- opened, after which Left/Right acted on the wrong row.
     expandedMod = nil
     selectionIndex = 1
     scrollOffset = 0
+    host = nil
+    styleSource = nil
 end
 
 -- Dumps the host widget tree so the exact canvas/child names can be confirmed

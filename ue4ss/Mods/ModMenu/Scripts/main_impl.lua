@@ -97,7 +97,23 @@ end
 
 local function isValid(object)
     if object == nil then return false end
-    local ok, valid = pcall(function() return object:IsValid() end)
+    local kind = type(object)
+    if kind ~= "userdata" and kind ~= "table" then return false end
+    local ok, valid = pcall(function()
+        if type(object.get_address) == "function" then
+            local addr = object:get_address()
+            if addr == nil or addr == 0 then return false end
+        elseif type(object.GetAddress) == "function" then
+            local addr = object:GetAddress()
+            if addr == nil or addr == 0 then return false end
+        end
+        if type(object.IsValid) == "function" then
+            return object:IsValid()
+        elseif type(object.is_valid) == "function" then
+            return object:is_valid()
+        end
+        return true
+    end)
     return ok and valid == true
 end
 
@@ -328,6 +344,48 @@ local function countForeignInjectedRows(parent, mainList, nativeCount)
         end
     end
     return foreign
+end
+
+-- True when another mod's injected row sits above this one on the rail.
+--
+-- The boundary with the native rows belongs to whichever injected row is
+-- physically first, and that has to be re-read from the live tree on every
+-- press. foreignRows only says how many other injected rows exist, not where
+-- they are, so gating on it made this mod stand down whenever any other row was
+-- present at all -- while FastTravelMod had recorded at injection time that it
+-- was not the first injected row and had stood down too. On a floor, where both
+-- mods inject, that left nobody carrying focus off the last native row and
+-- neither custom row could be reached. In town the pair never met, because with
+-- no travel destination FastTravelMod injects nothing.
+local function hasInjectedRowAbove(context)
+    if context == nil then return false end
+    local parent = context.wrapperParent
+    if not isValid(parent) or not isValid(context.wrapperPanel) then return false end
+
+    local childCount = nil
+    pcall(function() childCount = parent:GetChildrenCount() end)
+    if type(childCount) ~= "number" then return false end
+
+    local authored = {}
+    for index = 0, MAX_NATIVE_MENU_ITEMS - 1 do
+        local _, wrapper = menuItemAndPanel(context.mainList, index)
+        if isValid(wrapper) then authored[objectName(wrapper)] = true end
+    end
+
+    local ownKey = objectName(context.wrapperPanel)
+    for index = 0, childCount - 1 do
+        local child = nil
+        pcall(function() child = parent:GetChildAt(index) end)
+        if isValid(child) then
+            local key = objectName(child)
+            -- Reaching our own row first means everything above it is native.
+            if key == ownKey then return false end
+            if not authored[key] and iconInsideWrapper(child) ~= nil then
+                return true
+            end
+        end
+    end
+    return false
 end
 
 -- Draws a letter over the row instead of relying on a texture. The donor wrapper
@@ -995,11 +1053,13 @@ local function handleButton(widgetParameter, buttonParameter)
     end
 
     -- Downwards off the last row on the rail wraps into Mods. When another mod
-    -- owns the row above, that mod hands focus over itself, so only the plain
-    -- no-other-mods case is claimed here.
+    -- owns the row directly above the native ones, that mod claims this boundary
+    -- and hands focus down over itself, so only the case where Mods is the first
+    -- injected row is claimed here.
     local context = activeContext
-    if context == nil or context.foreignRows > 0 then return end
+    if context == nil then return end
     if not contains(objectName(widget), "WBP_Console_MainMenu_List_C") then return end
+    if hasInjectedRowAbove(context) then return end
 
     local index = nil
     pcall(function() index = widget:GetItemIndex() end)
@@ -1099,6 +1159,7 @@ local function processMenuInjectionCycle()
         local staleKey = activeContext.mainMenuKey
         activeContext = nil
         if staleKey ~= nil then injectedMenus[staleKey] = nil end
+        panel.close()
     end
 
     for menuKey, readyAt in pairs(pendingMenuInjections) do
@@ -1255,9 +1316,10 @@ ensureInputHooks = function()
             local previousIndex = listFocusIndexes[listKey]
             listFocusIndexes[listKey] = index
 
-            -- When another mod owns a row on this rail it drives the boundary
-            -- itself, and stealing focus here would fight it.
-            if context.foreignRows > 0 then return end
+            -- When another mod owns the row directly above the native ones it
+            -- drives this boundary itself, and stealing focus here would fight
+            -- it. Asked of the live rail, not of the injection-time count.
+            if hasInjectedRowAbove(context) then return end
 
             local lastNativeIndex = context.modsIndex - 1
             local wrappedDown = previousIndex == lastNativeIndex and index == 0

@@ -258,7 +258,21 @@ local function isValid(object)
     if object == nil then return false end
     local kind = type(object)
     if kind ~= "userdata" and kind ~= "table" then return false end
-    local ok, valid = pcall(function() return object:IsValid() end)
+    local ok, valid = pcall(function()
+        if type(object.get_address) == "function" then
+            local addr = object:get_address()
+            if addr == nil or addr == 0 then return false end
+        elseif type(object.GetAddress) == "function" then
+            local addr = object:GetAddress()
+            if addr == nil or addr == 0 then return false end
+        end
+        if type(object.IsValid) == "function" then
+            return object:IsValid()
+        elseif type(object.is_valid) == "function" then
+            return object:is_valid()
+        end
+        return true
+    end)
     return ok and valid == true
 end
 
@@ -276,6 +290,7 @@ local function enemyOperational(enemy)
 end
 
 local function objectKey(object)
+    if not isValid(object) then return nil end
     local ok, name = pcall(function() return object:GetFullName() end)
     if ok and type(name) == "string" and name ~= "" then return name end
     return nil
@@ -2719,7 +2734,11 @@ requireHook(
         pcall(function()
             local obj = context:get()
             if isValid(obj) then
-                queueLifecycleEnemy(obj, false)
+                ExecuteInGameThread(function()
+                    if isValid(obj) then
+                        queueLifecycleEnemy(obj, false)
+                    end
+                end)
             end
         end)
     end
@@ -2732,7 +2751,11 @@ requireHook(
         pcall(function()
             local obj = context:get()
             if isValid(obj) then
-                queueLifecycleEnemy(obj, true)
+                ExecuteInGameThread(function()
+                    if isValid(obj) then
+                        queueLifecycleEnemy(obj, true)
+                    end
+                end)
             end
         end)
     end

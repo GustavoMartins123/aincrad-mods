@@ -282,7 +282,23 @@ end
 
 local function isValid(object)
     if object == nil then return false end
-    local ok, valid = pcall(function() return object:IsValid() end)
+    local kind = type(object)
+    if kind ~= "userdata" and kind ~= "table" then return false end
+    local ok, valid = pcall(function()
+        if type(object.get_address) == "function" then
+            local addr = object:get_address()
+            if addr == nil or addr == 0 then return false end
+        elseif type(object.GetAddress) == "function" then
+            local addr = object:GetAddress()
+            if addr == nil or addr == 0 then return false end
+        end
+        if type(object.IsValid) == "function" then
+            return object:IsValid()
+        elseif type(object.is_valid) == "function" then
+            return object:is_valid()
+        end
+        return true
+    end)
     return ok and valid == true
 end
 
@@ -1601,6 +1617,28 @@ local function railIconsRelativeToOwn(context)
         return nil, nil, "Fast Travel wrapper is detached"
     end
     return before, after, nil
+end
+
+-- Whether this row is the one that borders the native rows, asked of the live
+-- rail on every press.
+--
+-- The boundary belongs to whichever injected row is physically first, and that
+-- cannot be settled at injection time: on a floor both this mod and ModMenu
+-- inject, in whatever order the two independent notification cycles happen to
+-- land. The answer used to be frozen into context.firstInjected, so when ModMenu
+-- injected first this row recorded "not first" permanently -- and ModMenu then
+-- moved itself back to the end of the rail, which left this row bordering the
+-- native ones with its claim already surrendered. Both mods stood down, nothing
+-- carried focus off the last native row, and neither custom row could be
+-- reached. In town the pair never met: with no travel destination this row is
+-- not injected at all, which is why the rail behaved there.
+local function ownsNativeBoundary(context)
+    if context == nil then return false end
+    local before = railIconsRelativeToOwn(context)
+    -- The walk only fails while the rail is being torn down. Fall back to the
+    -- injection-time answer rather than failing the menu from an input hook.
+    if before == nil then return context.firstInjected == true end
+    return #before == 0
 end
 
 local function focusRowAbove(context)
@@ -3401,10 +3439,10 @@ local function handleButton(widgetParameter, buttonParameter)
 
     local context = activeContext
     if context == nil or context.failed
-        or context.firstInjected ~= true
         or not nameContains(widget, K.MAIN_MENU_LIST_FRAGMENT) then
         return
     end
+    if not ownsNativeBoundary(context) then return end
 
     local index = nil
     pcall(function() index = widget:GetItemIndex() end)
@@ -3518,7 +3556,7 @@ requireHook(
 
         local previousIndex = listFocusIndexes[listKey]
         listFocusIndexes[listKey] = index
-        if context.firstInjected ~= true then return end
+        if not ownsNativeBoundary(context) then return end
 
         local wrappedDown =
             previousIndex == context.nativeCount - 1 and index == 0
