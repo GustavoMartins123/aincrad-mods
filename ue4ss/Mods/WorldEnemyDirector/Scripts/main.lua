@@ -2702,6 +2702,7 @@ local function requireHook(path, callback, postCallback)
 end
 
 local function queueLifecycleEnemy(object, reused)
+    if not isValid(object) then return end
     if worldPaused and resumeAtMs == nil then return end
     if CONFIG ~= nil and (not configHealthy or not CONFIG.ENABLED) then return end
     if worldFault ~= nil then return end
@@ -2715,7 +2716,12 @@ requireHook(
     "/Script/ROD.RODEnemyCharacter:OnFinishedInitialize",
     function() end,
     function(context)
-        queueLifecycleEnemy(context:get(), false)
+        pcall(function()
+            local obj = context:get()
+            if isValid(obj) then
+                queueLifecycleEnemy(obj, false)
+            end
+        end)
     end
 )
 
@@ -2723,7 +2729,12 @@ requireHook(
     "/Script/ROD.RODEnemyCharacter:EnemyReused",
     function() end,
     function(context)
-        queueLifecycleEnemy(context:get(), true)
+        pcall(function()
+            local obj = context:get()
+            if isValid(obj) then
+                queueLifecycleEnemy(obj, true)
+            end
+        end)
     end
 )
 
