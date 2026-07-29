@@ -1,175 +1,146 @@
 # FastTravelMod
 
-An independent **Echoes of Aincrad** mod that adds a **Fast Travel** entry to
-the Start Menu and turns the game's regular map into a destination selection
-screen.
+FastTravelMod **v0.14.0** adds a native-styled **Fast Travel** entry to the
+Start Menu in **Echoes of Aincrad**. It opens the game's own fast-travel screen
+and lets the player travel from anywhere on a floor without standing beside a
+terminal.
 
-## Version 0.3.7 scope
+## Requirements
 
-- resolves the map ability owned by the local hero's Ability System, closes the
-  Start Menu, waits for `GA_AvatarMenu_Main_C` to end, and activates the regular
-  map with the ability's own `GameplayEvent` trigger;
-- can be started from anywhere without requiring proximity to a terminal;
-- uses the map icon currently hovered by the cursor or focused by navigation;
-- accepts checkpoints, teleport terminals, safe areas, and map pins;
-- captures the position supplied by the game for each icon through
-  `URODMapMenuWidgetBase::UpdateIcon`;
-- requests teleportation through the native
-  `ARODAvatarCharacter::ServerDebugTeleportGimmick(FVector)` RPC;
-- closes the map and explicitly restores the gameplay camera;
-- does not impersonate terminal access or use the
-  `ServerDecideFastTravel` transaction;
-- integrates `ENABLED` and `DEBUG_LOGS` with ModMenu.
+- Echoes of Aincrad **1.0.3**.
+- The Echoes of Aincrad-compatible UE4SS build.
 
-The contract was audited against the **1.0.3** game SDK/template.
+The in-game ModMenu is optional. FastTravelMod includes its own private settings
+bridge and works when installed by itself.
 
-| Responsibility | Canonical contract |
-|---|---|
-| Close the Start Menu | `ARODInGamePlayerController::EndMainMenu(true)` |
-| Observe menu transition | `GA_AvatarMenu_Main_C::BP_IsActive()` |
-| Resolve ability ownership | `UGameplayAbility::GetAbilitySystemComponentFromActorInfo()` |
-| Resolve activation trigger | Local `GA_AvatarMenu_Map_C::AbilityTriggers` |
-| Open the map | `URODAbilitySystemComponent::TryActivateAbilityWithPayloadFromClass(...)` |
-| Map ability | `GA_AvatarMenu_Map_C` |
-| Widget | `URODMapMenuWidgetBase` / `WBP_Map_C` |
-| Selected icon | `MapItemWidget.CurrentTargetIconWidget` |
-| Icon type | `URODIconForMapWidgetBase::GetMapIconKind()` |
-| Destination position | `Location` argument of `URODMapMenuWidgetBase::UpdateIcon` |
-| Teleport | `ARODAvatarCharacter::ServerDebugTeleportGimmick(FVector)` |
-| Close the map | `ARODInGamePlayerController::EndMapMenu(AllClose)` |
+## Installation
+
+Copy the complete `FastTravelMod` folder to:
+
+```text
+EchoesofAincrad\Binaries\Win64\ue4ss\Mods\FastTravelMod
+```
+
+The installed layout must include:
+
+```text
+FastTravelMod\
+├── enabled.txt
+├── README.md
+└── Scripts\
+    ├── main.lua
+    ├── main_impl.lua
+    ├── config.lua
+    └── standalone\
+        └── ModMenuBridge.lua
+```
+
+Restart the game after installing or enabling the mod.
+
+## Where it works
+
+Fast Travel is available on **floor maps only**. It is intentionally unavailable
+in town because the town world does not contain the floor's accessible terminal
+and checkpoint destinations.
+
+The Start Menu entry is omitted when the current world has no valid travel
+destination, so opening the menu in town does not expose a non-functional row.
 
 ## Usage
 
-1. Start the game with UE4SS and enter the world.
+1. Enter a floor map.
 2. Open the Start Menu.
-3. Select `Fast Travel`.
-4. Hover a destination on the map or move navigation focus to it.
-5. Single-click it or press the accept button.
+3. Select **Fast Travel**.
+4. Select a checkpoint, teleport terminal, gate, or safe area.
+5. Confirm the destination.
 
-If no icon is selected, or if the selected icon is not an allowed type, the mod
-consumes the confirmation and reports an explicit error. It does not create a
-marker or select another destination.
+The default screen is the game's native `WBP_Map_FastTravel_C` destination
+picker. `MAP_TARGET = "map"` remains available in `Scripts/config.lua` as an
+experimental diagnostic path, but it is not the recommended travel screen.
 
-## Allowed destinations
+## How travel is performed
 
-The values below come from `EMapIconKind` in the 1.0.3 SDK.
-
-| Group | Types |
-|---|---|
-| Checkpoints and terminals | `AccessGimmick` (11), `AccessGimmick_Restart` (12) |
-| Teleport gates | `TeleportGate` (14), `TeleportGate_Restart` (15) |
-| Safe areas | `SafeArea` (16), `SafeAreaRestart` (17) |
-| Hero pins | `HeroPin1..3` (24–26) |
-| Pillar pins | `PillarPin1..5` (27–31) |
-| Instant pins | `InstantPin1..3` (32–34) |
-
-Enemy, quest, chest, shop, NPC, and other point-of-interest icons are not
-accepted by this version. Adding a new icon type must be deliberate and
-audited; there is no generic destination acceptance.
-
-## Travel completion and camera recovery
-
-Version 0.2.0 artificially initiated the native terminal access flow. After a
-travel operation, the game could remain in this state:
+The native screen chooses a destination and reports its ID through
+`ARODPlayerState::ServerDecideFastTravel(ID)`. FastTravelMod resolves that ID
+against `ARODGameState::RODAccessibleGimmicks`, obtains the destination's arrival
+position, and moves the local hero with:
 
 ```text
-FastTravelStatus=Decide(2)
-PSAcsGmkStatus=0
-bAccessingTerminal=false
-CurrentAcsGmkID=None
+AActor::K2_TeleportTo(FVector, FRotator)
 ```
 
-This represents a completed but unclosed transaction. Version 0.3.7 recognizes
-only this exact combination, calls
-`ARODPlayerState::ServerCancelFastTravel()` to close it, and restores the
-camera. Any other `Decide` state is treated as an actual active travel
-transaction and map opening fails.
+`ARODAvatarCharacter::ServerDebugTeleportGimmick` is **not** used. It was tested
+on the supported build and did not move the hero.
 
-After a map teleport, the mod closes the menu and calls:
+This is a verified position change, not the complete native terminal transaction.
+The terminal fade, arrival cutscene, and partner-warp sequence may therefore not
+play.
 
-- `StopCameraAnimation`;
-- `ResetFov`;
-- `ResetCameraViewPointLocation(true)`;
-- `ResetCameraBoomArmLength`;
-- `ResetMenuRotation`;
-- `ResetMenuCameraTransform`;
-- `OnEnablePlayableFollowCamera`.
+## Map pins
 
-This prevents the terminal-flow close-up camera from remaining active.
+The fast-travel screen displays map pins for orientation, but its native
+**Confirm** action accepts only normal travel destinations. It does not confirm
+pins.
+
+Press **F9** by default to travel to the selected or hovered map pin. Pin
+coordinates are projected onto the navigation mesh before the hero is moved; a
+pin that cannot be projected is rejected.
+
+The key can be changed with `PIN_TRAVEL_KEY` in `Scripts/config.lua`. Set it to
+an empty string to disable the binding.
+
+## Recovery key
+
+A viewport change such as Alt+Enter can occasionally leave the map visible with
+its normal input no longer responding.
+
+Press **F8** by default to force-close the map, restore gameplay input, and reset
+the mod's active menu state. The console command below performs the same action:
+
+```text
+fasttravel close
+```
+
+The key can be changed with `FORCE_CLOSE_KEY` in `Scripts/config.lua`. Set it to
+an empty string to disable the binding.
 
 ## Configuration
 
-Edit `Scripts/config.lua` or use the in-game `Mods` menu:
+Edit `Scripts/config.lua` or use the optional in-game ModMenu.
 
-- `ENABLED`: shows or hides the Start Menu entry;
-- `DEBUG_LOGS`: records focus, map destinations, and captured positions.
+| Setting | Default | Meaning |
+|---|---|---|
+| `ENABLED` | `true` | Shows the Fast Travel entry when the current floor has destinations |
+| `DEBUG_LOGS` | `false` | Enables additional destination and UI diagnostics |
+| `MAP_TARGET` | `"fasttravel"` | Chooses the native fast-travel screen or experimental reference map |
+| `MAP_MENU_KEY` | `""` | Optional exact menu-key override for the reference-map path |
+| `FORCE_CLOSE_KEY` | `"F8"` | Emergency map-close key |
+| `PIN_TRAVEL_KEY` | `"F9"` | Map-pin travel key |
 
-`Scripts/runtime.lua` contains machine-local state written by ModMenu.
+When ModMenu is installed, machine-local overrides are written to
+`Scripts/runtime.lua`. That file is optional and should not be included when
+redistributing the mod.
 
-## Diagnostics
-
-UE4SS console commands:
+## Console diagnostics
 
 ```text
 fasttravel status
 fasttravel open
+fasttravel close
 fasttravel terminals
 fasttravel pins
+fasttravel pin <index>
+fasttravel menukeys
 ```
 
-- `status` displays mod state and schedules a read of the old native travel
-  transaction;
-- `open` opens the map in teleport mode;
-- `terminals` lists terminal and checkpoint IDs for diagnostics;
-- `pins` lists `Kind`, `Pos`, `Actor`, and `Timestamp` for each `FRODMapPin`.
+Diagnostics stop rather than guessing when a required game object, destination,
+widget, or position cannot be validated.
 
-A valid selection produces a line similar to:
+## Known limitations
 
-```text
-teleporting to selected map icon | kind=HeroPin1(24) | pos=(...)
-```
-
-A failure produces `FAST TRAVEL ERROR` or `FAIL-CLOSED` followed by the contract
-that could not be validated.
-
-## Fail-closed policy
-
-The mod has one teleport route:
-
-1. close the Start Menu through `EndMainMenu(true)`;
-2. wait until `GA_AvatarMenu_Main_C::BP_IsActive()` returns false for every
-   loaded instance;
-3. require exactly one `GA_AvatarMenu_Map_C` owned by the local hero's Ability
-   System, require exactly one `GameplayEvent` trigger on that ability, and
-   activate its exact generated class with that trigger through the same
-   Ability System;
-4. require `GA_AvatarMenu_Map_C` to construct `WBP_Map_C`;
-5. identify the exact `CurrentTargetIconWidget`;
-6. require an allowed `EMapIconKind`;
-7. require the position captured for that same widget by `UpdateIcon`;
-8. call `ServerDebugTeleportGimmick` with that position.
-
-The mod does not:
-
-- select a substitute terminal;
-- reuse `CheckPointID` as a fake source terminal;
-- write `FastTravelStatus`, `PSAcsGmkStatus`, or `bAccessingTerminal`;
-- directly modify the actor location;
-- use another icon's coordinates when the selection cannot be resolved;
-- call `OpenDirectingMapMenu` directly without its owning gameplay ability;
-- open another widget when `WBP_Map_C` fails.
-
-If any canonical step fails, no teleport request is sent.
-If map construction fails after ability activation, the mod cancels that exact
-ability to restore the pre-open state.
-
-## Compatibility with the other menu mods
-
-The entry is created 250 ms after Start Menu construction:
-
-- `FieldEquipmentMod` is added at 100 ms;
-- `FastTravelMod` is added at 250 ms;
-- `ModMenu` is added at 400 ms.
-
-The mod uses a native wrapper from `WBP_Console_MainMenu_List` and bridges only
-the navigation boundaries.
+- Floor maps only; town is intentionally unsupported.
+- The move uses `K2_TeleportTo`, not the complete terminal travel transaction.
+- Pins require the F9 binding because the native fast-travel screen disables its
+  normal confirmation action over a pin.
+- `MAP_TARGET = "map"` is experimental and is not the default supported path.
+- Game updates may change reflected classes, widget fields, or menu contracts.
