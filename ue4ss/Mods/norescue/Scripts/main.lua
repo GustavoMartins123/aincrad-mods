@@ -358,7 +358,9 @@ local function onRespawnPath()
     applyProgressiveRetry(1)
 end
 
-RegisterHook("/Script/Engine.PlayerController:ClientRestart", onRespawnPath)
+pcall(function()
+    RegisterHook("/Script/Engine.PlayerController:ClientRestart", onRespawnPath)
+end)
 
 ------------------------------------------------------------ runtime settings
 -- Lets the in-game Mods menu flip ENABLED or retune the threshold without a
