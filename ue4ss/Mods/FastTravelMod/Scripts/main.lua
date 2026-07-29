@@ -247,6 +247,13 @@ local menuCloseBusy = false
 local teleportMapModeActive = false
 local mapTeleportBusy = false
 local mapIconDestinations = {}
+-- UpdateIcon fires once per icon and a floor map carries well over a hundred of
+-- them, all reporting the same map widget. Resolving that widget's full object
+-- path for every one of them is the same answer bought a hundred times, so it is
+-- remembered here. owner pins the memo to the destination table it was measured
+-- against: every reset of that table replaces it, which invalidates this on its
+-- own without any of the eleven reset sites having to know about it.
+local updateIconMemo = { owner = nil, widget = nil, accepted = false }
 local pendingMapAbility = nil
 local pendingMapContract = nil
 local lastNativeFastTravelStatus = nil
@@ -3248,10 +3255,19 @@ local function cacheMapIconDestination(
     if not teleportMapModeActive then return end
 
     local mapWidget = hookValue(mapParameter)
-    if not isValid(mapWidget)
-        or not nameContains(mapWidget, K.MAP_MENU_WIDGET_FRAGMENT) then
-        return
+    if not isValid(mapWidget) then return end
+
+    local accepted
+    if updateIconMemo.owner == mapIconDestinations
+        and updateIconMemo.widget == mapWidget then
+        accepted = updateIconMemo.accepted
+    else
+        accepted = nameContains(mapWidget, K.MAP_MENU_WIDGET_FRAGMENT)
+        updateIconMemo.owner = mapIconDestinations
+        updateIconMemo.widget = mapWidget
+        updateIconMemo.accepted = accepted
     end
+    if not accepted then return end
 
     local kind = tonumber(hookValue(kindParameter))
     if kind == nil then

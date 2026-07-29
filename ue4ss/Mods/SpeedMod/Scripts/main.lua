@@ -667,9 +667,14 @@ local function applyJumpHeight(hero, movement)
     if not isValidObj(hero) or not isValidObj(movement) then return false end
 
     -- Fast path: reuse cached jump state if target configuration and component reference are unchanged.
+    -- This runs every tick, so the signature is compared field by field. Building
+    -- a formatted string here meant allocating one that embeds the component's
+    -- full object path roughly sixty times a second to discover that nothing had
+    -- changed.
     if jumpMovement == movement and jumpWriteSupported == true and jumpReadySignature ~= nil then
-        local currentSignature = string.format("%s|%.6f", jumpMovementKey or "", CONFIG.JUMP_HEIGHT_MULTIPLIER)
-        if jumpReadySignature == currentSignature then
+        if jumpMovementKey ~= nil
+            and jumpReadySignature.key == jumpMovementKey
+            and jumpReadySignature.multiplier == CONFIG.JUMP_HEIGHT_MULTIPLIER then
             return true
         end
     end
@@ -716,15 +721,16 @@ local function applyJumpHeight(hero, movement)
 
     local targetVelocity =
         nativeJumpZVelocity * math.sqrt(CONFIG.JUMP_HEIGHT_MULTIPLIER)
-    local readySignature = string.format(
-        "%s|%.6f",
-        movementIdentity,
-        CONFIG.JUMP_HEIGHT_MULTIPLIER
-    )
-
     local function reportReady()
-        if jumpReadySignature == readySignature then return end
-        jumpReadySignature = readySignature
+        if jumpReadySignature ~= nil
+            and jumpReadySignature.key == movementIdentity
+            and jumpReadySignature.multiplier == CONFIG.JUMP_HEIGHT_MULTIPLIER then
+            return
+        end
+        jumpReadySignature = {
+            key = movementIdentity,
+            multiplier = CONFIG.JUMP_HEIGHT_MULTIPLIER,
+        }
         warn(string.format(
             "JUMP READY | native=%.2f | applied=%.2f | height=%.2fx",
             nativeJumpZVelocity,

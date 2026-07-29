@@ -44,9 +44,9 @@ local NAV_ATTEMPTS_PER_PASS = 1
 local NAV_MAX_ATTEMPTS = 12
 local NAV_MIN_SEPARATION_CM = 150.0
 local MAX_DISCOVERY_PER_TICK = 2
--- 12 attempts, 250 ms apart: three seconds of grace for a streaming enemy to
+-- 32 attempts, 250 ms apart: eight seconds of grace for a streaming enemy to
 -- finish initialising before it is reported as broken.
-local SNAPSHOT_RETRY_LIMIT = 12
+local SNAPSHOT_RETRY_LIMIT = 32
 local SNAPSHOT_RETRY_BACKOFF_MS = 250
 local GAMEPLAY_MOD_ADDITIVE = 0
 local SPAWN_ON_SERVER = 0
@@ -1770,7 +1770,7 @@ local function registerEnemy(enemy, reused, queued)
         return
     end
 
-    local request = takePendingSpawn(key)
+    local request = (queued and queued.request) or takePendingSpawn(key)
     local previous = states[key]
     if previous ~= nil and not reused then return end
     if previous ~= nil then
@@ -1806,16 +1806,17 @@ local function registerEnemy(enemy, reused, queued)
         destroyPending(request, "spawned class did not match the requested class")
         log("SPAWN ERROR | created class " .. classKey ..
             " does not match requested class " .. request.classKey)
+        if isValid(enemy) then pcall(function() enemy:K2_DestroyActor() end) end
         return
     end
     local baseline, snapshotError = snapshotEnemy(enemy)
     if baseline == nil then
-        if request == nil and queued ~= nil
-            and snapshotErrorIsTransient(snapshotError) then
+        if queued ~= nil and snapshotErrorIsTransient(snapshotError) then
             local retryCount = (queued.retryCount or 0) + 1
             if retryCount <= SNAPSHOT_RETRY_LIMIT then
                 queued.retryCount = retryCount
                 queued.retryAtMs = elapsedMs + SNAPSHOT_RETRY_BACKOFF_MS
+                queued.request = request
                 objectQueue[#objectQueue + 1] = queued
                 return
             end
@@ -1823,11 +1824,20 @@ local function registerEnemy(enemy, reused, queued)
                 " | still absent after " .. SNAPSHOT_RETRY_LIMIT ..
                 " retries over " ..
                 (SNAPSHOT_RETRY_LIMIT * SNAPSHOT_RETRY_BACKOFF_MS) .. " ms")
+            if request ~= nil then
+                destroyPending(request, "required enemy state was unavailable")
+            end
+            if isValid(enemy) and request ~= nil then
+                pcall(function() enemy:K2_DestroyActor() end)
+            end
             return
         end
         log("ENEMY ERROR | " .. key .. " | " .. snapshotError)
         if request ~= nil then
             destroyPending(request, "required enemy state was unavailable")
+        end
+        if isValid(enemy) and request ~= nil then
+            pcall(function() enemy:K2_DestroyActor() end)
         end
         return
     end
@@ -1973,10 +1983,26 @@ local activationReported = false
 activateSpawnedEnemy = function(enemy, key, spawnPosition)
     if not isValid(enemy) then return end
 
-    -- InitialStateLoc, which this path never supplies: ProwlFirstPosition is the
-    -- anchor the idle/patrol logic works around, and on an actor created outside
-    -- the game's own spawn call it stays at the origin, so the enemy's notion of
-    -- where it belongs was (0,0,0) on the far side of the map.
+    pcall(function()
+        enemy:SetActorEnableCollision(true)
+        enemy:SetCanBeDamaged(true)
+        enemy.bCanBeDamaged = true
+    end)
+    pcall(function()
+        local capsule = enemy.CapsuleComponent
+        if isValid(capsule) then
+            capsule:SetCollisionEnabled(3)
+            capsule:SetCollisionResponseToAllChannels(2)
+        end
+    end)
+    pcall(function()
+        local mesh = enemy.Mesh
+        if isValid(mesh) then
+            mesh:SetCollisionEnabled(3)
+            mesh:SetCollisionResponseToAllChannels(2)
+        end
+    end)
+
     if spawnPosition ~= nil then
         pcall(function()
             enemy.ProwlFirstPosition = spawnPosition
@@ -2480,7 +2506,12 @@ local function reconcileNearbyOrigins()
 
     local limitSquared = CONFIG.DESPAWN_RADIUS * CONFIG.DESPAWN_RADIUS
     for _, origin in pairs(origins) do
-        if origin.location ~= nil
+        -- reconcileOrigin's own first act is to return on a completed origin,
+        -- so testing it here first keeps the sweep from measuring a distance
+        -- for every origin in the world only to discard the answer. At a large
+        -- despawn radius that is most of them.
+        if origin.completed ~= true
+            and origin.location ~= nil
             and planarDistanceSquared(origin.location, heroLocation) <= limitSquared then
             reconcileOrigin(origin)
         end

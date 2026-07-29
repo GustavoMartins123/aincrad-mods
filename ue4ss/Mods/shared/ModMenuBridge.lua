@@ -73,7 +73,11 @@ end
 
 Bridge.overlay = overlay
 
-function Bridge.readSettings(_modName, scriptDir)
+-- revHint is an optional { text = <revision text or nil> } record. The polling
+-- path already read runtime.rev to decide whether anything could have changed,
+-- so passing it here keeps that one file from being opened twice per poll, for
+-- every mod, forever.
+function Bridge.readSettings(_modName, scriptDir, revHint)
     if type(scriptDir) ~= "string" or scriptDir == "" then
         return nil, nil, {
             error = "canonical Scripts directory is unavailable",
@@ -103,8 +107,12 @@ function Bridge.readSettings(_modName, scriptDir)
             transactionInProgress = true,
         }
     end
-    local revPath = scriptDir .. "runtime.rev"
-    local revText, _ = readExactFile(revPath, false)
+    local revText
+    if type(revHint) == "table" then
+        revText = revHint.text
+    else
+        revText = (readExactFile(scriptDir .. "runtime.rev", false))
+    end
     local configText, configReadError = readExactFile(configPath, true)
     local runtimeText, runtimeReadError = readExactFile(runtimePath, false)
     local fingerprint =
@@ -232,7 +240,7 @@ function Bridge.attach(options)
         end
 
         local settings, fingerprint, info =
-            Bridge.readSettings(modName, scriptDir)
+            Bridge.readSettings(modName, scriptDir, { text = revText })
         if not force and fingerprint == lastFingerprint then
             lastRevText = revText
             return false

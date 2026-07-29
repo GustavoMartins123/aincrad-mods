@@ -155,6 +155,7 @@ local notifyExpandQueue    = {}
 local notifyExpandPending  = {}
 local notifyExpandScheduled = false
 local nearbyPruneTick      = 0
+local nearbyTickSerial     = 0
 local originalActionFlagDisplayDist = nil
 local notifyDbgBucket = { t = 0, n = 0 }
 local lastAppliedTakeItemDist = nil
@@ -794,13 +795,14 @@ applyOperatableRadius = function(gimmick, hero)
     return ok
 end
 
+-- Tracked entries are { obj, key } records. GetFullName is a native call that
+-- builds a full object path, and the previous list of bare objects had to
+-- recompute it for every element on every insertion and every removal.
 local function removeFromNearbyExpandedByKey(key)
     if not key then return end
     for i = #nearbyExpanded, 1, -1 do
-        local g = nearbyExpanded[i]
-        if not isValidObj(g) then
-            table.remove(nearbyExpanded, i)
-        elseif gimmickKey(g) == key then
+        local entry = nearbyExpanded[i]
+        if entry.key == key or not isValidObj(entry.obj) then
             table.remove(nearbyExpanded, i)
         end
     end
@@ -808,10 +810,10 @@ end
 
 local function trackExpandedGimmick(gimmick)
     local key = gimmickKey(gimmick)
-    for _, g in ipairs(nearbyExpanded) do
-        if gimmickKey(g) == key then return false end
+    for _, entry in ipairs(nearbyExpanded) do
+        if entry.key == key then return false end
     end
-    nearbyExpanded[#nearbyExpanded + 1] = gimmick
+    nearbyExpanded[#nearbyExpanded + 1] = { obj = gimmick, key = key }
     if #nearbyExpanded > 64 then
         table.remove(nearbyExpanded, 1)
     end
@@ -822,31 +824,35 @@ local function pruneNearbyExpanded(hero, full)
     local kept = {}
     local scanRange = full and getScanRange(getEffectiveRange(hero)) or nil
 
-    for _, gimmick in ipairs(nearbyExpanded) do
-        if isValidObj(gimmick) then
+    for _, entry in ipairs(nearbyExpanded) do
+        if isValidObj(entry.obj) then
             if full then
-                local dist = getDistance(hero, gimmick)
+                -- Measured once and stamped with the current tick so the
+                -- candidate scan reuses it instead of asking the engine for
+                -- the same distance a second time in the same frame.
+                local dist = getDistance(hero, entry.obj)
                 if dist and dist <= scanRange then
-                    kept[#kept + 1] = gimmick
+                    entry.dist = dist
+                    entry.distSerial = nearbyTickSerial
+                    kept[#kept + 1] = entry
                 end
             else
-                kept[#kept + 1] = gimmick
+                kept[#kept + 1] = entry
             end
         end
     end
     nearbyExpanded = kept
 
-    if not full or #nearbyExpanded <= 1 then return end
+    if not full or #nearbyExpanded <= 64 then return end
 
-    if #nearbyExpanded > 64 then
-        table.sort(nearbyExpanded, function(a, b)
-            local da = getDistance(hero, a) or 999999
-            local db = getDistance(hero, b) or 999999
-            return da < db
-        end)
-        while #nearbyExpanded > 64 do
-            table.remove(nearbyExpanded)
-        end
+    -- This comparator used to call getDistance on both operands, so sorting 64
+    -- entries spent several hundred native calls inside a single frame. The
+    -- pass above already measured every distance being sorted on.
+    table.sort(nearbyExpanded, function(a, b)
+        return (a.dist or 999999) < (b.dist or 999999)
+    end)
+    for index = #nearbyExpanded, 65, -1 do
+        nearbyExpanded[index] = nil
     end
 end
 
@@ -1202,20 +1208,27 @@ local function tryPickupIfReady(hero, gimmick, now)
 end
 
 local function tryPickupNearbyFirst(hero, now)
+    nearbyTickSerial = nearbyTickSerial + 1
     nearbyPruneTick = nearbyPruneTick + 1
-    pruneNearbyExpanded(hero, nearbyPruneTick >= 5)
-    if nearbyPruneTick >= 5 then nearbyPruneTick = 0 end
+    local full = nearbyPruneTick >= 5
+    pruneNearbyExpanded(hero, full)
+    if full then nearbyPruneTick = 0 end
 
     local maxChecks = 10
     local maxR = getEffectiveRange(hero)
     local candidates = {}
 
-    for _, gimmick in ipairs(nearbyExpanded) do
-        if isValidObj(gimmick) and isPickupGimmick(gimmick) then
-            local dist = getDistance(hero, gimmick)
-            if dist and dist <= maxR then
-                candidates[#candidates + 1] = { gimmick = gimmick, dist = dist }
-            end
+    -- Nothing is re-validated or re-classified here. The prune above just
+    -- dropped every invalid entry in this same frame, and everything reaching
+    -- the list passed isPickupGimmick when it was tracked. canPickPromptGimmick
+    -- still runs the authoritative check before anything is actually collected,
+    -- so this loop only has to rank by distance.
+    for _, entry in ipairs(nearbyExpanded) do
+        local dist = entry.distSerial == nearbyTickSerial
+            and entry.dist
+            or getDistance(hero, entry.obj)
+        if dist and dist <= maxR then
+            candidates[#candidates + 1] = { gimmick = entry.obj, dist = dist }
         end
     end
 
@@ -1277,9 +1290,17 @@ local function pollTick()
     end
 end
 
+-- Back-pressure, same rule SpeedMod and the enemy director already follow:
+-- never stack another game-thread callback while the previous one is still
+-- outstanding. Without this, a game thread that is already struggling gets a
+-- fresh scan queued onto it every 100 ms regardless.
+local tickQueued = false
+
 local function poll()
-    if CONFIG.ENABLED then
+    if CONFIG.ENABLED and not tickQueued then
+        tickQueued = true
         ExecuteInGameThread(function()
+            tickQueued = false
             local handler = function(e) return tostring(e) end
             if debug and type(debug.traceback) == "function" then
                 handler = debug.traceback
