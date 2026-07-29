@@ -790,9 +790,38 @@ end
 -- there can only fail -- measured, twice. Counting terminals that actually hold
 -- an ID is the semantic question and hardcodes no map name, so it keeps working
 -- on floors this build has not shipped yet.
+local function isTownWorld(gameState)
+    local hero = resolveLocalHero()
+    if isValid(hero) then
+        local isTown = false
+        local ok = pcall(function()
+            if hero:IsTown() == true or hero.bIsTown == true then
+                isTown = true
+            end
+        end)
+        if ok and isTown then return true end
+    end
+
+    if isValid(gameState) then
+        local isTown = false
+        local ok = pcall(function()
+            if gameState.bIsTown == true or gameState.bTownActive == true then
+                isTown = true
+            end
+        end)
+        if ok and isTown then return true end
+    end
+
+    return false
+end
+
 local function fastTravelAvailability()
     local gameState, gameStateError = resolveWorldGameState()
     if gameState == nil then return nil, tostring(gameStateError) end
+
+    if isTownWorld(gameState) then
+        return { travelable = 0, total = 0, sample = {}, isTown = true }, nil
+    end
 
     local gimmicks = nil
     local listOk, listError = pcall(function()
@@ -2435,6 +2464,16 @@ end
 -- instead of being torn down first.
 local function openFastTravelMenu(serial)
     if serial ~= openSerial then return end
+
+    local availability, availabilityError = fastTravelAvailability()
+    if availability == nil or availability.travelable == 0 then
+        failPendingOpen(
+            serial,
+            "Fast Travel is not available in the town map"
+        )
+        log("Fast Travel open refused: current world has no travel terminals (Town Map).")
+        return
+    end
 
     local controller, controllerError = resolveLocalController()
     if controller == nil then
