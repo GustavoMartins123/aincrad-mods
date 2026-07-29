@@ -1,4 +1,4 @@
--- FastTravelMod v0.12.0
+-- FastTravelMod v0.14.0
 --
 -- TWO MAPS, ONE OF THEM WRONG
 --
@@ -25,11 +25,10 @@
 --
 -- PINS ON THE FAST TRAVEL SCREEN
 --
--- The screen does not lock pins out; it simply does not list them in the array
--- its cursor snaps by. URODMapItemWidgetBase::SnapMapIconKinds is that array,
--- and v0.10.0 appends the pin kinds to the instance this screen builds. Nothing
--- foreign is introduced -- the icons, the cursor and the snap list are all the
--- game's, given a wider list to work from. See injectPinSnapKinds.
+-- Pin hover uses URODInputWidgetBase::GetIsMouseHover, which is where the game
+-- keeps hover state. Icons get SetInputEnable(true) when the screen opens, since
+-- an icon with input disabled never receives hover. Destinations still come from
+-- ARODGameState::MapPins. See enablePinIconInput and hoveredPinTimestamp.
 --
 -- Natively the second is opened by GA_AvatarMenu_AccessTerminal_C, which needs a
 -- real terminal actor as its Target. This mod instead constructs the widget and
@@ -78,10 +77,13 @@
 --   ARODPlayerState::ServerDecideFastTravel(ID)
 --   ARODGameState::RODAccessibleGimmicks
 --   ARODAccessibleGimmickBase::ID / WarpOutTransforms / AccessTransforms
---   ARODGameState::MapPins (FRODMapPin::Pos)
---   WBP_MapIcon_C
---   URODIconForMapWidgetBase::GetMapIconKind / GetCanHoverIcon / Timestamp
---   URODMapItemWidgetBase::CursorWidget / PinIconWidgets / SnapMapIconKinds
+--   ARODGameState::MapPins (FRODMapPin::Kind / Pos / Timestamp)
+--   UNavigationSystemV1::K2_ProjectPointToNavigation
+--   URODIconForMapWidgetBase::GetMapIconKind / MapIconKind / Timestamp
+--   URODInputWidgetBase::SetInputEnable / IsInputEnable
+--   UWidget::RenderTransform (icon and cursor positions)
+--   UWidget::SetVisibility / GetVisibility / SetIsEnabled / GetParent
+--   URODMapItemWidgetBase::PinIconWidgets
 --   URODFieldMapItemWidget::CurrentStayTerminalIconWidget
 --   UWidget::GetCachedGeometry / USlateBlueprintLibrary::LocalToAbsolute
 --   URODWidgetBPFunctionLibrary::SetCurrentMenuInputActionEnable
@@ -123,57 +125,64 @@
 -- is unavailable, the operation stops and reports the error.
 
 local MOD_NAME = "FastTravelMod"
-local MOD_VERSION = "v0.12.0"
+local MOD_VERSION = "v0.14.0"
 local SUPPORTED_SDK = "Echoes of Aincrad 1.0.3"
 
-local MAIN_MENU_ICON_CLASS =
-    "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
-local MAIN_MENU_LIST_CLASS =
-    "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_List.WBP_Console_MainMenu_List_C"
-local MAIN_MENU_CLASS_FRAGMENT = "WBP_Console_MainMenu_C"
-local MAIN_MENU_LIST_FRAGMENT = "WBP_Console_MainMenu_List_C"
-local MENU_ICON_FRAGMENT = "WBP_Console_MainMenu_MenuIcon_C"
+-- Folded into one table: this file sits at Lua's limit of 200 locals in the
+-- main chunk, and thirty individual constants is thirty slots.
+local K = {
+    MAIN_MENU_ICON_CLASS =
+    "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C",
+    MAIN_MENU_LIST_CLASS =
+    "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_List.WBP_Console_MainMenu_List_C",
+    MAIN_MENU_CLASS_FRAGMENT = "WBP_Console_MainMenu_C",
+    MAIN_MENU_LIST_FRAGMENT = "WBP_Console_MainMenu_List_C",
+    MENU_ICON_FRAGMENT = "WBP_Console_MainMenu_MenuIcon_C",
 -- Two different screens, and only one of them is the fast travel one.
 --   WBP_Map_C            : URODMapMenuWidgetBase    -- the reference map,
 --                          titled "Mapa / Detalhes da Area de Missao"
 --   WBP_Map_FastTravel_C : URODFastTravelMenuWidget -- the destination picker,
 --                          the screen a terminal opens
-local MAP_MENU_WIDGET_FRAGMENT = "WBP_Map_C"
-local FAST_TRAVEL_WIDGET_FRAGMENT = "WBP_Map_FastTravel_C"
+    MAP_MENU_WIDGET_FRAGMENT = "WBP_Map_C",
+    FAST_TRAVEL_WIDGET_FRAGMENT = "WBP_Map_FastTravel_C",
 -- Read back from URODWidgetData::MenuWidgetMap for EMenuKind::FastTravelMenu on
 -- this build, so this path is confirmed rather than assumed.
-local FAST_TRAVEL_WIDGET_CLASS =
-    "/Game/ROD/Widget/Cockpit/Minimap/WBP_Map_FastTravel.WBP_Map_FastTravel_C"
-local MAIN_MENU_ABILITY_CLASS = "GA_AvatarMenu_Main_C"
-local MAP_MENU_ABILITY_CLASS = "GA_AvatarMenu_Map_C"
+    FAST_TRAVEL_WIDGET_CLASS =
+    "/Game/ROD/Widget/Cockpit/Minimap/WBP_Map_FastTravel.WBP_Map_FastTravel_C",
+    MAIN_MENU_ABILITY_CLASS = "GA_AvatarMenu_Main_C",
+    MAP_MENU_ABILITY_CLASS = "GA_AvatarMenu_Map_C",
 
--- EMenuKind::FastTravelMenu. The reference map is EMenuKind::MapMenu = 31, but
--- it is opened through its gameplay ability rather than by kind.
-local MENU_KIND_FAST_TRAVEL_MENU = 66
+-- EMenuKind::FastTravelMenu is what the row opens. The reference map is
+-- EMenuKind::MapMenu = 31 but is opened through its gameplay ability, not by
+-- kind, so only this one is needed.
+    MENU_KIND_FAST_TRAVEL_MENU = 66,
 
-local FAST_TRAVEL_STATUS_DISABLE = 0
-local FAST_TRAVEL_STATUS_CANCEL = 1
-local FAST_TRAVEL_STATUS_DECIDE = 2
-local FAST_TRAVEL_STATUS_ENABLE = 3
-local ACCESSIBLE_STATUS_NONE = 0
+    FAST_TRAVEL_STATUS_DISABLE = 0,
+    FAST_TRAVEL_STATUS_CANCEL = 1,
+    FAST_TRAVEL_STATUS_DECIDE = 2,
+    FAST_TRAVEL_STATUS_ENABLE = 3,
+    ACCESSIBLE_STATUS_NONE = 0,
 
-local MAX_NATIVE_MENU_ITEMS = 7
-local MENU_INJECTION_DELAY_MS = 250
-local MENU_TRANSITION_POLL_MS = 50
-local MENU_TRANSITION_TIMEOUT_MS = 3000
-local OPEN_VERIFICATION_DELAY_MS = 2500
-local TELEPORT_FINALIZE_DELAY_MS = 900
-local MENU_END_ALL_CLOSE = 2
+    MAX_NATIVE_MENU_ITEMS = 7,
+    MENU_INJECTION_DELAY_MS = 250,
+    MENU_TRANSITION_POLL_MS = 50,
+    MENU_TRANSITION_TIMEOUT_MS = 3000,
+    OPEN_VERIFICATION_DELAY_MS = 2500,
+    TELEPORT_FINALIZE_DELAY_MS = 900,
+    MENU_END_ALL_CLOSE = 2,
 
-local ACCEPT_BUTTON = 1
-local BACK_BUTTON = 2
-local SINGLE_CLICK = 1
-local DPAD_UP = 13
-local DPAD_DOWN = 14
-local LSTICK_UP = 17
-local LSTICK_DOWN = 18
+    ACCEPT_BUTTON = 1,
+    BACK_BUTTON = 2,
+    SINGLE_CLICK = 1,
+    DPAD_UP = 13,
+    DPAD_DOWN = 14,
+    LSTICK_UP = 17,
+    LSTICK_DOWN = 18,
 
-local ELIGIBLE_MAP_ICON_KINDS = {
+-- Filled from the pin half of ELIGIBLE_MAP_ICON_KINDS below.
+    MAP_PIN_ICON_KINDS = {},
+
+    ELIGIBLE_MAP_ICON_KINDS = {
     [11] = "AccessGimmick",
     [12] = "AccessGimmick_Restart",
     [14] = "TeleportGate",
@@ -191,18 +200,18 @@ local ELIGIBLE_MAP_ICON_KINDS = {
     [32] = "InstantPin1",
     [33] = "InstantPin2",
     [34] = "InstantPin3",
+    },
+
+    VISIBLE = 0,
+    COLLAPSED = 1,
+    HIDDEN = 2,
 }
 
--- The pin half of the table above. WBP_Map_FastTravel_C is authored as a
--- terminal picker, so these are the kinds it does not let the cursor stop on.
-local MAP_PIN_ICON_KINDS = {}
-for kind in pairs(ELIGIBLE_MAP_ICON_KINDS) do
-    if kind >= 24 then MAP_PIN_ICON_KINDS[kind] = true end
+-- Kinds 24 and above are the pin half: HeroPin1..3, PillarPin1..5,
+-- InstantPin1..3. Below that are the checkpoints the screen already accepts.
+for kind in pairs(K.ELIGIBLE_MAP_ICON_KINDS) do
+    if kind >= 24 then K.MAP_PIN_ICON_KINDS[kind] = true end
 end
-
-local VISIBLE = 0
-local COLLAPSED = 1
-local HIDDEN = 2
 
 local SCRIPT_DIR = (function()
     local source = (debug.getinfo(1, "S") or {}).source or ""
@@ -220,7 +229,7 @@ local CONFIG = {
     MAP_MENU_KEY = "",
     MAP_TARGET = "fasttravel",
     FORCE_CLOSE_KEY = "F8",
-    CURSOR_PROBE_KEY = "F7",
+    PIN_TRAVEL_KEY = "F9",
 }
 
 local runtimeHealthy = true
@@ -287,11 +296,11 @@ end
 -- substring of "WBP_Map_FastTravel_C", so these never answer for each other.
 local function mapScreenFragment(widget)
     if not isValid(widget) then return nil end
-    if nameContains(widget, FAST_TRAVEL_WIDGET_FRAGMENT) then
-        return FAST_TRAVEL_WIDGET_FRAGMENT
+    if nameContains(widget, K.FAST_TRAVEL_WIDGET_FRAGMENT) then
+        return K.FAST_TRAVEL_WIDGET_FRAGMENT
     end
-    if nameContains(widget, MAP_MENU_WIDGET_FRAGMENT) then
-        return MAP_MENU_WIDGET_FRAGMENT
+    if nameContains(widget, K.MAP_MENU_WIDGET_FRAGMENT) then
+        return K.MAP_MENU_WIDGET_FRAGMENT
     end
     return nil
 end
@@ -344,7 +353,7 @@ local function applySettings(settings)
         MAP_MENU_KEY = true,
         MAP_TARGET = true,
         FORCE_CLOSE_KEY = true,
-        CURSOR_PROBE_KEY = true,
+        PIN_TRAVEL_KEY = true,
     }
     for key in pairs(settings) do
         if booleanKeys[key] ~= true and stringKeys[key] ~= true then
@@ -375,8 +384,8 @@ local function applySettings(settings)
     if settings.FORCE_CLOSE_KEY ~= nil then
         CONFIG.FORCE_CLOSE_KEY = settings.FORCE_CLOSE_KEY
     end
-    if settings.CURSOR_PROBE_KEY ~= nil then
-        CONFIG.CURSOR_PROBE_KEY = settings.CURSOR_PROBE_KEY
+    if settings.PIN_TRAVEL_KEY ~= nil then
+        CONFIG.PIN_TRAVEL_KEY = settings.PIN_TRAVEL_KEY
     end
     runtimeHealthy = true
 end
@@ -598,18 +607,18 @@ local function resolveMapAbilityContract()
     local mapAbilityTriggerTagName = nil
     local contractOk, contractError = pcall(function()
         mapAbility = resolveOwnedAbility(
-            MAP_MENU_ABILITY_CLASS,
+            K.MAP_MENU_ABILITY_CLASS,
             abilitySystem)
         mapAbilityClass = mapAbility:GetClass()
         if not isValid(mapAbilityClass) then
-            error(MAP_MENU_ABILITY_CLASS ..
+            error(K.MAP_MENU_ABILITY_CLASS ..
                 " generated class is unavailable")
         end
         mapAbilityClassName = objectName(mapAbilityClass)
         if mapAbilityClassName == nil
             or string.find(
                 mapAbilityClassName,
-                MAP_MENU_ABILITY_CLASS,
+                K.MAP_MENU_ABILITY_CLASS,
                 1,
                 true) == nil then
             error("map ability generated class fingerprint mismatch: " ..
@@ -625,7 +634,7 @@ local function resolveMapAbilityContract()
         local eventTriggers = {}
         local triggers = mapAbility.AbilityTriggers
         if triggers == nil then
-            error(MAP_MENU_ABILITY_CLASS ..
+            error(K.MAP_MENU_ABILITY_CLASS ..
                 " AbilityTriggers is unavailable")
         end
         local triggersOk, triggersError = pcall(function()
@@ -647,26 +656,26 @@ local function resolveMapAbilityContract()
         if #eventTriggers ~= 1 then
             error(string.format(
                 "%s must expose exactly one GameplayEvent trigger; found %d",
-                MAP_MENU_ABILITY_CLASS,
+                K.MAP_MENU_ABILITY_CLASS,
                 #eventTriggers))
         end
 
         mapAbilityTriggerTag = eventTriggers[1]
         if tagLibrary:IsGameplayTagValid(
             mapAbilityTriggerTag) ~= true then
-            error(MAP_MENU_ABILITY_CLASS ..
+            error(K.MAP_MENU_ABILITY_CLASS ..
                 " GameplayEvent trigger tag is invalid")
         end
         mapAbilityTriggerTagName = exactFNameString(
             mapAbilityTriggerTag.TagName,
-            MAP_MENU_ABILITY_CLASS .. " trigger TagName")
+            K.MAP_MENU_ABILITY_CLASS .. " trigger TagName")
 
         local mainMenuActive =
             isOwnedAbilityClassActive(
-                MAIN_MENU_ABILITY_CLASS,
+                K.MAIN_MENU_ABILITY_CLASS,
                 abilitySystem)
         if not mainMenuActive then
-            error(MAIN_MENU_ABILITY_CLASS ..
+            error(K.MAIN_MENU_ABILITY_CLASS ..
                 " has no active ability instance")
         end
     end)
@@ -712,7 +721,7 @@ local function mapSequenceKeys(mapAbility)
     mapSequenceKeyCache = keys
     log(string.format(
         "MAP SEQUENCE KEYS | %s LevelSequenceMap holds %d key(s): %s",
-        MAP_MENU_ABILITY_CLASS,
+        K.MAP_MENU_ABILITY_CLASS,
         #keys,
         #keys == 0 and "<none>" or table.concat(keys, ", ")))
     return mapSequenceKeyCache
@@ -810,10 +819,10 @@ local function fastTravelAvailability()
 end
 
 local FAST_TRAVEL_STATUS_NAMES = {
-    [FAST_TRAVEL_STATUS_DISABLE] = "Disable",
-    [FAST_TRAVEL_STATUS_CANCEL] = "Cancel",
-    [FAST_TRAVEL_STATUS_DECIDE] = "Decide",
-    [FAST_TRAVEL_STATUS_ENABLE] = "Enable",
+    [K.FAST_TRAVEL_STATUS_DISABLE] = "Disable",
+    [K.FAST_TRAVEL_STATUS_CANCEL] = "Cancel",
+    [K.FAST_TRAVEL_STATUS_DECIDE] = "Decide",
+    [K.FAST_TRAVEL_STATUS_ENABLE] = "Enable",
 }
 
 local function exactFastTravelStatusName(status)
@@ -920,8 +929,8 @@ end
 local function recoverCompletedNativeTravel(source)
     local state = readNativeTravelState()
     local completedButStale =
-        state.fastTravelStatus == FAST_TRAVEL_STATUS_DECIDE
-        and state.accessibleStatus == ACCESSIBLE_STATUS_NONE
+        state.fastTravelStatus == K.FAST_TRAVEL_STATUS_DECIDE
+        and state.accessibleStatus == K.ACCESSIBLE_STATUS_NONE
         and state.accessingTerminal == false
         and state.currentGimmickId == "None"
     if not completedButStale then return false end
@@ -1014,7 +1023,7 @@ local function failCurrentMenu(reason)
     openSerial = openSerial + 1
     if activeContext ~= nil then
         activeContext.failed = true
-        setContextVisibility(activeContext, COLLAPSED)
+        setContextVisibility(activeContext, K.COLLAPSED)
     end
     log("FAIL-CLOSED | " .. message)
 end
@@ -1040,7 +1049,7 @@ local function resolveNativeMenuCount(mainMenu, mainList)
     if not readOk or finalIndex == nil
         or finalIndex % 1 ~= 0
         or finalIndex < 0
-        or finalIndex >= MAX_NATIVE_MENU_ITEMS then
+        or finalIndex >= K.MAX_NATIVE_MENU_ITEMS then
         return nil, "canonical NumContent is invalid: " ..
             tostring(readError or finalIndex)
     end
@@ -1070,7 +1079,7 @@ local function iconInsideWrapper(wrapper)
             child = wrapper:GetChildAt(index)
         end)
         if childOk and isValid(child)
-            and nameContains(child, MENU_ICON_FRAGMENT) then
+            and nameContains(child, K.MENU_ICON_FRAGMENT) then
             return child
         end
     end
@@ -1079,7 +1088,7 @@ end
 
 local function authoredWrapperNames(mainList)
     local authored = {}
-    for index = 0, MAX_NATIVE_MENU_ITEMS - 1 do
+    for index = 0, K.MAX_NATIVE_MENU_ITEMS - 1 do
         local _, wrapper = menuItemAndPanel(mainList, index)
         local name = objectName(wrapper)
         if name ~= nil then authored[name] = true end
@@ -1115,7 +1124,7 @@ end
 local function attachIconWithNativeWrapper(
     umgLibrary, controller, parent, icon
 )
-    local listClass = StaticFindObject(MAIN_MENU_LIST_CLASS)
+    local listClass = StaticFindObject(K.MAIN_MENU_LIST_CLASS)
     if not isValid(listClass) then
         error("native main-menu list class is unavailable")
     end
@@ -1147,8 +1156,8 @@ local function attachIconWithNativeWrapper(
     iconSlot:SetLayout(donorLayout)
     iconSlot:SetAutoSize(true)
     iconSlot:SetZOrder(20)
-    icon:SetVisibility(VISIBLE)
-    donorPanel:SetVisibility(VISIBLE)
+    icon:SetVisibility(K.VISIBLE)
+    donorPanel:SetVisibility(K.VISIBLE)
     donorPanel:ForceLayoutPrepass()
     return donorList, donorPanel
 end
@@ -1187,9 +1196,9 @@ local function applyLetterIcon(context)
         slot:SetAutoSize(true)
         slot:SetPosition({ X = 28.0, Y = 26.0 })
         slot:SetZOrder(30)
-        label:SetVisibility(VISIBLE)
+        label:SetVisibility(K.VISIBLE)
         label:SetRenderOpacity(1.0)
-        context.icon.IconImage:SetVisibility(HIDDEN)
+        context.icon.IconImage:SetVisibility(K.HIDDEN)
     end)
     if not built then
         if isValid(label) then
@@ -1209,8 +1218,8 @@ local function enforceLetterIcon(context)
         return nil, "FT letter presentation is no longer valid"
     end
     local ok, presentationError = pcall(function()
-        context.icon.IconImage:SetVisibility(HIDDEN)
-        context.letterWidget:SetVisibility(VISIBLE)
+        context.icon.IconImage:SetVisibility(K.HIDDEN)
+        context.letterWidget:SetVisibility(K.VISIBLE)
         context.letterWidget:SetRenderOpacity(1.0)
     end)
     if not ok then return nil, tostring(presentationError) end
@@ -1219,7 +1228,7 @@ end
 
 local function isCanonicalMainMenu(mainMenu)
     if not isValid(mainMenu)
-        or not nameContains(mainMenu, MAIN_MENU_CLASS_FRAGMENT) then
+        or not nameContains(mainMenu, K.MAIN_MENU_CLASS_FRAGMENT) then
         return false
     end
 
@@ -1234,7 +1243,7 @@ end
 
 local function resolveConstructedMainMenu(menuKey)
     local ok, widgets = pcall(function()
-        return FindAllOf(MAIN_MENU_CLASS_FRAGMENT)
+        return FindAllOf(K.MAIN_MENU_CLASS_FRAGMENT)
     end)
     if not ok or type(widgets) ~= "table" then
         return nil, "exact main-menu object query failed"
@@ -1337,7 +1346,7 @@ local function injectFastTravelEntry(mainMenu)
     end
     local fastTravelIndex = nativeCount + rowsAbove
 
-    local iconClass = StaticFindObject(MAIN_MENU_ICON_CLASS)
+    local iconClass = StaticFindObject(K.MAIN_MENU_ICON_CLASS)
     if not isValid(iconClass) then
         log("row injection failed closed: native menu icon class is unavailable")
         return
@@ -1732,36 +1741,165 @@ local function failPendingOpen(serial, reason)
 end
 
 --========================================================--
---            MAKING PINS SNAPPABLE BY INJECTION          --
+--                     MAP PIN TRAVEL                     --
 --========================================================--
--- SnapMapIconKinds is the array the cursor stops by, and the theory was that
--- this screen's copy omitted pins. It does not. Measured on open:
+-- Pins are read from the game state, never from the screen. Measured with the
+-- cursor over the only placed pin:
 --
---   PIN SNAP | SnapMapIconKinds 21 -> 26
---   had [16, 17, 14, 15, 49, 18, 45, 46, 35, 20, 32, 27, 11, 12, 48, 19,
---        28, 29, 30, 31, 51]
+--   MapPins[1]  EMapPinKind=7  timestamp=33.5873  pos=(21400.3, 291328.2, 0.0)
+--   PinIcon[8]  kind=27        timestamp=33.5873  visible=true  canHover=false
 --
--- 32 is InstantPin1 and 27..31 are PillarPin1..5. Pins were already snappable
--- and the cursor still would not stop on one, so this array is not the gate and
--- appending to it was never going to be the fix. The append is kept only because
--- it completes the set with the remaining pin kinds, which any real fix needs
--- anyway; it is not presented as the mechanism.
+-- The timestamp join works, but every widget on that screen -- the cursor
+-- included -- reports position 0,0 through both the canvas slot and the cached
+-- geometry, and the icons report canHover=false. Nothing on screen can say which
+-- pin is being pointed at, so the pin is identified rather than aimed at.
 --
--- The gate is not there. The cursor probe, pressed while hovering a pin, came
--- back with CurrentTargetIconWidget empty on a WBP_FieldMap_C map item -- and
--- WBP_FieldMap_C is a URODFieldMapItemWidget, which keeps its own hovered-icon
--- field: CurrentStayTerminalIconWidget. The base field this mod was reading is
--- simply not the one this screen fills.
+-- Note the Z: a pin is placed on a 2D map, so FRODMapPin::Pos comes back with
+-- Z = 0 for ground sitting around Z 25000. Travelling there verbatim drops the
+-- hero through the world, so the point is projected onto the navmesh first. The
+-- query extent is deliberately tall because the whole answer is in that Z.
+-- HOW THE GAME ITSELF DOES HOVER
 --
--- That field is named for terminals, so it may never hold a pin at all. Rather
--- than depend on the screen tracking something it may be authored never to
--- track, the pin under the cursor is also found geometrically: PinIconWidgets
--- lists the pin icons, CursorWidget is the cursor, and comparing their absolute
--- screen positions needs no cooperation from the screen whatsoever.
+-- Not by geometry. URODInputWidgetBase -- the base of every interactive widget,
+-- which URODIconForMapWidgetBase inherits through URODMenuItemWidgetBase --
+-- carries the hover state itself:
+--
+--   bool GetIsMouseHover();              execGetIsMouseHover
+--   void SetInputEnable(bool bEnable);   execSetInputEnable
+--   bool IsInputEnable();                execIsInputEnable
+--   void OnEnterHover();  void OnLeaveHover();
+--
+-- So the question "is the cursor on this pin" is asked of the pin, not computed
+-- from coordinates. Every previous attempt here tried to compute it -- canvas
+-- slots, cached geometry, absolute positions, nearest-wins -- and all of it read
+-- 0,0 because that is not where this information lives.
+--
+-- SetInputEnable is one half. Hit testing is the other: an icon that is drawn
+-- HitTestInvisible so it does not intercept the mouse over the map can never
+-- report hover, whatever its input flags say. Both are raised.
+-- URODMapMenuWidgetBase declares MapItemWidget. URODFastTravelMenuWidget does
+-- not: it builds one from FieldClass into MapWidgetCanvas, so for that screen
+-- the canvas children are where it lives.
+-- Grounding a pin is a two-step problem, not one call.
+--
+-- K2_ProjectPointToNavigation fails for every pin -- measured on all three at
+-- once -- and the reason is World Partition: the hero is in one cell and the
+-- pins are in others, so there is no navmesh at those coordinates to project
+-- onto. Waiting for it is not an option either; those cells only stream in once
+-- the hero is there.
+--
+-- So the first hop borrows a height from the nearest terminal, which the game
+-- keeps loaded for the whole floor, and lands slightly above it. Once the hero
+-- is there the cell is streamed, the navmesh exists, and a second pass projects
+-- properly and corrects the landing.
+--
+-- Declared ahead of the do-block so the helpers inside cost no chunk-level local
+-- slots: this file sits close to Lua's limit of 200 in the main chunk.
+local groundedPinPosition
+local projectPinOntoNavmesh
 
--- URODMapMenuWidgetBase declares MapItemWidget. URODFastTravelMenuWidget does not:
--- it builds one from FieldClass into MapWidgetCanvas, so for that screen the
--- canvas children are where it lives.
+do
+    local PIN_PROJECTION_EXTENT = { X = 500.0, Y = 500.0, Z = 100000.0 }
+    local PIN_APPROACH_LIFT = 400.0
+
+    function projectPinOntoNavmesh(flat)
+        local navigation = StaticFindObject(
+            "/Script/NavigationSystem.Default__NavigationSystemV1")
+        if not isValid(navigation) then
+            return nil, "NavigationSystemV1 is unavailable"
+        end
+        local controller, controllerError = resolveLocalController()
+        if controller == nil then return nil, tostring(controllerError) end
+
+        -- WorldEnemyDirector measured on this build that navigation
+        -- out-parameters arrive by mutating the passed table.
+        local projected = { X = 0.0, Y = 0.0, Z = 0.0 }
+        local ok, found = pcall(function()
+            return navigation:K2_ProjectPointToNavigation(
+                controller, flat, projected, nil, nil, PIN_PROJECTION_EXTENT)
+        end)
+        if not ok then
+            return nil, "K2_ProjectPointToNavigation failed: " .. tostring(found)
+        end
+        local landed = {
+            X = tonumber(projected.X),
+            Y = tonumber(projected.Y),
+            Z = tonumber(projected.Z),
+        }
+        if found ~= true or landed.Z == nil or landed.Z == 0.0 then
+            return nil, "no navmesh at those coordinates"
+        end
+        return landed, nil
+    end
+
+    -- Height borrowed from the nearest accessible gimmick. Those carry real
+    -- world Z and stay loaded for the whole floor, which is exactly what the
+    -- navmesh does not do.
+    local function nearestTerminalHeight(flat)
+        local gameState, gameStateError = resolveWorldGameState()
+        if gameState == nil then return nil, tostring(gameStateError) end
+
+        local best, bestDistance = nil, nil
+        local ok, walkError = pcall(function()
+            local gimmicks = gameState.RODAccessibleGimmicks
+            for index = 1, #gimmicks do
+                local gimmick = gimmicks[index]
+                if isValid(gimmick) then
+                    local at = gimmick:K2_GetActorLocation()
+                    local x, y, z =
+                        tonumber(at.X), tonumber(at.Y), tonumber(at.Z)
+                    if x ~= nil and y ~= nil and z ~= nil then
+                        local dx, dy = x - flat.X, y - flat.Y
+                        local distance = math.sqrt(dx * dx + dy * dy)
+                        if bestDistance == nil or distance < bestDistance then
+                            best, bestDistance = z, distance
+                        end
+                    end
+                end
+            end
+        end)
+        if not ok then
+            return nil, "terminal sweep failed: " .. tostring(walkError)
+        end
+        if best == nil then
+            return nil, "no accessible gimmick carries a height"
+        end
+        return best, nil, bestDistance
+    end
+
+    function groundedPinPosition(rawPosition)
+        local flat = {
+            X = tonumber(rawPosition.X),
+            Y = tonumber(rawPosition.Y),
+            Z = tonumber(rawPosition.Z),
+        }
+        if flat.X == nil or flat.Y == nil or flat.Z == nil then
+            return nil, "pin position is not numeric"
+        end
+        if flat.Z ~= 0.0 then return flat, nil end
+
+        local projected = projectPinOntoNavmesh(flat)
+        if projected ~= nil then
+            log(string.format(
+                "PIN GROUND | (%.1f, %.1f) projected onto navmesh at Z %.1f",
+                flat.X, flat.Y, projected.Z))
+            return projected, nil, false
+        end
+
+        local height, heightError, distance = nearestTerminalHeight(flat)
+        if height == nil then
+            return nil, "no navmesh and no terminal height: " ..
+                tostring(heightError)
+        end
+        log(string.format(
+            "PIN GROUND | (%.1f, %.1f) has no streamed navmesh; approaching " ..
+                "at Z %.1f borrowed from a terminal %.0f cm away",
+            flat.X, flat.Y, height + PIN_APPROACH_LIFT, distance or -1))
+        return { X = flat.X, Y = flat.Y, Z = height + PIN_APPROACH_LIFT },
+            nil, true
+    end
+end
+
 local function resolveMapItemWidget(mapWidget)
     if not isValid(mapWidget) then return nil, "no map screen" end
 
@@ -1795,57 +1933,325 @@ local function resolveMapItemWidget(mapWidget)
     return nil, "no RODMapItemWidgetBase under MapWidgetCanvas"
 end
 
-local function injectPinSnapKinds(mapWidget)
-    local item, itemError = resolveMapItemWidget(mapWidget)
-    if item == nil then
-        log("PIN SNAP | map item unavailable: " .. tostring(itemError))
-        return
-    end
-
-    local snap = nil
-    local readOk, readError = pcall(function()
-        snap = item.SnapMapIconKinds
-    end)
-    if not readOk or snap == nil then
-        log("PIN SNAP | SnapMapIconKinds unavailable: " .. tostring(readError))
-        return
-    end
-
-    local existing = {}
-    local before = {}
+-- The placed pins' icons, paired with their Timestamp. The timestamp join
+-- between FRODMapPin and URODIconForMapWidgetBase is measured working:
+--   MapPins[1] timestamp=33.5873  <->  PinIcon[8] kind=27 timestamp=33.5873
+-- Spare pool slots read back with Timestamp 0 and are skipped.
+local function placedPinIcons(item)
+    local icons = nil
+    pcall(function() icons = item.PinIconWidgets end)
+    if icons == nil then return {} end
     local count = 0
-    pcall(function() count = #snap end)
+    pcall(function() count = #icons end)
+
+    local placed = {}
     for index = 1, count do
-        local kind = nil
-        pcall(function() kind = tonumber(snap[index]) end)
-        if kind ~= nil then
-            existing[kind] = true
-            before[#before + 1] = tostring(kind)
+        local icon = nil
+        pcall(function() icon = icons[index] end)
+        if isValid(icon) then
+            local timestamp = nil
+            pcall(function() timestamp = tonumber(icon.Timestamp) end)
+            if timestamp ~= nil and timestamp ~= 0.0 then
+                placed[#placed + 1] = { icon = icon, timestamp = timestamp }
+            end
         end
     end
+    return placed
+end
 
-    -- Index-assign one past the end: the growth path proven on this UE4SS build.
-    local added = {}
-    for kind in pairs(MAP_PIN_ICON_KINDS) do
-        if existing[kind] ~= true then
-            local at = 0
-            pcall(function() at = #snap end)
-            if pcall(function() snap[at + 1] = kind end) then
-                existing[kind] = true
-                added[#added + 1] = string.format(
-                    "%d(%s)", kind, tostring(ELIGIBLE_MAP_ICON_KINDS[kind]))
+-- ESlateVisibility. A widget only takes part in hit testing at Visible; at
+-- HitTestInvisible its whole subtree is excluded, and at SelfHitTestInvisible
+-- only the widget itself is, with its children still testable.
+local SLATE_VISIBLE = 0
+local SLATE_HIT_TEST_INVISIBLE = 3
+local SLATE_SELF_HIT_TEST_INVISIBLE = 4
+local SLATE_VISIBILITY_NAMES = {
+    [0] = "Visible", [1] = "Collapsed", [2] = "Hidden",
+    [3] = "HitTestInvisible", [4] = "SelfHitTestInvisible",
+}
+local PIN_ANCESTOR_LIMIT = 8
+
+local function visibilityName(value)
+    return SLATE_VISIBILITY_NAMES[value] or tostring(value)
+end
+
+-- The <MISSING STRING TABLE ENTRY> labels track whether a WBP_Map_C has been
+-- constructed this session. They were correct while v0.13.0's icon helper
+-- existed -- which built one on every open -- and came back the moment it was
+-- removed; the log shows them correct after a WBP_Map_C construction at
+-- 20:16:48 and missing at 20:22 with none. Constructing the reference map
+-- evidently pulls in the string assets the fast travel screen's keys resolve
+-- against.
+--
+-- So the widget is built once and kept, and nothing else is done with it. The
+-- parts that made the old helper dangerous -- redirecting its MapItemWidget at
+-- another screen and calling GetIconForMap/UpdateIcon through it -- are not
+-- coming back.
+local mapStringCompanion = nil
+local buildingStringCompanion = false
+
+local function ensureMapStringCompanion()
+    if isValid(mapStringCompanion) then return end
+
+    local controller, controllerError = resolveLocalController()
+    if controller == nil then
+        log("MAP STRINGS | " .. tostring(controllerError))
+        return
+    end
+    local umgLibrary, umgError = resolveUmgLibrary()
+    if umgLibrary == nil then
+        log("MAP STRINGS | " .. tostring(umgError))
+        return
+    end
+
+    local widgetClass = StaticFindObject(
+        "/Game/ROD/Widget/Cockpit/Minimap/WBP_Map.WBP_Map_C")
+    if not isValid(widgetClass) then
+        log("MAP STRINGS | WBP_Map_C class is not loaded")
+        return
+    end
+
+    buildingStringCompanion = true
+    local created = nil
+    local ok, createError = pcall(function()
+        created = umgLibrary:Create(controller, widgetClass, controller)
+    end)
+    buildingStringCompanion = false
+
+    if not ok or not isValid(created) then
+        log("MAP STRINGS | companion creation failed: " ..
+            tostring(createError))
+        return
+    end
+    mapStringCompanion = created
+    log("MAP STRINGS | reference map companion built for string resolution")
+end
+
+-- Called when the screen is presented.
+--
+-- SetInputEnable alone was not enough -- measured, it wrote cleanly
+-- ("IsInputEnable false -> true | write=true" on all five pins) and hover still
+-- never fired. Input permission is not hit testing: map icons are drawn so they
+-- do not intercept the mouse over the map, and a widget outside hit testing
+-- cannot report hover no matter what its input flags say.
+--
+-- So visibility is raised to Visible on the icon, and any ancestor sitting at
+-- HitTestInvisible is moved to SelfHitTestInvisible -- which re-admits the
+-- children to hit testing without letting the ancestor start swallowing clicks
+-- itself.
+local function enablePinIconInput(mapWidget)
+    ensureMapStringCompanion()
+
+    local item, itemError = resolveMapItemWidget(mapWidget)
+    if item == nil then
+        log("PIN HOVER | map item unavailable: " .. tostring(itemError))
+        return
+    end
+
+    local placed = placedPinIcons(item)
+    if #placed == 0 then
+        log("PIN HOVER | no placed pin icon on this screen")
+        return
+    end
+
+    for _, entry in ipairs(placed) do
+        local beforeInput, beforeVisibility
+        pcall(function() beforeInput = entry.icon:IsInputEnable() end)
+        pcall(function()
+            beforeVisibility = tonumber(entry.icon:GetVisibility())
+        end)
+
+        local wrote = pcall(function()
+            entry.icon:SetInputEnable(true)
+            entry.icon:SetInputEnableIndividualAll(true)
+            entry.icon:SetIsEnabled(true)
+            entry.icon:SetVisibility(SLATE_VISIBLE)
+        end)
+
+        local afterInput, afterVisibility
+        pcall(function() afterInput = entry.icon:IsInputEnable() end)
+        pcall(function()
+            afterVisibility = tonumber(entry.icon:GetVisibility())
+        end)
+
+        log(string.format(
+            "PIN HOVER | pin timestamp=%s | input %s -> %s | visibility %s -> %s | write=%s",
+            tostring(entry.timestamp),
+            tostring(beforeInput), tostring(afterInput),
+            visibilityName(beforeVisibility), visibilityName(afterVisibility),
+            tostring(wrote)))
+
+        -- One HitTestInvisible ancestor is enough to keep the icon out of hit
+        -- testing however the icon itself is configured.
+        pcall(function()
+            local node = entry.icon:GetParent()
+            local depth = 0
+            while isValid(node) and depth < PIN_ANCESTOR_LIMIT do
+                depth = depth + 1
+                local current = tonumber(node:GetVisibility())
+                if current == SLATE_HIT_TEST_INVISIBLE then
+                    local changed = pcall(function()
+                        node:SetVisibility(SLATE_SELF_HIT_TEST_INVISIBLE)
+                    end)
+                    local now = nil
+                    pcall(function() now = tonumber(node:GetVisibility()) end)
+                    log(string.format(
+                        "PIN HOVER | ancestor %d %s | %s -> %s | write=%s",
+                        depth, tostring(objectName(node)),
+                        visibilityName(current), visibilityName(now),
+                        tostring(changed)))
+                else
+                    dbg(string.format(
+                        "PIN HOVER | ancestor %d %s is %s",
+                        depth, tostring(objectName(node)),
+                        visibilityName(current)))
+                end
+                node = node:GetParent()
+            end
+        end)
+    end
+end
+
+-- WHERE THE POSITIONS ACTUALLY ARE
+--
+-- The canvas slot read 0,0 for every widget including the cursor, and so did
+-- GetCachedGeometry. Both were the wrong place to look: an icon that moves
+-- across a map is positioned by render translation, not by its slot.
+-- UWidget::RenderTransform is a plain property, so this is a field read with no
+-- UFunction call behind it.
+local PIN_TRANSLATION_TOLERANCE = 60.0
+
+local function widgetTranslation(widget)
+    if not isValid(widget) then return nil end
+    local at = nil
+    pcall(function()
+        local translation = widget.RenderTransform.Translation
+        at = { X = tonumber(translation.X), Y = tonumber(translation.Y) }
+    end)
+    if at == nil or at.X == nil or at.Y == nil then return nil end
+    return at
+end
+
+-- The pin whose icon sits closest to the cursor. The screen's own box does not
+-- move onto pins -- that selection lives in its Blueprint and is not reachable
+-- -- so this reproduces only the decision, not the highlight.
+local function nearestPinByTranslation(item)
+    local cursorAt = nil
+    pcall(function() cursorAt = widgetTranslation(item.CursorWidget) end)
+    if cursorAt == nil then
+        return nil, "the map cursor has no readable render translation"
+    end
+
+    local placed = placedPinIcons(item)
+    if #placed == 0 then return nil, "no placed pin icon on this screen" end
+
+    local best, bestDistance = nil, nil
+    local report = {}
+    for _, entry in ipairs(placed) do
+        local at = widgetTranslation(entry.icon)
+        if at ~= nil then
+            local dx, dy = at.X - cursorAt.X, at.Y - cursorAt.Y
+            local distance = math.sqrt(dx * dx + dy * dy)
+            report[#report + 1] = string.format(
+                "%s@%.0f,%.0f=%.0f", tostring(entry.timestamp),
+                at.X, at.Y, distance)
+            if bestDistance == nil or distance < bestDistance then
+                best, bestDistance = entry, distance
             end
         end
     end
 
-    local after = 0
-    pcall(function() after = #snap end)
     log(string.format(
-        "PIN SNAP | SnapMapIconKinds %d -> %d | had [%s] | added [%s]",
-        count,
-        after,
-        table.concat(before, ", "),
-        #added == 0 and "nothing" or table.concat(added, ", ")))
+        "PIN HOVER | cursor at %.0f,%.0f | pins [%s]",
+        cursorAt.X, cursorAt.Y, table.concat(report, " ")))
+
+    if best == nil then
+        return nil, "no pin icon has a readable render translation"
+    end
+    if bestDistance > PIN_TRANSLATION_TOLERANCE then
+        return nil, string.format(
+            "nearest pin is %.0f px from the cursor", bestDistance)
+    end
+    return best.timestamp, nil
+end
+
+-- Which placed pin icon the mouse is on, asked of the icons themselves.
+local function hoveredPinTimestamp(mapWidget)
+    local item, itemError = resolveMapItemWidget(mapWidget)
+    if item == nil then return nil, tostring(itemError) end
+
+    local placed = placedPinIcons(item)
+    if #placed == 0 then return nil, "no placed pin icon on this screen" end
+
+    local report = {}
+    for _, entry in ipairs(placed) do
+        local hovered = nil
+        pcall(function() hovered = entry.icon:GetIsMouseHover() end)
+        report[#report + 1] = string.format(
+            "%s:%s", tostring(entry.timestamp), tostring(hovered))
+        if hovered == true then
+            log("PIN HOVER | mouse is on pin timestamp=" ..
+                tostring(entry.timestamp))
+            return entry.timestamp, nil
+        end
+    end
+    -- Slate hover never fires for these icons: measured, GetIsMouseHover stays
+    -- false on all of them even once they are Visible and input-enabled, and the
+    -- game never calls GetCanHoverIcon either. Falling back to the cursor's own
+    -- render translation, which is the same decision the screen makes for
+    -- terminals, just made here.
+    local nearest, nearestError = nearestPinByTranslation(item)
+    if nearest ~= nil then return nearest, nil end
+
+    return nil, "no pin hovered [" .. table.concat(report, ", ") ..
+        "] and " .. tostring(nearestError)
+end
+
+local function livePinsInWorld()
+    local gameState, gameStateError = resolveWorldGameState()
+    if gameState == nil then return nil, tostring(gameStateError) end
+
+    local pins = nil
+    local readOk, readError = pcall(function() pins = gameState.MapPins end)
+    if not readOk or pins == nil then
+        return nil, "MapPins is unavailable: " .. tostring(readError)
+    end
+    local count = 0
+    pcall(function() count = #pins end)
+    if count == 0 then return {}, "no map pin is placed" end
+
+    -- Grounding is not done here. It costs a navigation query per pin, and this
+    -- runs on a keypress that repeats -- fifty invocations in ten seconds, in
+    -- the log that exposed it. Only the raw pin data is collected; the height is
+    -- resolved once, for the one pin actually being travelled to.
+    local live = {}
+    for index = 1, count do
+        local pin = nil
+        pcall(function() pin = pins[index] end)
+        if pin ~= nil then
+            local kind, timestamp, raw
+            pcall(function() kind = tonumber(pin.Kind) end)
+            pcall(function() timestamp = tonumber(pin.Timestamp) end)
+            pcall(function()
+                raw = { X = tonumber(pin.Pos.X), Y = tonumber(pin.Pos.Y),
+                        Z = tonumber(pin.Pos.Z) }
+            end)
+            if kind ~= nil and kind ~= 0 and raw ~= nil and raw.X ~= nil then
+                live[#live + 1] = {
+                    index = index,
+                    kind = kind,
+                    timestamp = timestamp,
+                    raw = raw,
+                }
+            end
+        end
+    end
+    if #live == 0 then
+        return {}, string.format(
+            "%d map pin(s) exist but none carry a usable kind and position",
+            count)
+    end
+    return live, nil
 end
 
 local function verifyTeleportMapOpen(serial)
@@ -1856,7 +2262,7 @@ local function verifyTeleportMapOpen(serial)
     local presented = {}
     local constructed = 0
     for _, fragment in ipairs({
-        FAST_TRAVEL_WIDGET_FRAGMENT, MAP_MENU_WIDGET_FRAGMENT
+        K.FAST_TRAVEL_WIDGET_FRAGMENT, K.MAP_MENU_WIDGET_FRAGMENT
     }) do
         local ok, widgets = pcall(function()
             return FindAllOf(fragment)
@@ -1878,15 +2284,15 @@ local function verifyTeleportMapOpen(serial)
                 "constructed (%s / %s)",
             #presented,
             constructed,
-            FAST_TRAVEL_WIDGET_FRAGMENT,
-            MAP_MENU_WIDGET_FRAGMENT))
+            K.FAST_TRAVEL_WIDGET_FRAGMENT,
+            K.MAP_MENU_WIDGET_FRAGMENT))
         return
     end
 
     local fragment = mapScreenFragment(presented[1])
     local wanted = CONFIG.MAP_TARGET == "map"
-        and MAP_MENU_WIDGET_FRAGMENT
-        or FAST_TRAVEL_WIDGET_FRAGMENT
+        and K.MAP_MENU_WIDGET_FRAGMENT
+        or K.FAST_TRAVEL_WIDGET_FRAGMENT
     if fragment ~= wanted then
         log(string.format(
             "MAP SCREEN MISMATCH | opened %s, wanted %s",
@@ -1903,7 +2309,7 @@ local function verifyTeleportMapOpen(serial)
     log(string.format(
         "map screen presented | %s | select an eligible icon and confirm",
         tostring(fragment)))
-    injectPinSnapKinds(presented[1])
+    enablePinIconInput(presented[1])
 end
 
 local function activateTeleportMapAbility(serial, contract)
@@ -1920,7 +2326,7 @@ local function activateTeleportMapAbility(serial, contract)
     if menuKey == nil then
         failPendingOpen(
             serial,
-            "no menu key is available for " .. MAP_MENU_ABILITY_CLASS ..
+            "no menu key is available for " .. K.MAP_MENU_ABILITY_CLASS ..
                 "; set MAP_MENU_KEY in config.lua or open the map once " ..
                 "natively so the key can be observed")
         return
@@ -1957,7 +2363,7 @@ local function activateTeleportMapAbility(serial, contract)
         " | trigger=" .. contract.mapAbilityTriggerTagName)
     local scheduled, scheduleError = pcall(function()
         ExecuteWithDelay(
-            OPEN_VERIFICATION_DELAY_MS,
+            K.OPEN_VERIFICATION_DELAY_MS,
             function()
                 ExecuteInGameThread(function()
                     verifyTeleportMapOpen(serial)
@@ -2039,13 +2445,13 @@ local function openFastTravelMenu(serial)
         return
     end
 
-    reportMenuWidgetClass(MENU_KIND_FAST_TRAVEL_MENU)
+    reportMenuWidgetClass(K.MENU_KIND_FAST_TRAVEL_MENU)
 
-    local widgetClass = StaticFindObject(FAST_TRAVEL_WIDGET_CLASS)
+    local widgetClass = StaticFindObject(K.FAST_TRAVEL_WIDGET_CLASS)
     if not isValid(widgetClass) then
         failPendingOpen(
             serial,
-            FAST_TRAVEL_WIDGET_CLASS .. " is not loaded")
+            K.FAST_TRAVEL_WIDGET_CLASS .. " is not loaded")
         return
     end
 
@@ -2058,7 +2464,7 @@ local function openFastTravelMenu(serial)
     -- the process down with no Lua error left to catch.
     log(string.format(
         "MAP OPEN | Create + DebugOpenMenu + OpenMenu | kind=%d | parent=%s",
-        MENU_KIND_FAST_TRAVEL_MENU,
+        K.MENU_KIND_FAST_TRAVEL_MENU,
         tostring(objectName(parentMenu))))
 
     local widget = nil
@@ -2070,7 +2476,7 @@ local function openFastTravelMenu(serial)
         if parentMenu ~= nil then
             widget.ParentMenu = parentMenu
         end
-        widget.MenuKind = MENU_KIND_FAST_TRAVEL_MENU
+        widget.MenuKind = K.MENU_KIND_FAST_TRAVEL_MENU
 
         -- Settled by measurement: Create already leaves PlayerControllerRef and
         -- UIManagerRef populated here. v0.6.0 wrote them on the theory that they
@@ -2112,7 +2518,7 @@ local function openFastTravelMenu(serial)
 
     local scheduled, scheduleError = pcall(function()
         ExecuteWithDelay(
-            OPEN_VERIFICATION_DELAY_MS,
+            K.OPEN_VERIFICATION_DELAY_MS,
             function()
                 ExecuteInGameThread(function()
                     verifyTeleportMapOpen(serial)
@@ -2137,24 +2543,24 @@ local function waitForMainMenuAbilityEnd(
     local transitionOk, transitionError = xpcall(function()
         local mainMenuActive =
             isOwnedAbilityClassActive(
-                MAIN_MENU_ABILITY_CLASS,
+                K.MAIN_MENU_ABILITY_CLASS,
                 contract.abilitySystem)
         if not mainMenuActive then
             activateTeleportMapAbility(serial, contract)
             return
         end
 
-        if elapsedMs >= MENU_TRANSITION_TIMEOUT_MS then
-            error(MAIN_MENU_ABILITY_CLASS .. " remained active for " ..
+        if elapsedMs >= K.MENU_TRANSITION_TIMEOUT_MS then
+            error(K.MAIN_MENU_ABILITY_CLASS .. " remained active for " ..
                 tostring(elapsedMs) .. " ms")
         end
 
-        ExecuteWithDelay(MENU_TRANSITION_POLL_MS, function()
+        ExecuteWithDelay(K.MENU_TRANSITION_POLL_MS, function()
             ExecuteInGameThread(function()
                 waitForMainMenuAbilityEnd(
                     serial,
                     contract,
-                    elapsedMs + MENU_TRANSITION_POLL_MS)
+                    elapsedMs + K.MENU_TRANSITION_POLL_MS)
             end)
         end)
     end, debug.traceback)
@@ -2220,11 +2626,11 @@ local function requestFastTravelOpen(source)
             local recovered =
                 recoverCompletedNativeTravel("before teleport map")
             state = logNativeTravelState("before teleport map")
-            if state.fastTravelStatus == FAST_TRAVEL_STATUS_DECIDE
+            if state.fastTravelStatus == K.FAST_TRAVEL_STATUS_DECIDE
                 and recovered ~= true then
                 error("a native Fast Travel transaction is still active")
             end
-            if state.accessibleStatus ~= ACCESSIBLE_STATUS_NONE
+            if state.accessibleStatus ~= K.ACCESSIBLE_STATUS_NONE
                 or state.accessingTerminal ~= false then
                 error(string.format(
                     "terminal interaction is active | PSAcsGmkStatus=%d | bAccessingTerminal=%s",
@@ -2262,10 +2668,10 @@ local function requestFastTravelOpen(source)
     local alreadyActiveOk, alreadyActiveError = xpcall(function()
         local mapMenuActive =
             isOwnedAbilityClassActive(
-                MAP_MENU_ABILITY_CLASS,
+                K.MAP_MENU_ABILITY_CLASS,
                 abilityContract.abilitySystem)
         if mapMenuActive then
-            error(MAP_MENU_ABILITY_CLASS .. " is already active")
+            error(K.MAP_MENU_ABILITY_CLASS .. " is already active")
         end
     end, debug.traceback)
     if not alreadyActiveOk then
@@ -2289,7 +2695,7 @@ local function requestFastTravelOpen(source)
         return
     end
 
-    log("waiting for " .. MAIN_MENU_ABILITY_CLASS .. " to end")
+    log("waiting for " .. K.MAIN_MENU_ABILITY_CLASS .. " to end")
     waitForMainMenuAbilityEnd(serial, abilityContract, 0)
 end
 
@@ -2309,8 +2715,8 @@ end
 
 local function resolveSelectedMapIcon(mapWidget)
     if not isValid(mapWidget)
-        or not nameContains(mapWidget, MAP_MENU_WIDGET_FRAGMENT) then
-        error("exact " .. MAP_MENU_WIDGET_FRAGMENT ..
+        or not nameContains(mapWidget, K.MAP_MENU_WIDGET_FRAGMENT) then
+        error("exact " .. K.MAP_MENU_WIDGET_FRAGMENT ..
             " reference map is unavailable")
     end
 
@@ -2360,7 +2766,7 @@ local function resolveSelectedMapIcon(mapWidget)
         error("selected map icon is not hoverable")
     end
 
-    local kindName = ELIGIBLE_MAP_ICON_KINDS[kind]
+    local kindName = K.ELIGIBLE_MAP_ICON_KINDS[kind]
     if kindName == nil then
         error("map icon kind " .. tostring(kind) ..
             " is not an eligible checkpoint/pin destination")
@@ -2539,7 +2945,7 @@ local function requestSelectedMapTeleport(mapWidget, source)
             local controller, controllerError =
                 resolveLocalController()
             if controller == nil then error(controllerError) end
-            controller:EndMapMenu(MENU_END_ALL_CLOSE)
+            controller:EndMapMenu(K.MENU_END_ALL_CLOSE)
         end
     end)
     if not closed then
@@ -2550,7 +2956,7 @@ local function requestSelectedMapTeleport(mapWidget, source)
     end
 
     local scheduled, scheduleError = pcall(function()
-        ExecuteWithDelay(TELEPORT_FINALIZE_DELAY_MS, function()
+        ExecuteWithDelay(K.TELEPORT_FINALIZE_DELAY_MS, function()
             ExecuteInGameThread(function()
                 finalizeMapTeleport(source)
             end)
@@ -2716,7 +3122,7 @@ local function dismissFastTravelScreen()
     end
 
     local scheduled, scheduleError = pcall(function()
-        ExecuteWithDelay(TELEPORT_FINALIZE_DELAY_MS, function()
+        ExecuteWithDelay(K.TELEPORT_FINALIZE_DELAY_MS, function()
             ExecuteInGameThread(function()
                 finalizeMapTeleport("fast travel map")
             end)
@@ -2759,178 +3165,6 @@ end
 -- Absolute (screen) position of a widget's top-left. Absolute rather than slot
 -- position because the cursor and the icons need not share a canvas, and slot
 -- coordinates are only comparable within one.
-local function widgetAbsolutePosition(widget)
-    if not isValid(widget) then return nil end
-    local position = nil
-    pcall(function()
-        local slate =
-            StaticFindObject("/Script/UMG.Default__SlateBlueprintLibrary")
-        if not isValid(slate) then
-            error("SlateBlueprintLibrary default object is unavailable")
-        end
-        local absolute = slate:LocalToAbsolute(
-            widget:GetCachedGeometry(), { X = 0.0, Y = 0.0 })
-        position = { X = tonumber(absolute.X), Y = tonumber(absolute.Y) }
-    end)
-    if position == nil or position.X == nil or position.Y == nil then
-        return nil
-    end
-    return position
-end
-
--- How close the cursor has to be to a pin icon, in absolute pixels, to count as
--- pointing at it. Map icons render around 30 px, so this is roughly "touching".
-local PIN_CURSOR_TOLERANCE = 48.0
-
-local function nearestPinIconToCursor(item)
-    local cursor = nil
-    pcall(function() cursor = item.CursorWidget end)
-    local cursorAt = widgetAbsolutePosition(cursor)
-    if cursorAt == nil then
-        return nil, "the map cursor position is unreadable"
-    end
-
-    local pins = nil
-    pcall(function() pins = item.PinIconWidgets end)
-    if pins == nil then return nil, "PinIconWidgets is unavailable" end
-    local count = 0
-    pcall(function() count = #pins end)
-    if count == 0 then return nil, "the map item holds no pin icons" end
-
-    local best, bestDistance = nil, nil
-    for index = 1, count do
-        local icon = nil
-        pcall(function() icon = pins[index] end)
-        local at = widgetAbsolutePosition(icon)
-        if at ~= nil then
-            local dx = at.X - cursorAt.X
-            local dy = at.Y - cursorAt.Y
-            local distance = math.sqrt(dx * dx + dy * dy)
-            if bestDistance == nil or distance < bestDistance then
-                best, bestDistance = icon, distance
-            end
-        end
-    end
-    if best == nil then
-        return nil, string.format(
-            "none of the %d pin icon positions could be read", count)
-    end
-    if bestDistance > PIN_CURSOR_TOLERANCE then
-        return nil, string.format(
-            "nearest of %d pin icons is %.0f px from the cursor",
-            count, bestDistance)
-    end
-    return best, nil, bestDistance
-end
-
--- Where the cursor's icon actually lives, in the order this screen fills them.
---
---   CurrentTargetIconWidget         URODMapItemWidgetBase, the base field.
---                                   Measured empty on this screen.
---   CurrentStayTerminalIconWidget   URODFieldMapItemWidget, which is what the
---                                   fast travel screen builds (WBP_FieldMap_C).
---                                   Its name says terminal, so it may never hold
---                                   a pin.
---   nearest PinIconWidgets entry    If the screen tracks no pin at all, the pin
---                                   the cursor is over can still be found by
---                                   comparing screen positions. This does not
---                                   need the screen's cooperation.
-local function isPinIcon(icon)
-    local kind = nil
-    pcall(function() kind = tonumber(icon:GetMapIconKind()) end)
-    return kind ~= nil and MAP_PIN_ICON_KINDS[kind] == true
-end
-
-local function cursorIcon(item)
-    -- A tracked icon is only accepted if it is a pin. The stay field is named
-    -- for terminals, and a terminal there would otherwise shadow the pin the
-    -- cursor is actually over.
-    local icon = nil
-    pcall(function() icon = weakObject(item.CurrentTargetIconWidget) end)
-    if isValid(icon) and isPinIcon(icon) then
-        return icon, "CurrentTargetIconWidget"
-    end
-
-    pcall(function()
-        icon = weakObject(item.CurrentStayTerminalIconWidget)
-    end)
-    if isValid(icon) and isPinIcon(icon) then
-        return icon, "CurrentStayTerminalIconWidget"
-    end
-
-    local nearest, nearestError, distance = nearestPinIconToCursor(item)
-    if nearest ~= nil then
-        return nearest, string.format(
-            "nearest pin icon (%.0f px)", distance or -1)
-    end
-    return nil, nil, nearestError
-end
-
-local function focusedPinDestination()
-    if not isValid(teleportMapWidget) then return nil, "no map screen tracked" end
-
-    local item, itemError = resolveMapItemWidget(teleportMapWidget)
-    if item == nil then return nil, tostring(itemError) end
-
-    local icon, iconSource, iconError = cursorIcon(item)
-    if not isValid(icon) then
-        return nil, "the cursor is not on a pin: " ..
-            tostring(iconError or "no icon reference")
-    end
-    dbg("pin candidate found via " .. tostring(iconSource))
-
-    local kind, timestamp
-    local probed = pcall(function()
-        kind = tonumber(icon:GetMapIconKind())
-        timestamp = tonumber(icon.Timestamp)
-    end)
-    if not probed or kind == nil then
-        return nil, "focused widget is not a map icon"
-    end
-    if MAP_PIN_ICON_KINDS[kind] ~= true then
-        return nil, string.format(
-            "focused icon kind %d (%s) is not a pin",
-            kind, tostring(ELIGIBLE_MAP_ICON_KINDS[kind] or "other"))
-    end
-
-    local gameState, gameStateError = resolveWorldGameState()
-    if gameState == nil then return nil, tostring(gameStateError) end
-
-    local matched = nil
-    local matchOk, matchError = pcall(function()
-        local pins = gameState.MapPins
-        local count = #pins
-        for index = 1, count do
-            local pin = pins[index]
-            if pin ~= nil and timestamp ~= nil
-                and tonumber(pin.Timestamp) == timestamp then
-                matched = {
-                    index = index,
-                    kind = kind,
-                    position = {
-                        X = tonumber(pin.Pos.X),
-                        Y = tonumber(pin.Pos.Y),
-                        Z = tonumber(pin.Pos.Z),
-                    },
-                }
-                return
-            end
-        end
-    end)
-    if not matchOk then
-        return nil, "MapPins scan failed: " .. tostring(matchError)
-    end
-    if matched == nil then
-        return nil, string.format(
-            "no map pin carries timestamp %s", tostring(timestamp))
-    end
-    if matched.position.X == nil or matched.position.Y == nil
-        or matched.position.Z == nil then
-        return nil, "matched pin position is not numeric"
-    end
-    return matched, nil
-end
-
 local function handleNativeFastTravelDecision(idName)
     local state = nil
     local stateOk, stateError = pcall(function()
@@ -2941,7 +3175,7 @@ local function handleNativeFastTravelDecision(idName)
             tostring(stateError))
         return
     end
-    if state.fastTravelStatus == FAST_TRAVEL_STATUS_ENABLE
+    if state.fastTravelStatus == K.FAST_TRAVEL_STATUS_ENABLE
         or state.accessingTerminal == true then
         log("native Fast Travel is live; leaving the decision to the game" ..
             " | ID=" .. idName)
@@ -2975,15 +3209,15 @@ local function interceptMapTeleport(
 
     local mapWidget = hookValue(mapParameter)
     if not isValid(mapWidget)
-        or not nameContains(mapWidget, MAP_MENU_WIDGET_FRAGMENT) then
+        or not nameContains(mapWidget, K.MAP_MENU_WIDGET_FRAGMENT) then
         return
     end
 
     local button = tonumber(hookValue(buttonParameter))
-    if button ~= ACCEPT_BUTTON then return end
+    if button ~= K.ACCEPT_BUTTON then return end
     if clickTypeParameter ~= nil then
         local clickType = tonumber(hookValue(clickTypeParameter))
-        if clickType ~= SINGLE_CLICK then return end
+        if clickType ~= K.SINGLE_CLICK then return end
     end
 
     if not consumeButton(buttonParameter) then return end
@@ -3015,7 +3249,7 @@ local function cacheMapIconDestination(
 
     local mapWidget = hookValue(mapParameter)
     if not isValid(mapWidget)
-        or not nameContains(mapWidget, MAP_MENU_WIDGET_FRAGMENT) then
+        or not nameContains(mapWidget, K.MAP_MENU_WIDGET_FRAGMENT) then
         return
     end
 
@@ -3023,7 +3257,7 @@ local function cacheMapIconDestination(
     if kind == nil then
         error("UpdateIcon EMapIconKind decode failed")
     end
-    if ELIGIBLE_MAP_ICON_KINDS[kind] == nil then return end
+    if K.ELIGIBLE_MAP_ICON_KINDS[kind] == nil then return end
 
     local iconWidget = hookValue(iconParameter)
     local iconKey = objectName(iconWidget)
@@ -3047,7 +3281,7 @@ local function cacheMapIconDestination(
     }
     dbg(string.format(
         "cached map destination | kind=%s(%d) | pos=(%.3f, %.3f, %.3f) | actor=%s",
-        ELIGIBLE_MAP_ICON_KINDS[kind],
+        K.ELIGIBLE_MAP_ICON_KINDS[kind],
         kind,
         x,
         y,
@@ -3086,21 +3320,21 @@ local function handleButton(widgetParameter, buttonParameter)
     if not isValid(widget) then return end
 
     if isFastTravelIcon(widget) then
-        if button == ACCEPT_BUTTON then
+        if button == K.ACCEPT_BUTTON then
             if consumeButton(buttonParameter) then
                 scheduleFastTravelOpen("Start Menu")
             end
-        elseif button == BACK_BUTTON then
+        elseif button == K.BACK_BUTTON then
             if consumeButton(buttonParameter) then
                 closeMainMenuFromFastTravel()
             end
-        elseif button == DPAD_UP or button == LSTICK_UP then
+        elseif button == K.DPAD_UP or button == K.LSTICK_UP then
             if consumeButton(buttonParameter) then
                 withInputLock(function()
                     focusRowAbove(activeContext)
                 end)
             end
-        elseif button == DPAD_DOWN or button == LSTICK_DOWN then
+        elseif button == K.DPAD_DOWN or button == K.LSTICK_DOWN then
             if consumeButton(buttonParameter) then
                 withInputLock(function()
                     focusRowBelow(activeContext)
@@ -3113,7 +3347,7 @@ local function handleButton(widgetParameter, buttonParameter)
     local context = activeContext
     if context == nil or context.failed
         or context.firstInjected ~= true
-        or not nameContains(widget, MAIN_MENU_LIST_FRAGMENT) then
+        or not nameContains(widget, K.MAIN_MENU_LIST_FRAGMENT) then
         return
     end
 
@@ -3121,8 +3355,8 @@ local function handleButton(widgetParameter, buttonParameter)
     pcall(function() index = widget:GetItemIndex() end)
     if type(index) ~= "number" then return end
 
-    local down = button == DPAD_DOWN or button == LSTICK_DOWN
-    local up = button == DPAD_UP or button == LSTICK_UP
+    local down = button == K.DPAD_DOWN or button == K.LSTICK_DOWN
+    local up = button == K.DPAD_UP or button == K.LSTICK_UP
     if down and index == context.nativeCount - 1 then
         if consumeButton(buttonParameter) then
             withInputLock(function() focusFastTravel(context) end)
@@ -3408,23 +3642,52 @@ optionalHook(
             end)
             ExecuteWithDelay(0, function()
                 ExecuteInGameThread(function()
-                    local pin, pinError = focusedPinDestination()
-                    if pin == nil then
-                        log("FAST TRAVEL | no destination decided (ID=None) | " ..
-                            tostring(pinError) ..
-                            " | Fast Travel needs a floor map, not the town map.")
+                    -- The hovered pin is asked of the icons through
+                    -- URODInputWidgetBase::GetIsMouseHover, which is where the
+                    -- game keeps hover. Coordinates were the wrong question.
+                    local livePins, livePinsError = livePinsInWorld()
+                    if livePins ~= nil and #livePins > 0 then
+                        local chosen = nil
+                        local hovered, hoverError =
+                            hoveredPinTimestamp(teleportMapWidget)
+                        if hovered ~= nil then
+                            for _, entry in ipairs(livePins) do
+                                if entry.timestamp == hovered then
+                                    chosen = entry
+                                    break
+                                end
+                            end
+                        end
+                        -- With a single pin placed there is nothing to
+                        -- disambiguate, so hover is not required for it.
+                        if chosen == nil and #livePins == 1 then
+                            chosen = livePins[1]
+                            log("FAST TRAVEL | no pin hovered (" ..
+                                tostring(hoverError) ..
+                                "); one pin is placed, taking it")
+                        end
+                        if chosen ~= nil then
+                            log(string.format(
+                                "MOD TELEPORT | map pin %d | EMapPinKind=%s | timestamp=%s",
+                                chosen.index, tostring(chosen.kind),
+                                tostring(chosen.timestamp)))
+                            performTeleport(chosen.position, "map pin")
+                            dismissFastTravelScreen()
+                            return
+                        end
+                        log(string.format(
+                            "FAST TRAVEL | %d pins placed, none hovered | %s",
+                            #livePins, tostring(hoverError)))
                         return
                     end
-                    log(string.format(
-                        "MOD TELEPORT | pin %d kind=%s (%s) | pos=(%.1f, %.1f, %.1f)",
-                        pin.index,
-                        tostring(pin.kind),
-                        tostring(ELIGIBLE_MAP_ICON_KINDS[pin.kind]),
-                        pin.position.X, pin.position.Y, pin.position.Z))
-                    performTeleport(
-                        pin.position,
-                        string.format("pin %d", pin.index))
-                    dismissFastTravelScreen()
+                    if livePinsError ~= nil then
+                        log("FAST TRAVEL | map pins unavailable: " ..
+                            tostring(livePinsError))
+                    end
+
+                    log("FAST TRAVEL | no destination decided (ID=None)"
+                        .. " and no map pin is placed here.")
+                    return
                 end)
             end)
             return
@@ -3569,6 +3832,7 @@ for _, notification in ipairs({
 }) do
     local notifyOk, notifyError = pcall(function()
         NotifyOnNewObject(notification.class, function(widget)
+            if buildingStringCompanion then return end
             local fragment = mapScreenFragment(widget)
             if fragment ~= nil then
                 teleportMapWidgetKey = objectName(widget)
@@ -3590,7 +3854,7 @@ local notifyMainMenuOk, notifyMainMenuError = pcall(function()
         function(mainMenu)
             if not isValid(mainMenu)
                 or not nameContains(
-                    mainMenu, MAIN_MENU_CLASS_FRAGMENT) then
+                    mainMenu, K.MAIN_MENU_CLASS_FRAGMENT) then
                 return
             end
             local menuKey = objectName(mainMenu)
@@ -3600,7 +3864,7 @@ local notifyMainMenuOk, notifyMainMenuError = pcall(function()
             end
             pendingInjectionKeys[menuKey] = true
 
-            ExecuteWithDelay(MENU_INJECTION_DELAY_MS, function()
+            ExecuteWithDelay(K.MENU_INJECTION_DELAY_MS, function()
                 pendingInjectionKeys[menuKey] = nil
                 ExecuteInGameThread(function()
                     local resolved, resolveError =
@@ -3777,14 +4041,12 @@ local commandOk, commandError = pcall(function()
                         if pin == nil then
                             error("MapPins[" .. index .. "] is unavailable")
                         end
-                        local position = {
-                            X = tonumber(pin.Pos.X),
-                            Y = tonumber(pin.Pos.Y),
-                            Z = tonumber(pin.Pos.Z),
-                        }
-                        if position.X == nil or position.Y == nil
-                            or position.Z == nil then
-                            error("pin position is not numeric")
+                        -- Grounded, not raw: FRODMapPin::Pos carries Z = 0 and
+                        -- travelling to that drops the hero through the world.
+                        local position, positionError =
+                            groundedPinPosition(pin.Pos)
+                        if position == nil then
+                            error(tostring(positionError))
                         end
                         performTeleport(
                             position,
@@ -3928,63 +4190,93 @@ bindKey(CONFIG.FORCE_CLOSE_KEY, "force close map", function()
     forceCloseMapScreen("keybind")
 end)
 
--- The pin gate is not in SnapMapIconKinds, which already listed pins. This
--- reports what the cursor is actually resolving to at the instant it is pressed,
--- which is the evidence needed to find where the gate really is.
-bindKey(CONFIG.CURSOR_PROBE_KEY, "map cursor probe", function()
-    if not isValid(teleportMapWidget) then
-        log("CURSOR PROBE | no map screen is tracked")
-        return
-    end
-    local item, itemError = resolveMapItemWidget(teleportMapWidget)
-    if item == nil then
-        log("CURSOR PROBE | map item unavailable: " .. tostring(itemError))
+-- WHY PIN TRAVEL NEEDS ITS OWN KEY
+--
+-- "Confirmar" is greyed out unless the cursor is on a destination the screen
+-- accepts, and it accepts only safe areas and teleport terminals. Over a pin the
+-- button is dead, so ServerDecideFastTravel never fires and there is no confirm
+-- to intercept. Detecting the pin correctly changes nothing while the trigger
+-- itself cannot happen.
+--
+-- This key is that trigger. It only acts while the mod's own screen is open.
+local pinTravelBusy = false
+
+bindKey(CONFIG.PIN_TRAVEL_KEY, "travel to pin under cursor", function()
+    -- A held key repeats several times a second. Without this the last attempt
+    -- fired fifty times in ten seconds, each running navigation queries.
+    if pinTravelBusy then return end
+
+    if not teleportMapModeActive or not isValid(teleportMapWidget) then
+        log("PIN TRAVEL | the fast travel map is not open")
         return
     end
 
-    -- Every field that could hold the hovered icon, reported together. The last
-    -- probe read only CurrentTargetIconWidget, found it empty, and that said
-    -- nothing about the other two.
-    local targetIcon, stayIcon = nil, nil
-    pcall(function() targetIcon = weakObject(item.CurrentTargetIconWidget) end)
-    pcall(function()
-        stayIcon = weakObject(item.CurrentStayTerminalIconWidget)
-    end)
+    local livePins, livePinsError = livePinsInWorld()
+    if livePins == nil or #livePins == 0 then
+        log("PIN TRAVEL | " .. tostring(livePinsError or "no map pin is placed"))
+        return
+    end
 
-    local pinCount = -1
-    pcall(function() pinCount = #item.PinIconWidgets end)
-    local nearest, nearestError, distance = nearestPinIconToCursor(item)
+    local chosen = nil
+    if #livePins == 1 then
+        chosen = livePins[1]
+    else
+        local item, itemError = resolveMapItemWidget(teleportMapWidget)
+        if item == nil then
+            log("PIN TRAVEL | " .. tostring(itemError))
+            return
+        end
+        local timestamp, nearestError = nearestPinByTranslation(item)
+        if timestamp == nil then
+            log("PIN TRAVEL | " .. tostring(nearestError) ..
+                " | move the cursor onto a pin")
+            return
+        end
+        for _, entry in ipairs(livePins) do
+            if entry.timestamp == timestamp then chosen = entry end
+        end
+        if chosen == nil then
+            log("PIN TRAVEL | the nearest icon matches no placed pin")
+            return
+        end
+    end
+
+    pinTravelBusy = true
+    ExecuteWithDelay(1200, function() pinTravelBusy = false end)
+
+    -- Height is resolved here, once, for this pin only.
+    local position, positionError, approximate =
+        groundedPinPosition(chosen.raw)
+    if position == nil then
+        log("PIN TRAVEL | pin " .. chosen.index .. " has no usable height: " ..
+            tostring(positionError))
+        return
+    end
 
     log(string.format(
-        "CURSOR PROBE | item=%s | CurrentTargetIconWidget=%s | " ..
-            "CurrentStayTerminalIconWidget=%s | PinIconWidgets=%d | nearestPin=%s",
-        tostring(objectName(item)),
-        isValid(targetIcon) and tostring(objectName(targetIcon)) or "<empty>",
-        isValid(stayIcon) and tostring(objectName(stayIcon)) or "<empty>",
-        pinCount,
-        nearest ~= nil
-            and string.format("%.0f px away", distance or -1)
-            or tostring(nearestError)))
+        "PIN TRAVEL | pin %d | EMapPinKind=%s | timestamp=%s",
+        chosen.index, tostring(chosen.kind), tostring(chosen.timestamp)))
+    performTeleport(position, "map pin")
+    dismissFastTravelScreen()
 
-    for label, icon in pairs({
-        target = targetIcon, stay = stayIcon, nearestPin = nearest
-    }) do
-        if isValid(icon) then
-            local kind, canHover, inactive, timestamp
-            pcall(function() kind = tonumber(icon:GetMapIconKind()) end)
-            pcall(function() canHover = icon:GetCanHoverIcon() end)
-            pcall(function() inactive = icon:GetInactive() end)
-            pcall(function() timestamp = tonumber(icon.Timestamp) end)
-            log(string.format(
-                "CURSOR PROBE | %s | kind=%s (%s) | canHover=%s | inactive=%s | timestamp=%s",
-                label,
-                tostring(kind),
-                tostring(kind ~= nil and ELIGIBLE_MAP_ICON_KINDS[kind]
-                    or "other"),
-                tostring(canHover),
-                tostring(inactive),
-                tostring(timestamp)))
-        end
+    -- The first hop used a borrowed height because the destination cell had no
+    -- streamed navmesh. Now that the hero is standing in it, the navmesh exists
+    -- and the landing can be corrected properly.
+    if approximate == true then
+        ExecuteWithDelay(PIN_SETTLE_DELAY_MS, function()
+            ExecuteInGameThread(function()
+                local settled = projectPinOntoNavmesh(chosen.raw)
+                if settled == nil then
+                    log("PIN TRAVEL | arrival not corrected; still no navmesh " ..
+                        "at the pin")
+                    return
+                end
+                log(string.format(
+                    "PIN TRAVEL | correcting arrival to navmesh Z %.1f",
+                    settled.Z))
+                performTeleport(settled, "map pin (corrected)")
+            end)
+        end)
     end
 end)
 
@@ -4006,7 +4298,7 @@ do
             end
             if activeContext ~= nil then
                 if CONFIG.ENABLED then
-                    setContextVisibility(activeContext, VISIBLE)
+                    setContextVisibility(activeContext, K.VISIBLE)
                 else
                     clearFastTravelSelection(activeContext)
                     local focusOk, focusError =
@@ -4018,7 +4310,7 @@ do
                             tostring(focusError))
                         return
                     end
-                    setContextVisibility(activeContext, COLLAPSED)
+                    setContextVisibility(activeContext, K.COLLAPSED)
                 end
             end
         end,
@@ -4033,7 +4325,7 @@ do
             teleportMapWidget = nil
             openSerial = openSerial + 1
             if activeContext ~= nil then
-                setContextVisibility(activeContext, COLLAPSED)
+                setContextVisibility(activeContext, K.COLLAPSED)
             end
             log("CONFIG ERROR | " .. tostring(reason) ..
                 " | mod disabled")

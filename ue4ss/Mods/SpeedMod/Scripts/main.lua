@@ -1,9 +1,9 @@
-print("[SpeedMod] Loading TERRAIN RUNNER v7.19 - STATE MACHINE READINESS & HOT-PATH OPTIMIZATION...")
+print("[SpeedMod] Loading TERRAIN RUNNER v7.20 - STATE MACHINE READINESS & HOT-PATH OPTIMIZATION...")
 print("[SpeedMod] Startup lifecycle hooks arm immediately; readiness state machine activates upon world stability.")
 print("[SpeedMod] Quest/map travel uses dynamic readiness stability guard; ClientRestart uses tick-safe quarantine.")
 
 --========================================================--
---     TERRAIN RUNNER v7.19 - MOD STACK COMPATIBILITY   --
+--     TERRAIN RUNNER v7.20 - MOD STACK COMPATIBILITY   --
 --========================================================--
 -- Goals:
 --   * Dynamic state-machine readiness based on consecutive world & hero stability.
@@ -62,11 +62,11 @@ local CONFIG = {
 local SAFE_MIN_START = 1.00
 local SAFE_MAX_START = 2.50
 local SAFE_MIN_MAX = 1.00
-local SAFE_MAX_MAX = 8.00
+local SAFE_MAX_MAX = 20.00
 local SAFE_MIN_RAMP_SECONDS = 0.25
 local SAFE_MAX_RAMP_SECONDS = 10.00
 local SAFE_MIN_JUMP_HEIGHT = 0.25
-local SAFE_MAX_JUMP_HEIGHT = 6.00
+local SAFE_MAX_JUMP_HEIGHT = 15.00
 
 local function getScriptDirectory()
     if debug == nil or type(debug.getinfo) ~= "function" then
@@ -1101,8 +1101,26 @@ local function beginTravel(reason)
         if not mapLeaving or timeoutId ~= travelTimeoutId then
             return
         end
+        -- This used to warn and stop, leaving mapLeaving set: the tick returned
+        -- early on it forever and movement never came back for the rest of the
+        -- session. ClientRestart is shared by several mods, and UE4SS does
+        -- remove a hook when any of them throws --
+        -- "[Lua::Registry::get_function_ref] Ref was not function ... removing
+        -- hook!" was observed immediately before this timeout fired. A lost
+        -- callback must not be able to disable movement permanently.
+        --
+        -- Recovery is the same readiness-stability path ClientRestart would have
+        -- taken, so nothing new is invented: the tick resumes once the hero and
+        -- movement component read valid, or once the quarantine clock passes.
         warn("TRAVEL ERROR | ClientRestart was not received after " ..
-            tostring(TRAVEL_TIMEOUT_MS) .. "ms; movement remains paused")
+            tostring(TRAVEL_TIMEOUT_MS) ..
+            "ms; recovering through readiness stability")
+        restartCompatToken = restartCompatToken + 1
+        restartPending = true
+        restartReleaseClock = math.max(
+            restartReleaseClock,
+            os.clock() + MAX_RESTART_QUARANTINE_SEC
+        )
     end)
 end
 

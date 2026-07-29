@@ -38,11 +38,13 @@ return {
     -- Any name from UE4SS's Key table; empty disables the binding.
     FORCE_CLOSE_KEY = "F8",
 
-    -- Diagnostic. Logs which map icon the cursor is currently resolved to, with
-    -- its kind and hover state. Pins cannot be confirmed on the fast travel
-    -- screen and the cause is not yet known -- SnapMapIconKinds was ruled out,
-    -- since it already lists pin kinds. This is how the real cause gets found.
-    CURSOR_PROBE_KEY = "F7",
+    -- Travels to a map pin from the fast travel screen. This needs its own key
+    -- because "Confirmar" is greyed out over a pin: that screen accepts only
+    -- safe areas and teleport terminals, so the confirm never fires there and
+    -- there is nothing for the mod to intercept. With one pin placed the key
+    -- takes it; with several it takes the one nearest the cursor.
+    -- Any name from UE4SS's Key table; empty disables the binding.
+    PIN_TRAVEL_KEY = "F9",
 
     -- Only used when MAP_TARGET is "map".
     -- The FName handed to ARODAvatarCharacter::ActivateFPCameraMenuAbility as

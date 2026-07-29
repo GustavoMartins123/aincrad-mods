@@ -37,6 +37,7 @@ download, credits, permissions, changelog, and support information.
 | Auto Pickup Mod | Collects nearby drops and nature items automatically | Live |
 | No Rescue | Removes ledge steering and the hard-fall teleport | Live |
 | Field Equipment Mod | Opens the native Equipment screen while in the field | Reopen Start Menu |
+| Fast Travel Mod | Adds a **Fast Travel** entry that opens the game's own teleport map | Reopen Start Menu |
 | World Enemy Director | Multiplies and mutates world enemies | Live |
 | Experience Notifications | Shows the exact EXP awarded by each enemy death | Live |
 | Aincrad Open World | Opens complete floors and adds Free Roam quest entries | New quest manifests/restart |
@@ -261,12 +262,12 @@ Available settings:
 | Setting | Range | Meaning |
 |---|---:|---|
 | Starting speed | 1.00×–2.50× | Multiplier applied when the boost begins |
-| Top speed | 1.00×–8.00× | Maximum traversal multiplier |
+| Top speed | 1.00×–20.00× | Maximum traversal multiplier |
 | Time to top speed | 0.25–10.00 seconds | Acceleration duration |
-| Jump height | 0.25×–6.00× | Approximate physical jump-apex multiplier |
+| Jump height | 0.25×–15.00× | Approximate physical jump-apex multiplier |
 | Off during combat | On/Off | Disables super speed during deliberate combat |
 
-This suite currently sets top speed to **8.00×** and jump height to **6.00×**
+This suite currently sets top speed to **20.00×** and jump height to **15.00×**
 through `runtime.lua`.
 
 The mod waits for the local host hero and its movement component instead of
@@ -337,6 +338,70 @@ Because the Equipment row is created when the Start Menu is built, enabling or
 disabling it is marked with `+`. Close and reopen the Start Menu to rebuild the
 row. If it was disabled before launch and therefore never loaded by UE4SS,
 restart the game after turning it on.
+
+### Fast Travel Mod
+
+Fast Travel injects a **Fast Travel** entry into the game's Start Menu. It opens
+`WBP_Map_FastTravel_C`, the same destination picker a teleport terminal opens, so
+travelling from it is the game's own fast travel rather than a position write.
+Selecting a safe area or a teleport terminal and confirming works exactly as it
+does at a terminal.
+
+Because the row is created when the Start Menu is built, enabling or disabling it
+is marked with `+`. Close and reopen the Start Menu to rebuild the row.
+
+The row appears only where there is somewhere to go. Town maps hold no travel
+destination, and in those worlds the row is omitted with an explicit line in
+`UE4SS.log` instead of opening an empty screen.
+
+#### Keyboard shortcuts
+
+| Key | Action | Works when |
+|---|---|---|
+| `F9` | Travels to a map pin | The Fast Travel screen is open |
+| `F8` | Force-closes the map screen and resets the mod's state | Always |
+
+`F9` exists because the screen states its own scope in its banner: it accepts
+safe areas and teleport terminals only. Map pins are drawn on it, but
+**Confirmar** stays greyed out over a pin, so there is no confirmation for the
+mod to intercept. The key is that missing trigger. With one pin placed it takes
+that pin; with several it takes the one nearest the cursor, so move the cursor
+onto the pin you want first. Repeats are ignored for about a second, because a
+held key otherwise fires the whole sequence dozens of times.
+
+A pin's stored position carries no height — travelling to it raw drops the hero
+through the world — so the mod grounds it on the navigation mesh first. When the
+destination cell has not streamed in yet, it lands on a borrowed height and
+corrects the arrival once the hero is standing there and the navmesh exists.
+
+`F8` is the escape hatch. A viewport change, which Alt+Enter reproduces, can
+leave the map up with its cursor live but its input dead: **Cancelar** does
+nothing, and the Start Menu cannot be reached from that screen to recover. `F8`
+is a UE4SS keybind processed outside the game's input, which is why it still
+works when the screen itself has stopped responding.
+
+Both keys are set in `ue4ss\Mods\FastTravelMod\Scripts\config.lua` as
+`PIN_TRAVEL_KEY` and `FORCE_CLOSE_KEY`. They accept any name from UE4SS's `Key`
+table, and an empty string disables the binding. They are read once when the mod
+loads, so a changed key needs a game restart — unlike the values in the Mods
+menu, it is not picked up live.
+
+The Mods menu exposes **Enabled** and **Debug logging** for this mod. Which map
+screen the row opens (`MAP_TARGET`) and the two keys are `config.lua` settings
+only.
+
+#### Console commands
+
+These run in the UE4SS console and report to `UE4SS.log`:
+
+```text
+fasttravel status | open | close | pins | pin <index> | terminals | menukeys
+```
+
+`pins` lists every placed map pin with its index, and `pin <index>` travels to
+one by that index without the screen being open. `close` is the same escape hatch
+as `F8`. `terminals` lists the world's travel destinations, and `status` reports
+the mod's version, target screen, and the native travel state.
 
 ### World Enemy Director
 
@@ -461,6 +526,12 @@ fails, the previous state is restored and an explicit error is logged.
 - **No Rescue scope:** it removes fall rescue only. Water, pit, out-of-bounds,
   and quest recovery remain vanilla.
 - **Field Equipment scope:** it opens Equipment, not storage.
+- **Fast Travel pin confirmation:** the game's fast travel screen confirms safe
+  areas and teleport terminals only. **Confirmar** stays greyed out over a map
+  pin, so pins are reached with `F9` or `fasttravel pin <index>`, not by
+  confirming them on the screen.
+- **Fast Travel keybinds:** `F8` and `F9` are registered when the mod loads.
+  Changing them in `config.lua` requires a game restart; it is not a live value.
 - **Enemy Director native verification:** its reflected spawn, material, and
   enemy-stat contracts were validated against public dumped headers and still
   require an in-game test after each game update.
@@ -514,6 +585,14 @@ Confirm that `ue4ss\Mods\AincradOpenWorld\enabled.txt` exists and that
 `enabled.txt.off` does not. Fully restart the game, then start a newly
 constructed quest session. Do not use an OFF/ON toggle inside the mission:
 Open World must already be loaded when the quest manifest is constructed.
+
+### The map screen will not close
+
+If **Cancelar** does nothing and the map stays up, its input has been dropped —
+switching between fullscreen and windowed with Alt+Enter while the screen is open
+reproduces it. Press `F8`. That keybind is handled by UE4SS rather than by the
+game, so it still closes the screen and resets the mod's state when the screen
+itself no longer answers. `fasttravel close` in the UE4SS console does the same.
 
 ### The game crashes at startup
 

@@ -42,14 +42,14 @@ return {
               default = 1.40, min = 1.00, max = 2.50, step = 0.05, format = "%.2fx" },
             -- Bounds mirror SAFE_MIN_MAX / SAFE_MAX_MAX.
             { key = "MAX_SPEED", label = "Top speed", type = "number",
-              default = 3.20, min = 1.00, max = 8.00, step = 0.10, format = "%.2fx" },
+              default = 3.20, min = 1.00, max = 20.00, step = 0.10, format = "%.2fx" },
             -- Bounds mirror SAFE_MIN_RAMP_SECONDS / SAFE_MAX_RAMP_SECONDS.
             { key = "SECONDS_TO_MAX_SPEED", label = "Time to top speed", type = "number",
               default = 1.80, min = 0.25, max = 10.00, step = 0.05, format = "%.2fs" },
             -- Height is proportional to JumpZVelocity squared. SpeedMod converts
             -- this multiplier to the correct vertical launch velocity.
             { key = "JUMP_HEIGHT_MULTIPLIER", label = "Jump height", type = "number",
-              default = 1.00, min = 0.25, max = 6.00, step = 0.25, format = "%.2fx" },
+              default = 1.00, min = 0.25, max = 15.00, step = 0.25, format = "%.2fx" },
             { key = "DISABLE_IN_COMBAT", label = "Off during combat", type = "bool",
               default = true },
         },

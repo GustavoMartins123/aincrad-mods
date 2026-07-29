@@ -118,14 +118,14 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/45)
 **Baseline:** `SpeedMod v8 Stablized 45 8
 2026-07-20T00-09Z 3CxMATjay.zip`  
 **Original script version:** v7.11  
-**Integrated script version:** v7.19
+**Integrated script version:** v7.20
 
 ### Added
 
 - Physical jump-height control through
   `CharacterMovement.JumpZVelocity`.
 - `JUMP_HEIGHT_MULTIPLIER` in `Scripts\config.lua`.
-- A validated jump-height range from 0.25× to 6.00×.
+- A validated jump-height range from 0.25× to 15.00×.
 - Persistent hero and movement-component acquisition.
 - Native jump-velocity capture and restoration when the mod is disabled.
 - Stable movement-component identity through Unreal `GetFullName()`.
@@ -146,7 +146,7 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/45)
 - Replaced silent defaults and numeric clamping with strict transactional
   validation. Missing, mistyped, non-finite, or out-of-range values now produce
   an explicit error and disable the mod.
-- Raised the validated top-speed limit from 4.50× to 8.00×.
+- Raised the validated top-speed limit to 20.00×.
 - Replaced the exposed `hero.CharacterMovement` field with the canonical
   `hero:GetMovementComponent()` call.
 - Replaced first-live-sample jog learning with the exact
@@ -163,6 +163,17 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/45)
 
 ### Fixed
 
+- Fixed movement staying paused for the rest of the session when a travel never
+  reported completion. `ClientRestart` is registered by several mods at once, and
+  UE4SS removes a callback when any of them throws — observed as
+  `[Lua::Registry::get_function_ref] Ref was not function ... removing hook!`
+  immediately before this component's 30-second travel timeout fired. The timeout
+  only warned and left `mapLeaving` set, which the tick returns early on
+  unconditionally, so movement never came back. It now hands over to the same
+  readiness-stability path `ClientRestart` would have taken, resuming once the
+  hero and movement component read valid or the quarantine clock passes. Which
+  mod's callback was removed is not identified; this makes the outcome survivable
+  rather than diagnosing it.
 - Fixed a tick error that disabled part of the mod:
   `attempt to perform arithmetic on a function value (local 'x')` in
   `getHorizontalVelocity`. A component axis read through UE4SS does not always
@@ -198,9 +209,9 @@ Mods](https://www.nexusmods.com/echoesofaincrad/mods/45)
 The current `runtime.lua` sets:
 
 - Starting speed: 2.50×
-- Top speed: 8.00×
+- Top speed: 20.00×
 - Time to top speed: 1.80 seconds
-- Jump height: 6.00×
+- Jump height: 15.00×
 - Combat protection: inherited from `config.lua` and enabled
 
 ### Unchanged
@@ -826,7 +837,7 @@ work, and emits one concise world fault. It is not retried every poll cycle.
 
 **Original archive:** None of the six Nexus baselines contains this component
 
-**Current script version:** v0.12.0
+**Current script version:** v0.14.0
 
 ### Added
 
@@ -911,6 +922,13 @@ work, and emits one concise world fault. It is not retried every poll cycle.
   target (read back at 0 cm). Both dead ends are recorded in the source so they
   are not tried again. Arrival is still verified from the world, since a teleport
   into unstreamed World Partition cells remains possible.
+- Fixed pin travel dropping the hero through the world. `FRODMapPin::Pos` is
+  stored with `Z = 0` — a map pin is placed on a 2D map — so the measured
+  `(27196.8, 289435.9, 0.0)` sat roughly 25000 units below the ground it marks.
+  Pin positions are now projected onto the navmesh with
+  `UNavigationSystemV1::K2_ProjectPointToNavigation` and a deliberately tall
+  query extent, and a pin that does not project is refused rather than travelled
+  to. This affected `fasttravel pin <index>` as shipped in v0.7.0.
 - Fixed the hovered icon being read from the wrong widget, twice. It is not
   `URODMenuWidgetBase::CurrentFocusWidget`, which on a map screen is the map
   rather than an icon, and it is not the base
@@ -920,13 +938,6 @@ work, and emits one concise world fault. It is not retried every poll cycle.
   `CurrentStayTerminalIconWidget`. All candidates are now tried, and only a pin
   kind is accepted from any of them so a tracked terminal cannot shadow the pin
   the cursor is over.
-- Added a geometric fallback for the pin under the cursor, since
-  `CurrentStayTerminalIconWidget` is named for terminals and may be authored
-  never to hold a pin. `URODMapItemWidgetBase` exposes `CursorWidget` and
-  `PinIconWidgets`; their absolute screen positions are compared through
-  `UWidget::GetCachedGeometry` and `USlateBlueprintLibrary::LocalToAbsolute`, and
-  the nearest pin within 48 px is taken. This needs no cooperation from the
-  screen at all.
 - Fixed a viewport change, such as Alt+Enter, trapping the player on the map
   screen. The screen survives unfocused: its cursor keeps tracking the mouse,
   Confirmar stays greyed, Cancelar does nothing, and nothing in the game closes
@@ -982,19 +993,105 @@ work, and emits one concise world fault. It is not retried every poll cycle.
 
 ### Known limitations
 
-- **Pins still cannot be confirmed on the fast travel screen, and the cause is
-  not known.** `URODMapItemWidgetBase::SnapMapIconKinds` was the leading theory
-  and has been ruled out by measurement: that screen's array already contained
-  `32` (`InstantPin1`) and `27`–`31` (`PillarPin1`–`5`) before anything was
-  appended, so pins were already snappable and the cursor still would not stop on
-  one. The append is kept, since it completes the set with the remaining pin
-  kinds and any real fix needs them, but it is not the mechanism.
-  `CURSOR_PROBE_KEY` (default F7) reports every candidate field together —
-  `CurrentTargetIconWidget`, `CurrentStayTerminalIconWidget`, the
-  `PinIconWidgets` count and the nearest pin's distance in pixels — which is what
-  narrowed this from "the cursor stops on nothing" to "the mod was reading a
-  field this screen does not fill". `fasttravel pin <index>` travels to any pin
-  and depends on none of this.
+- **A crash was caused by this component's own diagnostics and has been removed.**
+  The `CURSOR_PROBE_KEY` binding ran roughly forty native UI calls per press —
+  twelve icons × geometry, kind, hover and visibility reads, plus a `MapPins`
+  walk — with no debounce, so holding the key re-entered that work faster than it
+  completed. The crash stack showed UE4SS hook frames interleaved with the same
+  three engine addresses repeatedly and jumped to an invalid code address, and
+  the log ends mid-probe. The probe, the `WBP_Map_C` icon helper, the
+  `SnapMapIconKinds` mutation and the geometry-based cursor matching are all gone
+  — roughly 560 lines. None of them had ever been shown to do anything, and two
+  of them wrote into widget state the game owns.
+- Pin travel is bound to a key (`PIN_TRAVEL_KEY`, default F9) because the screen
+  offers no trigger for it. "Confirmar" is greyed out over a pin — that screen
+  accepts only safe areas and teleport terminals — so `ServerDecideFastTravel`
+  never fires there and there is no confirm to intercept. Detecting the pin
+  correctly changes nothing while the trigger itself cannot happen, which is what
+  every confirm-based attempt before this was missing.
+- Fixed `<MISSING STRING TABLE ENTRY>` returning on the fast travel screen. The
+  labels track whether a `WBP_Map_C` has been constructed in the session:
+  correct while v0.13.0's icon helper existed, which built one on every open, and
+  missing again once it was removed — the log shows them resolving after a
+  `WBP_Map_C` construction at 20:16:48 and missing at 20:22 with none.
+  Constructing the reference map evidently pulls in the string assets the fast
+  travel screen's keys resolve against. A companion `WBP_Map_C` is now built once
+  and kept, and nothing else is done with it; the parts that made the old helper
+  dangerous — redirecting its `MapItemWidget` at another screen and calling
+  `GetIconForMap`/`UpdateIcon` through it — are not restored.
+- The pin under the cursor is decided from `UWidget::RenderTransform`, which is
+  where these positions actually live. Canvas slot position and
+  `GetCachedGeometry` both read `0,0` for every widget including the cursor —
+  wrong place to look, since an icon that moves across a map is positioned by
+  render translation, not by its slot. `RenderTransform` is a plain property, so
+  this is a field read with no UFunction call behind it. The screen's own
+  selection box still does not move onto pins: that lives in its Blueprint and is
+  not reachable, so only the decision is reproduced, not the highlight.
+- **Every route into the screen's own selection has been eliminated in the
+  running game, not assumed:**
+  - `SnapMapIconKinds` already contained the pin kinds before anything was
+    appended.
+  - `SetInputEnable(true)` wrote cleanly (`false -> true` on every pin) and
+    changed nothing.
+  - `ESlateVisibility` moved `SelfHitTestInvisible` → `Visible` and changed
+    nothing; no ancestor was `HitTestInvisible`.
+  - `GetIsMouseHover()` stays `false` on every icon even once they are visible
+    and input-enabled.
+  - `URODIconForMapWidgetBase::GetCanHoverIcon` — the one function named for the
+    job — **is never called by the game.** A hook installed cleanly on the native
+    path (`native hook (206, 207)`) and unconditional instrumentation of its
+    first three invocations never fired once, and there is no Blueprint override
+    to intercept instead: `WBP_MapIcon_C:GetCanHoverIcon` does not exist as a
+    UFunction. That hook has been removed rather than left in place.
+- Pin icons are made hit-testable when the screen opens. `SetInputEnable(true)` alone was measured insufficient —
+  it wrote cleanly (`IsInputEnable false -> true | write=true` on all five pins)
+  and hover still never fired. Input permission is not hit testing: map icons are
+  drawn so they do not intercept the mouse over the map, and a widget outside hit
+  testing cannot report hover whatever its input flags say. Each pin icon is now
+  raised to `ESlateVisibility::Visible` and enabled, and any ancestor found at
+  `HitTestInvisible` is moved to `SelfHitTestInvisible`, which re-admits the
+  children without letting the ancestor start swallowing clicks itself. Reported
+  per pin and per ancestor as `PIN HOVER`.
+- Pin hover is read from `URODInputWidgetBase`, which is where the game keeps it.
+  That class is the base of every interactive widget and
+  `URODIconForMapWidgetBase` inherits it through `URODMenuItemWidgetBase`; it
+  exposes `GetIsMouseHover()`, `SetInputEnable(bool)` and `IsInputEnable()`, all
+  confirmed exported. The hovered pin is therefore asked of the icon rather than
+  computed from coordinates, and the icons are given `SetInputEnable(true)` when
+  the screen opens, since a widget with input disabled never receives hover at
+  all. Every earlier attempt tried to compute the answer — canvas slots, cached
+  geometry, absolute positions, nearest-wins — and all of it read `0,0`, because
+  that is not where this information is kept.
+- With exactly one pin placed, travel does not require hover; there is nothing to
+  disambiguate. With several, the hovered one is used.
+- Earlier notes on pin selection, kept because the measurements stand:
+  `MapPins[1] EMapPinKind=7 timestamp=68.9378 pos=(27196.8, 289435.9, 0.0)` and
+  `PinIcon[8] kind=27 timestamp=68.9378 visible=true canHover=false`. The
+  timestamp join works and the kind mapping (7 → 27) is confirmed, but every
+  widget including the cursor reads `0,0` through both the canvas slot and the
+  cached geometry, and the icon reports `canHover=false` — the screen will not
+  let the cursor rest on a pin. With one pin placed the choice is unambiguous;
+  with more than one the mod lists them and defers to `fasttravel pin <index>`,
+  since nothing on that screen can point at one.
+- Two claims made earlier about pins were disproved by the screen itself:
+  - "The fast travel screen never creates a pin icon." It does. Its map item
+    reported `PinIconWidgets` at 12 before any injection ran, for a world holding
+    one map pin — a pre-allocated pool, whose spare slots read back with
+    `Timestamp` 0.
+  - "The nearest pin icon is under the cursor." The probe reported `0 px away`
+    for an icon that was nowhere near it. Every widget was reading the same
+    position through `GetCachedGeometry` + `LocalToAbsolute`, so the
+    nearest-wins comparison always returned the first pooled slot. Position is
+    now read from the canvas slot, which is what the map writes when it places an
+    icon, with the geometry route only as a fallback.
+  - "`SnapMapIconKinds` is what excludes pins." It is not. That screen's array
+    already contained `32` (`InstantPin1`) and `27`–`31` (`PillarPin1`–`5`)
+    before anything was appended, so pins were already snappable and the cursor
+    still would not stop on one.
+  - "The `WBP_Map_C` icon helper draws the pins onto this screen." It reported
+    one pin drawn and left `PinIconWidgets` at 12 — no observable effect.
+  All four of those code paths have been removed. `fasttravel pin <index>`
+  travels to any pin and never depended on them.
 - The reference-map selection pipeline (`resolveSelectedMapIcon`, the `UpdateIcon`
   destination cache, the `MapDecidedEvent` / `MapClickEvent` interception) is
   original to this component and has never run end to end, because until v0.7.0
