@@ -97,6 +97,7 @@ local SCHEMA = {
     XP_MULTIPLIER = { kind = "number", minimum = 0.0, maximum = 10.0 },
     POLL_MS = { kind = "number", minimum = 100, maximum = 2000, integer = true },
     DESPAWN_RADIUS = { kind = "number", minimum = 1500.0, maximum = 30000.0 },
+    SPAWN_IN_EMPTY_AREAS = { kind = "boolean" },
     DEBUG_LOGS = { kind = "boolean" },
 }
 
@@ -391,8 +392,15 @@ local spawnContractVerified = false
 -- new enemy. A spawn API that quietly does nothing looks exactly like this.
 local unmatchedSpawnStreak = 0
 local spawningProvenInert = false
-local cachedHero = nil
 local nextOriginSweepMs = 0
+local SPAWN_PACING_MS = 350
+local lastSpawnMs = 0
+local AMBIENT_CHECK_INTERVAL_MS = 4000
+local AMBIENT_EMPTY_RADIUS_CM = 3500.0
+local AMBIENT_SPAWN_MIN_DIST_CM = 1800.0
+local AMBIENT_SPAWN_MAX_DIST_CM = 3200.0
+local nextAmbientCheckMs = 0
+local ambientCounter = 0
 local spawnOrderProbeIds = nil
 local spawnOrderProbeReported = false
 local disableWorld
@@ -431,6 +439,9 @@ local function clearWorldReferences()
     spawningProvenInert = false
     cachedHero = nil
     nextOriginSweepMs = 0
+    lastSpawnMs = 0
+    nextAmbientCheckMs = 0
+    ambientCounter = 0
 end
 
 local function beginTravel(reason)
@@ -496,8 +507,10 @@ local function beginSameWorldSettle(reason)
     if resumeAtMs == nil or resumeAtMs < requestedResumeAtMs then
         resumeAtMs = requestedResumeAtMs
     end
+    clearWorldReferences()
+    scheduleReferenceCollection()
     log(string.format(
-        "WORLD QUARANTINE | %s | retained states and waiting %d seconds",
+        "WORLD QUARANTINE | %s | reset world references and waiting %d seconds",
         tostring(reason),
         QUEST_TELEPORT_SETTLE_MS / 1000
     ))
@@ -586,6 +599,22 @@ local function armSpawnOrderProbe()
     end
     spawnOrderProbeIds = idsOrError
     log("SPAWN PROBE | watching the next engine RODSpawnActor call")
+end
+
+local function resolveHeroObject()
+    if not isValid(cachedHero) then
+        cachedHero = nil
+        local ok, hero = pcall(FindFirstOf, "RODWorldHeroCharacter")
+        if not ok or not isValid(hero) then return nil end
+        cachedHero = hero
+    end
+    return cachedHero
+end
+
+local function resolveHeroLocation()
+    local hero = resolveHeroObject()
+    if not isValid(hero) then return nil end
+    return actorLocation(hero)
 end
 
 -- The local host controller, which owns ServerDebugEnemySpawn. Resolved fresh
@@ -1579,6 +1608,9 @@ local function queueExtra(origin, slot)
 end
 
 local function reconcileOrigin(origin)
+    if origin.completed == true then
+        return
+    end
     local desired = CONFIG.SPAWN_MULTIPLIER - 1
     if origin.issued > desired then
         for index = #spawnQueue, 1, -1 do
@@ -1603,9 +1635,14 @@ local function reconcileOrigin(origin)
         for _, state in ipairs(removals) do destroyOwned(state, "multiplier reduced") end
         origin.issued = desired
     end
+    if origin.issued >= desired then
+        origin.completed = true
+        return
+    end
     for slot = origin.issued + 1, desired do
         if not queueExtra(origin, slot) then break end
     end
+    origin.completed = true
 end
 
 local function addClass(classObject, classKey)
@@ -1847,6 +1884,7 @@ local function registerEnemy(enemy, reused, queued)
                 level = math.max(1, math.floor(level)),
                 location = location,
                 issued = 0,
+                completed = false,
                 spawnEligible = true,
             }
         end
@@ -2073,8 +2111,10 @@ local function streamingIsSettled()
 end
 
 local function processSpawnRequest()
+    if elapsedMs < lastSpawnMs + SPAWN_PACING_MS then return end
     local request = table.remove(spawnQueue, 1)
     if request == nil or request.generation ~= generation then return end
+    lastSpawnMs = elapsedMs
     if not streamingIsSettled() then
         -- Put it back untouched: this is not a failed attempt, so it must not
         -- consume the navigation budget or age the request.
@@ -2098,11 +2138,6 @@ local function processSpawnRequest()
         log("SPAWN ERROR | requested UClass is no longer valid: " .. request.classKey)
         return
     end
-    local originState = states[request.originKey]
-    if originState == nil or originState.owned or not isValid(originState.object) then
-        log("SPAWN ERROR | natural origin is unavailable: " .. request.originKey)
-        return
-    end
     local apiReady, apiError = resolveSpawnApi()
     if not apiReady then
         pauseForSpawnContractFailure(
@@ -2114,20 +2149,37 @@ local function processSpawnRequest()
     local spawnClass, classResolveError =
         resolveExactObject(request.classKey)
     if spawnClass == nil then
-        pauseForSpawnContractFailure(
-            "spawn class resolution failed: " ..
-                firstErrorLine(classResolveError)
-        )
-        return
+        if isValid(request.classObject) then
+            spawnClass = request.classObject
+        else
+            pauseForSpawnContractFailure(
+                "spawn class resolution failed: " ..
+                    firstErrorLine(classResolveError)
+            )
+            return
+        end
     end
-    local owner, ownerResolveError =
-        resolveExactObject(request.originKey)
-    if owner == nil then
-        pauseForSpawnContractFailure(
-            "spawn owner resolution failed: " ..
-                firstErrorLine(ownerResolveError)
-        )
-        return
+
+    local isAmbient = request.isAmbient == true
+    local owner = nil
+    if isAmbient then
+        owner = resolveHeroObject()
+        if not isValid(owner) then return end
+    else
+        local originState = states[request.originKey]
+        if originState == nil or originState.owned or not isValid(originState.object) then
+            log("SPAWN ERROR | natural origin is unavailable: " .. request.originKey)
+            return
+        end
+        local ownerObj, ownerResolveError = resolveExactObject(request.originKey)
+        if ownerObj == nil then
+            pauseForSpawnContractFailure(
+                "spawn owner resolution failed: " ..
+                    firstErrorLine(ownerResolveError)
+            )
+            return
+        end
+        owner = ownerObj
     end
     -- The origin is still resolved because the navigation query below needs a
     -- world context actor. It is no longer passed to the spawn call itself.
@@ -2380,24 +2432,6 @@ end
 -- It also bounds how many owned actors are alive when a mission ends, which is
 -- when the engine's fatal world-leak check runs. That check has already been
 -- seen firing on a spawned enemy's AI controller.
--- FindFirstOf walks the global object array. Doing that twice a tick was enough
--- to be felt as stutter, so the hero is resolved once and kept until it stops
--- being valid, which is also when travel invalidates it.
-local function resolveHeroObject()
-    if not isValid(cachedHero) then
-        cachedHero = nil
-        local ok, hero = pcall(FindFirstOf, "RODWorldHeroCharacter")
-        if not ok or not isValid(hero) then return nil end
-        cachedHero = hero
-    end
-    return cachedHero
-end
-
-local function resolveHeroLocation()
-    local hero = resolveHeroObject()
-    if not isValid(hero) then return nil end
-    return actorLocation(hero)
-end
 
 local function recycleDistantExtras()
     local heroLocation, heroError = resolveHeroLocation()
@@ -2453,6 +2487,86 @@ local function reconcileNearbyOrigins()
     end
 end
 
+local function checkAmbientEmptyAreaSpawns()
+    if CONFIG == nil or not CONFIG.ENABLED or not CONFIG.SPAWN_IN_EMPTY_AREAS then return end
+    if worldPaused or worldFault ~= nil then return end
+    if elapsedMs < nextAmbientCheckMs then return end
+    nextAmbientCheckMs = elapsedMs + AMBIENT_CHECK_INTERVAL_MS
+
+    if #classOrder == 0 then return end
+    if activeExtraCount() >= CONFIG.MAX_ACTIVE_EXTRAS then return end
+
+    local hero = resolveHeroObject()
+    if not isValid(hero) then return end
+    local heroPos, posError = actorLocation(hero)
+    if heroPos == nil then return end
+
+    local nearbyEnemies = 0
+    local emptyRadSq = AMBIENT_EMPTY_RADIUS_CM * AMBIENT_EMPTY_RADIUS_CM
+    for _, state in pairs(states) do
+        if isValid(state.object) then
+            local enemyPos = actorLocation(state.object)
+            if enemyPos ~= nil and planarDistanceSquared(heroPos, enemyPos) <= emptyRadSq then
+                nearbyEnemies = nearbyEnemies + 1
+            end
+        end
+    end
+
+    if nearbyEnemies > 0 then return end
+
+    local chosenClassKey = classOrder[math.random(1, #classOrder)]
+    local classInfo = classCatalog[chosenClassKey]
+    if classInfo == nil or not isValid(classInfo.classObject) then return end
+
+    local angle = math.random() * math.pi * 2.0
+    local dist = AMBIENT_SPAWN_MIN_DIST_CM + math.random() * (AMBIENT_SPAWN_MAX_DIST_CM - AMBIENT_SPAWN_MIN_DIST_CM)
+    local rawTarget = {
+        X = heroPos.X + math.cos(angle) * dist,
+        Y = heroPos.Y + math.sin(angle) * dist,
+        Z = heroPos.Z,
+    }
+
+    local navPoint = sampleReachablePoint(hero, rawTarget, 600.0)
+    if navPoint == nil then return end
+
+    ambientCounter = ambientCounter + 1
+    local ambientKey = "ambient_origin_" .. tostring(ambientCounter)
+
+    local heroLevel = 1
+    pcall(function()
+        local lvl = hero:GetEnemyLevel()
+        if finiteNumber(lvl) then heroLevel = math.max(1, math.floor(lvl)) end
+    end)
+
+    origins[ambientKey] = {
+        key = ambientKey,
+        classObject = classInfo.classObject,
+        classKey = chosenClassKey,
+        level = heroLevel,
+        location = navPoint,
+        issued = 1,
+        completed = true,
+        spawnEligible = true,
+        isAmbient = true,
+    }
+
+    local request = {
+        generation = generation,
+        originKey = ambientKey,
+        slot = 1,
+        classKey = chosenClassKey,
+        classObject = classInfo.classObject,
+        level = heroLevel,
+        originLocation = navPoint,
+        navAttempts = 0,
+        spawnEligible = true,
+        isAmbient = true,
+    }
+
+    spawnQueue[#spawnQueue + 1] = request
+    dbg(string.format("AMBIENT SPAWN | empty area detected | queued %s at %.0f, %.0f", chosenClassKey, navPoint.X, navPoint.Y))
+end
+
 local function tick(stepMs)
     elapsedMs = elapsedMs + stepMs
     checkSettings(CONFIG == nil)
@@ -2469,8 +2583,7 @@ local function tick(stepMs)
             readinessStabilitySamples = 0
         end
 
-        if clockPassed or readinessStabilitySamples >= STABILITY_SAMPLES_REQUIRED then
-            readinessStabilitySamples = 0
+        if heroReady and clockPassed and readinessStabilitySamples >= STABILITY_SAMPLES_REQUIRED then
             worldPaused = false
             resumeAtMs = nil
             rescanRequested = true
@@ -2524,6 +2637,7 @@ local function tick(stepMs)
     end
     if discoveryBatch then return end
     if #spawnQueue > 0 then processSpawnRequest() end
+    checkAmbientEmptyAreaSpawns()
 end
 
 local tickQueued = false
@@ -2600,6 +2714,13 @@ requireHook(
     "/Script/ROD.RODPlayerState:ServerDecideFastTravel",
     function()
         beginSameWorldSettle("ServerDecideFastTravel(same-world)")
+    end
+)
+
+requireHook(
+    "/Script/ROD.RODHeroCharacter:MulticastRestSafeArea",
+    function()
+        beginSameWorldSettle("MulticastRestSafeArea (Checkpoint Rest)")
     end
 )
 

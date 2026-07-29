@@ -149,6 +149,8 @@ return {
             { key = "DESPAWN_RADIUS", label = "Despawn distance", type = "number",
               default = 6000, min = 1500, max = 30000, step = 500,
               format = "%.0f cm" },
+            { key = "SPAWN_IN_EMPTY_AREAS", label = "Spawn in empty areas",
+              type = "bool", default = true },
             { key = "RANDOMIZE_EXTRA_SPECIES", label = "Random extra species",
               type = "bool", default = false },
             { key = "INCLUDE_BOSSES", label = "Mutate bosses",

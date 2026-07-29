@@ -17,6 +17,7 @@ return {
     -- visit keep the whole budget forever and no new area gets any.
     -- Freed slots are handed back to their origin, so returning refills.
     DESPAWN_RADIUS = 6000.0,
+    SPAWN_IN_EMPTY_AREAS = true,
     RANDOMIZE_EXTRA_SPECIES = false,
     INCLUDE_BOSSES = false,
 
