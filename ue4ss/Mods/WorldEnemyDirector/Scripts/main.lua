@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.7.3"
+local MOD_VERSION = "1.7.4"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -21,8 +21,31 @@ local RUNTIME_PATH = SCRIPT_DIR .. "runtime.lua"
 local RUNTIME_LOCK_PATH = RUNTIME_PATH .. ".lock"
 
 local STARTUP_SETTLE_MS = 2000
+-- Used by the ClientRestart-after-travel path, which logs "waiting 5 seconds"
+-- while actually waiting this. The string has been wrong for as long as it has
+-- existed. Left at 1500 for now because cross-world travel gets a real
+-- ClientRestart and the readiness-stability gate behind it, but it is the
+-- shortest settle in the mod guarding the most expensive transition -- if
+-- streaming crashes resurface after a map change rather than a fast travel,
+-- this is the number to raise.
 local RESTART_SETTLE_MS = 1500
-local QUEST_TELEPORT_SETTLE_MS = 2000
+-- Every same-world teleport goes through this: quest teleport-out and fast
+-- travel alike (beginSameWorldSettle). It used to be 2000, on the reasoning that
+-- staying in the same world is cheaper than travelling to a new one. The map
+-- says otherwise -- a fast travel jumps tens of thousands of units, so World
+-- Partition streams in a whole new region exactly like a real transition does,
+-- and only the ClientRestart is skipped. Resuming into that produced an access
+-- violation reading 0xffffffffffffffff about twelve seconds after a jump of
+-- ~58000 units, on this mod's first spawn in the new region. That address is the
+-- documented signature of UE4SS 3.0.1's use-after-free race dispatching
+-- callbacks during level/asset streaming (mod_template techniques/
+-- crash-safety.md, "Ambient background"): mod code cannot fix it, the only
+-- lever is not doing callback work while streaming is in flight.
+--
+-- 5000 is what the travel path's log line has always claimed to wait. Note that
+-- RESTART_SETTLE_MS is the value that path actually uses, and it is smaller than
+-- this one -- see the comment there.
+local QUEST_TELEPORT_SETTLE_MS = 5000
 local STABILITY_SAMPLES_REQUIRED = 3
 local DISCOVERY_STABILIZE_MS = 2000
 local SETTINGS_POLL_MS = 1000
@@ -256,23 +279,7 @@ end
 
 local function isValid(object)
     if object == nil then return false end
-    local kind = type(object)
-    if kind ~= "userdata" and kind ~= "table" then return false end
-    local ok, valid = pcall(function()
-        if type(object.get_address) == "function" then
-            local addr = object:get_address()
-            if addr == nil or addr == 0 then return false end
-        elseif type(object.GetAddress) == "function" then
-            local addr = object:GetAddress()
-            if addr == nil or addr == 0 then return false end
-        end
-        if type(object.IsValid) == "function" then
-            return object:IsValid()
-        elseif type(object.is_valid) == "function" then
-            return object:is_valid()
-        end
-        return true
-    end)
+    local ok, valid = pcall(function() return object:IsValid() end)
     return ok and valid == true
 end
 
@@ -401,6 +408,7 @@ local materialInterface = nil
 local navigationSystem = nil
 local gameplayStatics = nil
 local worldPartitionSubsystem = nil
+local cachedHero = nil
 local streamingGateReported = false
 local spawnContractVerified = false
 -- Consecutive spawn requests that expired without ever being matched to a
@@ -416,8 +424,6 @@ local AMBIENT_SPAWN_MIN_DIST_CM = 1800.0
 local AMBIENT_SPAWN_MAX_DIST_CM = 3200.0
 local nextAmbientCheckMs = 0
 local ambientCounter = 0
-local spawnOrderProbeIds = nil
-local spawnOrderProbeReported = false
 local disableWorld
 -- Assigned below; called from registerEnemy, which is defined before it.
 local activateSpawnedEnemy
@@ -499,7 +505,10 @@ local function beginRestartSettle()
     if followedTravel then
         clearWorldReferences()
         scheduleReferenceCollection()
-        log("TRAVEL SETTLE | ClientRestart after travel | waiting 5 seconds")
+        log(string.format(
+            "TRAVEL SETTLE | ClientRestart after travel | waiting %g seconds",
+            RESTART_SETTLE_MS / 1000
+        ))
         return
     end
 
@@ -547,73 +556,6 @@ local function resolveMaterialApi()
     materialLibrary = library
     materialInterface = interface
     return true, nil
-end
-
--- Reports, once per session, what the engine itself passes to RODSpawnActor.
---
--- This exists because the argument layout cannot be read back on this build:
--- ForEachProperty is not exposed on a UFunction here, and passing the six values
--- in the order the header declares them lands the collision-handling enum on
--- InInstigator. Watching a real call is the remaining source of truth. The game
--- spawns constantly, so this costs one natural spawn to answer.
---
--- Strictly read-only: it observes, logs one line, and unregisters itself. It
--- never alters the call it is watching.
-local function describeSpawnArgument(value)
-    if value == nil then return "nil" end
-    local unwrapped = value
-    local unwrapOk, inner = pcall(function() return value:get() end)
-    if unwrapOk and inner ~= nil then unwrapped = inner end
-
-    local kind = type(unwrapped)
-    if kind ~= "userdata" and kind ~= "table" then
-        return kind .. "(" .. tostring(unwrapped) .. ")"
-    end
-
-    local nameOk, fullName = pcall(function() return unwrapped:GetFullName() end)
-    if nameOk and type(fullName) == "string" and fullName ~= "" then
-        return "object[" .. fullName .. "]"
-    end
-    -- Structs have no GetFullName. Name them by a field only they carry.
-    for field, label in pairs({
-        Translation = "FTransform",
-        DefaultSpawnOn = "FRODSpawnActorOption",
-    }) do
-        local fieldOk, fieldValue = pcall(function() return unwrapped[field] end)
-        if fieldOk and fieldValue ~= nil then return "struct[" .. label .. "]" end
-    end
-    return kind .. "[unidentified]"
-end
-
-local function armSpawnOrderProbe()
-    if spawnOrderProbeIds ~= nil or spawnOrderProbeReported then return end
-
-    local ok, idsOrError = pcall(function()
-        local preId, postId = RegisterHook(
-            "/Script/ROD.RODGameState:RODSpawnActor",
-            function(_self, a, b, c, d, e, f)
-                if spawnOrderProbeReported then return end
-                spawnOrderProbeReported = true
-                log("SPAWN PROBE | engine call arguments:"
-                    .. " 1=" .. describeSpawnArgument(a)
-                    .. " 2=" .. describeSpawnArgument(b)
-                    .. " 3=" .. describeSpawnArgument(c)
-                    .. " 4=" .. describeSpawnArgument(d)
-                    .. " 5=" .. describeSpawnArgument(e)
-                    .. " 6=" .. describeSpawnArgument(f))
-                -- Unregistering from inside the callback is not safe; the flag
-                -- above makes every later call a single comparison, and the
-                -- next world teardown releases the hook.
-            end
-        )
-        return { pre = preId, post = postId }
-    end)
-    if not ok then
-        log("SPAWN PROBE | could not watch RODSpawnActor: " .. tostring(idsOrError))
-        return
-    end
-    spawnOrderProbeIds = idsOrError
-    log("SPAWN PROBE | watching the next engine RODSpawnActor call")
 end
 
 local function resolveHeroObject()
@@ -685,7 +627,6 @@ local function resolveSpawnApi()
         if not spawnContractVerified then
             spawnContractVerified = true
             log("SPAWN CONTRACT | GameplayStatics deferred spawn is available")
-            armSpawnOrderProbe()
         end
     end
     return true, nil
@@ -2717,10 +2658,10 @@ local function requireHook(path, callback, postCallback)
 end
 
 local function queueLifecycleEnemy(object, reused)
-    if not isValid(object) then return end
     if worldPaused and resumeAtMs == nil then return end
     if CONFIG ~= nil and (not configHealthy or not CONFIG.ENABLED) then return end
     if worldFault ~= nil then return end
+    if not isValid(object) then return end
     objectQueue[#objectQueue + 1] = { object = object, reused = reused }
     if discoveryBatch then
         discoveryReadyAtMs = elapsedMs + DISCOVERY_STABILIZE_MS
@@ -2731,10 +2672,13 @@ requireHook(
     "/Script/ROD.RODEnemyCharacter:OnFinishedInitialize",
     function() end,
     function(context)
+        if worldPaused and resumeAtMs == nil then return end
+        local eventGeneration = generation
         pcall(function()
             local obj = context:get()
             if isValid(obj) then
                 ExecuteInGameThread(function()
+                    if eventGeneration ~= generation then return end
                     if isValid(obj) then
                         queueLifecycleEnemy(obj, false)
                     end
@@ -2748,10 +2692,13 @@ requireHook(
     "/Script/ROD.RODEnemyCharacter:EnemyReused",
     function() end,
     function(context)
+        if worldPaused and resumeAtMs == nil then return end
+        local eventGeneration = generation
         pcall(function()
             local obj = context:get()
             if isValid(obj) then
                 ExecuteInGameThread(function()
+                    if eventGeneration ~= generation then return end
                     if isValid(obj) then
                         queueLifecycleEnemy(obj, true)
                     end
@@ -2965,19 +2912,6 @@ local function runSpawnTest()
 end
 
 RegisterConsoleCommandGlobalHandler(
-    "enemy_director_spawntest",
-    function()
-        -- Replies are not attempted here: the console writer is only valid for
-        -- this synchronous call, and the matrix runs on the game thread.
-        ExecuteInGameThread(function()
-            local ok, err = pcall(runSpawnTest)
-            if not ok then log("SPAWN TEST | aborted: " .. tostring(err)) end
-        end)
-        return true
-    end
-)
-
-RegisterConsoleCommandGlobalHandler(
     "enemy_director_status",
     function()
         ExecuteInGameThread(function()
@@ -3009,5 +2943,4 @@ if not configHealthy or CONFIG == nil then
     error("[" .. MOD_NAME .. "] CONFIG ERROR | initial canonical configuration rejected")
 end
 poll()
-log("READY | waiting for the playable world; console: enemy_director_status"
-    .. " | enemy_director_spawntest")
+log("READY | waiting for the playable world; console: enemy_director_status")

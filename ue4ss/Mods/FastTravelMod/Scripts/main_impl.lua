@@ -1,4 +1,4 @@
--- FastTravelMod v0.14.0
+-- FastTravelMod v0.14.1
 --
 -- TWO MAPS, ONE OF THEM WRONG
 --
@@ -125,7 +125,7 @@
 -- is unavailable, the operation stops and reports the error.
 
 local MOD_NAME = "FastTravelMod"
-local MOD_VERSION = "v0.14.0"
+local MOD_VERSION = "v0.14.1"
 local SUPPORTED_SDK = "Echoes of Aincrad 1.0.3"
 
 -- Folded into one table: this file sits at Lua's limit of 200 locals in the
@@ -164,7 +164,16 @@ local K = {
     ACCESSIBLE_STATUS_NONE = 0,
 
     MAX_NATIVE_MENU_ITEMS = 7,
-    MENU_INJECTION_DELAY_MS = 250,
+    -- The Start Menu's list builds asynchronously, and this row is borrowed from
+    -- a donor list that has to be finished before its slot geometry can be read.
+    -- 600ms is the field-tested floor for a first pass over a freshly opened
+    -- menu; 200-300ms crashed reproducibly, and worst when a second mod was
+    -- taking a donor of its own at the same time -- which is exactly this rail,
+    -- where ModMenu borrows one too. See mod_template techniques/
+    -- quest-manifest-and-menus.md ("Timing") and ui-widget-techniques.md
+    -- ("Do not race construction"). A crash here is a native access violation:
+    -- no pcall sees it, the log just stops.
+    MENU_INJECTION_DELAY_MS = 600,
     MENU_TRANSITION_POLL_MS = 50,
     MENU_TRANSITION_TIMEOUT_MS = 3000,
     OPEN_VERIFICATION_DELAY_MS = 2500,
@@ -282,23 +291,7 @@ end
 
 local function isValid(object)
     if object == nil then return false end
-    local kind = type(object)
-    if kind ~= "userdata" and kind ~= "table" then return false end
-    local ok, valid = pcall(function()
-        if type(object.get_address) == "function" then
-            local addr = object:get_address()
-            if addr == nil or addr == 0 then return false end
-        elseif type(object.GetAddress) == "function" then
-            local addr = object:GetAddress()
-            if addr == nil or addr == 0 then return false end
-        end
-        if type(object.IsValid) == "function" then
-            return object:IsValid()
-        elseif type(object.is_valid) == "function" then
-            return object:is_valid()
-        end
-        return true
-    end)
+    local ok, valid = pcall(function() return object:IsValid() end)
     return ok and valid == true
 end
 
@@ -1114,6 +1107,31 @@ local function resolveNativeMenuCount(mainMenu, mainList)
                 " is unavailable"
         end
     end
+
+    -- NumContent is the last AUTHORED index, not the last ACTIVE one. Progression
+    -- and quest state hide rows off the tail -- Logout is the usual one -- by
+    -- collapsing the wrapper, leaving the item itself alive and countable. Trust
+    -- it as-is and this row lands one index past the end: the handoff waits for
+    -- focus to reach a row the player can never select, the list wraps straight
+    -- from the real last row back to the first, and neither custom row can be
+    -- reached. On the floor where this was caught the count was 7 authored but 6
+    -- active, and ModMenu -- which already trimmed -- disagreed by exactly one.
+    -- Stop at the first still-visible row so a collapsed row in the MIDDLE is
+    -- left counted, which is what the native cursor does with it.
+    while count > 1 do
+        local _, wrapper = menuItemAndPanel(mainList, count - 1)
+        local _, previousWrapper = menuItemAndPanel(mainList, count - 2)
+        local visibility = nil
+        local previousVisibility = nil
+        pcall(function() visibility = wrapper:GetVisibility() end)
+        pcall(function() previousVisibility = previousWrapper:GetVisibility() end)
+        if visibility ~= K.COLLAPSED and visibility ~= K.HIDDEN then break end
+        if previousVisibility == K.COLLAPSED
+            or previousVisibility == K.HIDDEN then
+            break
+        end
+        count = count - 1
+    end
     return count, nil
 end
 
@@ -1196,15 +1214,19 @@ local function attachIconWithNativeWrapper(
         error("native wrapper hierarchy is unavailable")
     end
 
+    dbg("wrapper stage | reading donor layout")
     local donorLayout = donorItemSlot.LayoutData
+    dbg("wrapper stage | reparenting donor panel")
     donorItem:RemoveFromParent()
     donorPanel:RemoveFromParent()
     parent:AddChildToVerticalBox(donorPanel)
 
+    dbg("wrapper stage | slotting icon")
     local iconSlot = donorPanel:AddChildToCanvas(icon)
     if not isValid(iconSlot) then
         error("native wrapper rejected the Fast Travel icon")
     end
+    dbg("wrapper stage | applying donor layout")
     iconSlot:SetLayout(donorLayout)
     iconSlot:SetAutoSize(true)
     iconSlot:SetZOrder(20)
@@ -1407,16 +1429,24 @@ local function injectFastTravelEntry(mainMenu)
     local icon = nil
     local wrapperDonor = nil
     local wrapperPanel = nil
+    -- Everything below here is native widget construction and reparenting. A bad
+    -- pointer in any of it takes the process down with an access violation,
+    -- which is a hardware exception: the xpcall cannot see it and the log simply
+    -- stops. These markers are what tells the stages apart afterwards, so turn
+    -- DEBUG_LOGS on in config.lua before reproducing a crash on menu open.
+    dbg("row injection stage | creating icon")
     local configured, configureError = xpcall(function()
         icon = umgLibrary:Create(controller, iconClass, controller)
         if not isValid(icon) then
             error("Fast Travel icon creation returned null")
         end
 
+        dbg("row injection stage | borrowing native wrapper")
         wrapperDonor, wrapperPanel =
             attachIconWithNativeWrapper(
                 umgLibrary, controller, parent, icon)
 
+        dbg("row injection stage | configuring icon")
         icon:SetItemIndex(fastTravelIndex)
         icon:SetOwnerInputWidget(mainList)
         icon:SetInactive(false)
@@ -1854,18 +1884,10 @@ end
 -- URODMapMenuWidgetBase declares MapItemWidget. URODFastTravelMenuWidget does
 -- not: it builds one from FieldClass into MapWidgetCanvas, so for that screen
 -- the canvas children are where it lives.
--- Grounding a pin is a two-step problem, not one call.
---
--- K2_ProjectPointToNavigation fails for every pin -- measured on all three at
--- once -- and the reason is World Partition: the hero is in one cell and the
--- pins are in others, so there is no navmesh at those coordinates to project
--- onto. Waiting for it is not an option either; those cells only stream in once
--- the hero is there.
---
--- So the first hop borrows a height from the nearest terminal, which the game
--- keeps loaded for the whole floor, and lands slightly above it. Once the hero
--- is there the cell is streamed, the navmesh exists, and a second pass projects
--- properly and corrects the landing.
+-- A navmesh point is a floor position, while an ACharacter's actor origin is
+-- the center of its capsule. The landing therefore adds the live hero capsule's
+-- scaled half-height. Sending the surface Z directly makes K2_TeleportTo reject
+-- the move because the capsule overlaps the floor.
 --
 -- Declared ahead of the do-block so the helpers inside cost no chunk-level local
 -- slots: this file sits close to Lua's limit of 200 in the main chunk.
@@ -1874,7 +1896,30 @@ local projectPinOntoNavmesh
 
 do
     local PIN_PROJECTION_EXTENT = { X = 500.0, Y = 500.0, Z = 100000.0 }
-    local PIN_APPROACH_LIFT = 400.0
+    local PIN_LANDING_CLEARANCE = 5.0
+
+    local function pinLandingLift()
+        local hero, heroError = resolveLocalHero()
+        if hero == nil then return nil, tostring(heroError) end
+
+        local capsule = nil
+        local capsuleOk, capsuleError =
+            pcall(function() capsule = hero.CapsuleComponent end)
+        if not capsuleOk or not isValid(capsule) then
+            return nil, "hero capsule is unavailable: " .. tostring(capsuleError)
+        end
+
+        local height = nil
+        local heightOk, heightError =
+            pcall(function()
+                height = tonumber(capsule:GetScaledCapsuleHalfHeight())
+            end)
+        if not heightOk or height == nil or height <= 0.0 then
+            return nil, "hero capsule half-height is unreadable: " ..
+                tostring(heightError)
+        end
+        return height + PIN_LANDING_CLEARANCE, nil
+    end
 
     function projectPinOntoNavmesh(flat)
         local navigation = StaticFindObject(
@@ -1895,50 +1940,22 @@ do
         if not ok then
             return nil, "K2_ProjectPointToNavigation failed: " .. tostring(found)
         end
-        local landed = {
+        local surface = {
             X = tonumber(projected.X),
             Y = tonumber(projected.Y),
             Z = tonumber(projected.Z),
         }
-        if found ~= true or landed.Z == nil or landed.Z == 0.0 then
+        if found ~= true or surface.X == nil or surface.Y == nil
+            or surface.Z == nil or surface.Z == 0.0 then
             return nil, "no navmesh at those coordinates"
         end
-        return landed, nil
-    end
-
-    -- Height borrowed from the nearest accessible gimmick. Those carry real
-    -- world Z and stay loaded for the whole floor, which is exactly what the
-    -- navmesh does not do.
-    local function nearestTerminalHeight(flat)
-        local gameState, gameStateError = resolveWorldGameState()
-        if gameState == nil then return nil, tostring(gameStateError) end
-
-        local best, bestDistance = nil, nil
-        local ok, walkError = pcall(function()
-            local gimmicks = gameState.RODAccessibleGimmicks
-            for index = 1, #gimmicks do
-                local gimmick = gimmicks[index]
-                if isValid(gimmick) then
-                    local at = gimmick:K2_GetActorLocation()
-                    local x, y, z =
-                        tonumber(at.X), tonumber(at.Y), tonumber(at.Z)
-                    if x ~= nil and y ~= nil and z ~= nil then
-                        local dx, dy = x - flat.X, y - flat.Y
-                        local distance = math.sqrt(dx * dx + dy * dy)
-                        if bestDistance == nil or distance < bestDistance then
-                            best, bestDistance = z, distance
-                        end
-                    end
-                end
-            end
-        end)
-        if not ok then
-            return nil, "terminal sweep failed: " .. tostring(walkError)
-        end
-        if best == nil then
-            return nil, "no accessible gimmick carries a height"
-        end
-        return best, nil, bestDistance
+        local lift, liftError = pinLandingLift()
+        if lift == nil then return nil, tostring(liftError) end
+        return {
+            X = surface.X,
+            Y = surface.Y,
+            Z = surface.Z + lift,
+        }, nil, surface.Z
     end
 
     function groundedPinPosition(rawPosition)
@@ -1950,27 +1967,13 @@ do
         if flat.X == nil or flat.Y == nil or flat.Z == nil then
             return nil, "pin position is not numeric"
         end
-        if flat.Z ~= 0.0 then return flat, nil end
-
-        local projected = projectPinOntoNavmesh(flat)
-        if projected ~= nil then
-            log(string.format(
-                "PIN GROUND | (%.1f, %.1f) projected onto navmesh at Z %.1f",
-                flat.X, flat.Y, projected.Z))
-            return projected, nil, false
-        end
-
-        local height, heightError, distance = nearestTerminalHeight(flat)
-        if height == nil then
-            return nil, "no navmesh and no terminal height: " ..
-                tostring(heightError)
-        end
+        local projected, projectionError, surfaceZ =
+            projectPinOntoNavmesh(flat)
+        if projected == nil then return nil, tostring(projectionError) end
         log(string.format(
-            "PIN GROUND | (%.1f, %.1f) has no streamed navmesh; approaching " ..
-                "at Z %.1f borrowed from a terminal %.0f cm away",
-            flat.X, flat.Y, height + PIN_APPROACH_LIFT, distance or -1))
-        return { X = flat.X, Y = flat.Y, Z = height + PIN_APPROACH_LIFT },
-            nil, true
+            "PIN GROUND | (%.1f, %.1f) navmesh surface Z %.1f | capsule target Z %.1f",
+            flat.X, flat.Y, surfaceZ, projected.Z))
+        return projected, nil
     end
 end
 
@@ -2925,13 +2928,19 @@ local function performTeleport(position, label)
     end
 
     local before = heroLocation()
-    local teleported, teleportError = pcall(function()
-        hero:K2_TeleportTo(position, hero:K2_GetActorRotation())
+    local callOk, acceptedOrError = pcall(function()
+        return hero:K2_TeleportTo(position, hero:K2_GetActorRotation())
     end)
-    if not teleported then
+    if not callOk then
         log("FAST TRAVEL ERROR | K2_TeleportTo failed: " ..
-            tostring(teleportError))
-        return
+            tostring(acceptedOrError))
+        return false
+    end
+    if acceptedOrError ~= true then
+        log(string.format(
+            "TELEPORT | %s | K2_TeleportTo REJECTED target=(%.1f, %.1f, %.1f)",
+            label, position.X, position.Y, position.Z))
+        return false
     end
 
     log(string.format(
@@ -2967,6 +2976,7 @@ local function performTeleport(position, label)
         log("FAST TRAVEL ERROR | teleport verification scheduling failed: " ..
             tostring(scheduleError))
     end
+    return true
 end
 
 local function finalizeMapTeleport(source)
@@ -3020,9 +3030,13 @@ local function requestSelectedMapTeleport(mapWidget, source)
         destination.position.Z,
         tostring(objectName(iconWidget))))
 
-    performTeleport(
+    if not performTeleport(
         destination.position,
-        string.format("%s icon", tostring(iconKindName)))
+        string.format("%s icon", tostring(iconKindName))
+    ) then
+        mapTeleportBusy = false
+        return
+    end
 
     local closed, closeError = pcall(function()
         if isPresentedTeleportMapWidget(mapWidget) then
@@ -3281,9 +3295,9 @@ local function handleNativeFastTravelDecision(idName)
         destination.position.Z,
         tostring(objectName(destination.gimmick))))
 
-    performTeleport(destination.position, "terminal " .. idName)
-
-    dismissFastTravelScreen()
+    if performTeleport(destination.position, "terminal " .. idName) then
+        dismissFastTravelScreen()
+    end
 end
 
 local function interceptMapTeleport(
@@ -3764,8 +3778,16 @@ optionalHook(
                                 "MOD TELEPORT | map pin %d | EMapPinKind=%s | timestamp=%s",
                                 chosen.index, tostring(chosen.kind),
                                 tostring(chosen.timestamp)))
-                            performTeleport(chosen.position, "map pin")
-                            dismissFastTravelScreen()
+                            local position, positionError =
+                                groundedPinPosition(chosen.raw)
+                            if position == nil then
+                                log("PIN TRAVEL ERROR | " ..
+                                    tostring(positionError))
+                                return
+                            end
+                            if performTeleport(position, "map pin") then
+                                dismissFastTravelScreen()
+                            end
                             return
                         end
                         log(string.format(
@@ -4141,11 +4163,14 @@ local commandOk, commandError = pcall(function()
                         if position == nil then
                             error(tostring(positionError))
                         end
-                        performTeleport(
+                        if not performTeleport(
                             position,
                             string.format(
                                 "pin %d kind=%s",
-                                index, tostring(pin.Kind)))
+                                index, tostring(pin.Kind))
+                        ) then
+                            error("K2_TeleportTo rejected the grounded pin")
+                        end
                     end, debug.traceback)
                     if not ok then
                         log("PIN TRAVEL ERROR | " .. tostring(pinError))
@@ -4338,8 +4363,7 @@ bindKey(CONFIG.PIN_TRAVEL_KEY, "travel to pin under cursor", function()
     ExecuteWithDelay(1200, function() pinTravelBusy = false end)
 
     -- Height is resolved here, once, for this pin only.
-    local position, positionError, approximate =
-        groundedPinPosition(chosen.raw)
+    local position, positionError = groundedPinPosition(chosen.raw)
     if position == nil then
         log("PIN TRAVEL | pin " .. chosen.index .. " has no usable height: " ..
             tostring(positionError))
@@ -4349,27 +4373,8 @@ bindKey(CONFIG.PIN_TRAVEL_KEY, "travel to pin under cursor", function()
     log(string.format(
         "PIN TRAVEL | pin %d | EMapPinKind=%s | timestamp=%s",
         chosen.index, tostring(chosen.kind), tostring(chosen.timestamp)))
-    performTeleport(position, "map pin")
-    dismissFastTravelScreen()
-
-    -- The first hop used a borrowed height because the destination cell had no
-    -- streamed navmesh. Now that the hero is standing in it, the navmesh exists
-    -- and the landing can be corrected properly.
-    if approximate == true then
-        ExecuteWithDelay(PIN_SETTLE_DELAY_MS, function()
-            ExecuteInGameThread(function()
-                local settled = projectPinOntoNavmesh(chosen.raw)
-                if settled == nil then
-                    log("PIN TRAVEL | arrival not corrected; still no navmesh " ..
-                        "at the pin")
-                    return
-                end
-                log(string.format(
-                    "PIN TRAVEL | correcting arrival to navmesh Z %.1f",
-                    settled.Z))
-                performTeleport(settled, "map pin (corrected)")
-            end)
-        end)
+    if performTeleport(position, "map pin") then
+        dismissFastTravelScreen()
     end
 end)
 

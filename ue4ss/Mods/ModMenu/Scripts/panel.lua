@@ -398,8 +398,10 @@ local function destroyPanel()
     canvas = nil
     rowWidgets = {}
     titleWidgets = nil
-    host = nil
-    styleSource = nil
+    if not isValid(host) then
+        host = nil
+        styleSource = nil
+    end
 end
 
 local function buildPanel()
@@ -736,8 +738,10 @@ function Panel.close()
     expandedMod = nil
     selectionIndex = 1
     scrollOffset = 0
-    host = nil
-    styleSource = nil
+    if not isValid(host) then
+        host = nil
+        styleSource = nil
+    end
 end
 
 -- Dumps the host widget tree so the exact canvas/child names can be confirmed

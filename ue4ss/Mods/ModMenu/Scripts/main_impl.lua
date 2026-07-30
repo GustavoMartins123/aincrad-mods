@@ -70,7 +70,22 @@ local pendingMenuInjections = {}
 local menuInjectionTimerScheduled = false
 local scheduleMenuInjection
 
-local MENU_INJECTION_DELAY_SEC = 0.40
+-- The Start Menu's list builds asynchronously and this row borrows a donor
+-- list's slot geometry, so the pass must not start before the native build has
+-- settled. 600ms is the field-tested floor for a first pass; 200-300ms crashed
+-- reproducibly, and worst when a second mod was taking a donor of its own at the
+-- same time -- which is exactly this rail, where FastTravelMod borrows one too
+-- on any floor with travel destinations. See mod_template techniques/
+-- quest-manifest-and-menus.md ("Timing") and ui-widget-techniques.md ("Do not
+-- race construction").
+--
+-- Deliberately 150ms behind FastTravelMod's 600ms rather than equal to it. Both
+-- mods take a donor of their own, and letting them land together brought back
+-- the load-order race in the rail ordering. Going last is what this row wants
+-- anyway -- refreshRailPosition would move it to the end regardless -- and it
+-- makes FastTravelMod deterministically the first injected row, so ownership of
+-- the boundary with the native rows stops depending on scheduler luck.
+local MENU_INJECTION_DELAY_SEC = 0.75
 
 -- Assigned further down, called the first time a Mods row is actually injected.
 -- Nothing this mod hooks is useful before a start menu exists, so the input
@@ -806,7 +821,7 @@ end
 -- foreign injected row. Only the Mods row stays live as the controller input
 -- sink; its button is consumed before the outer list can act on it.
 local function setNativeMenuInputEnabled(context, enabled)
-    if context == nil then return end
+    if context == nil or not isValid(context.mainMenu) then return end
 
     local targets = {}
     local targetKeys = {}
@@ -838,15 +853,25 @@ local function setNativeMenuInputEnabled(context, enabled)
 
     local applied = 0
     for _, target in ipairs(targets) do
-        local ok = false
-        if pcall(function() target:SetInputEnable(enabled) end) then ok = true end
-        if pcall(function() target:BP_SetInputInteractionEnable(enabled) end) then ok = true end
-        if ok then applied = applied + 1 end
+        if isValid(target) and isValid(context.mainMenu) then
+            local ok = false
+            if type(target.SetInputEnable) == "function" then
+                if pcall(function() target:SetInputEnable(enabled) end) then ok = true end
+            end
+            if type(target.BP_SetInputInteractionEnable) == "function" then
+                if pcall(function() target:BP_SetInputInteractionEnable(enabled) end) then ok = true end
+            end
+            if ok then applied = applied + 1 end
+        end
     end
 
-    if isValid(context.icon) then
-        pcall(function() context.icon:SetInputEnable(true) end)
-        pcall(function() context.icon:BP_SetInputInteractionEnable(true) end)
+    if isValid(context.icon) and isValid(context.mainMenu) then
+        if type(context.icon.SetInputEnable) == "function" then
+            pcall(function() context.icon:SetInputEnable(true) end)
+        end
+        if type(context.icon.BP_SetInputInteractionEnable) == "function" then
+            pcall(function() context.icon:BP_SetInputInteractionEnable(true) end)
+        end
     end
 
     dbg(string.format("outer menu input %s on %d/%d widget(s); Mods row kept live",
