@@ -1,4 +1,4 @@
--- ModMenu v1.5.2
+-- ModMenu v1.5.5
 -- Adds a native-styled "Mods" entry to Echoes of Aincrad's start menu, opening a
 -- panel that enables/disables the other mods and retunes their values in-game.
 --
@@ -12,7 +12,7 @@
 -- mod's Lua state, because UE4SS gives each mod its own.
 
 local MOD_NAME = "ModMenu"
-local MOD_VERSION = "v1.5.2"
+local MOD_VERSION = "v1.5.5"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -112,23 +112,7 @@ end
 
 local function isValid(object)
     if object == nil then return false end
-    local kind = type(object)
-    if kind ~= "userdata" and kind ~= "table" then return false end
-    local ok, valid = pcall(function()
-        if type(object.get_address) == "function" then
-            local addr = object:get_address()
-            if addr == nil or addr == 0 then return false end
-        elseif type(object.GetAddress) == "function" then
-            local addr = object:GetAddress()
-            if addr == nil or addr == 0 then return false end
-        end
-        if type(object.IsValid) == "function" then
-            return object:IsValid()
-        elseif type(object.is_valid) == "function" then
-            return object:is_valid()
-        end
-        return true
-    end)
+    local ok, valid = pcall(function() return object:IsValid() end)
     return ok and valid == true
 end
 
@@ -552,7 +536,38 @@ local function attachIconWithNativeWrapper(umgLibrary, controller, parent, icon)
         error("native wrapper hierarchy is unavailable")
     end
 
-    local donorLayout = donorItemSlot.LayoutData
+    local layout = nil
+    local layoutOk, layoutError = pcall(function()
+        local position = donorItemSlot:GetPosition()
+        local size = donorItemSlot:GetSize()
+        local anchors = donorItemSlot:GetAnchors()
+        local alignment = donorItemSlot:GetAlignment()
+        layout = {
+            position = { X = tonumber(position.X), Y = tonumber(position.Y) },
+            size = { X = tonumber(size.X), Y = tonumber(size.Y) },
+            minimum = {
+                X = tonumber(anchors.Minimum.X),
+                Y = tonumber(anchors.Minimum.Y),
+            },
+            maximum = {
+                X = tonumber(anchors.Maximum.X),
+                Y = tonumber(anchors.Maximum.Y),
+            },
+            alignment = {
+                X = tonumber(alignment.X),
+                Y = tonumber(alignment.Y),
+            },
+        }
+    end)
+    if not layoutOk or layout == nil
+        or layout.position.X == nil or layout.position.Y == nil
+        or layout.size.X == nil or layout.size.Y == nil
+        or layout.minimum.X == nil or layout.minimum.Y == nil
+        or layout.maximum.X == nil or layout.maximum.Y == nil
+        or layout.alignment.X == nil or layout.alignment.Y == nil then
+        error("native wrapper layout snapshot failed: " ..
+            tostring(layoutError))
+    end
     -- The donor icon must be physically removed: collapsing it is not enough
     -- because its original list keeps repainting the icon brush.
     donorItem:RemoveFromParent()
@@ -561,7 +576,11 @@ local function attachIconWithNativeWrapper(umgLibrary, controller, parent, icon)
 
     local iconSlot = donorPanel:AddChildToCanvas(icon)
     if not isValid(iconSlot) then error("native wrapper rejected the Mods icon") end
-    iconSlot:SetLayout(donorLayout)
+    iconSlot:SetMinimum(layout.minimum)
+    iconSlot:SetMaximum(layout.maximum)
+    iconSlot:SetPosition(layout.position)
+    iconSlot:SetSize(layout.size)
+    iconSlot:SetAlignment(layout.alignment)
     iconSlot:SetAutoSize(true)
     iconSlot:SetZOrder(20)
     icon:SetVisibility(VISIBLE)
@@ -664,9 +683,8 @@ local function injectModsEntry(mainMenu)
         icon:BP_SetInputInteractionEnable(true)
         icon:SetDefaultAnimation()
 
-        local text = textLibrary:Conv_StringToText("Mods")
-        icon:SetMenuName(text)
-        icon.MenuName:SetText(text)
+        icon:SetMenuName(textLibrary:Conv_StringToText("Mods"))
+        icon.MenuName:SetText(textLibrary:Conv_StringToText("Mods"))
     end)
     if not configured then
         log("Mods entry configuration failed: " .. tostring(configureError))

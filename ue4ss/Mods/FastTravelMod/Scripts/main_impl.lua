@@ -1,4 +1,4 @@
--- FastTravelMod v0.14.1
+-- FastTravelMod v0.14.5
 --
 -- TWO MAPS, ONE OF THEM WRONG
 --
@@ -78,7 +78,6 @@
 --   ARODGameState::RODAccessibleGimmicks
 --   ARODAccessibleGimmickBase::ID / WarpOutTransforms / AccessTransforms
 --   ARODGameState::MapPins (FRODMapPin::Kind / Pos / Timestamp)
---   UNavigationSystemV1::K2_ProjectPointToNavigation
 --   URODIconForMapWidgetBase::GetMapIconKind / MapIconKind / Timestamp
 --   URODInputWidgetBase::SetInputEnable / IsInputEnable
 --   UWidget::RenderTransform (icon and cursor positions)
@@ -125,7 +124,7 @@
 -- is unavailable, the operation stops and reports the error.
 
 local MOD_NAME = "FastTravelMod"
-local MOD_VERSION = "v0.14.1"
+local MOD_VERSION = "v0.14.5"
 local SUPPORTED_SDK = "Echoes of Aincrad 1.0.3"
 
 -- Folded into one table: this file sits at Lua's limit of 200 locals in the
@@ -1214,8 +1213,41 @@ local function attachIconWithNativeWrapper(
         error("native wrapper hierarchy is unavailable")
     end
 
-    dbg("wrapper stage | reading donor layout")
-    local donorLayout = donorItemSlot.LayoutData
+    -- LayoutData is a remote FAnchorData view. It becomes invalid when the
+    -- donor slot is detached, so retain only plain Lua numbers across reparent.
+    dbg("wrapper stage | snapshotting donor layout scalars")
+    local layout = nil
+    local layoutOk, layoutError = pcall(function()
+        local position = donorItemSlot:GetPosition()
+        local size = donorItemSlot:GetSize()
+        local anchors = donorItemSlot:GetAnchors()
+        local alignment = donorItemSlot:GetAlignment()
+        layout = {
+            position = { X = tonumber(position.X), Y = tonumber(position.Y) },
+            size = { X = tonumber(size.X), Y = tonumber(size.Y) },
+            minimum = {
+                X = tonumber(anchors.Minimum.X),
+                Y = tonumber(anchors.Minimum.Y),
+            },
+            maximum = {
+                X = tonumber(anchors.Maximum.X),
+                Y = tonumber(anchors.Maximum.Y),
+            },
+            alignment = {
+                X = tonumber(alignment.X),
+                Y = tonumber(alignment.Y),
+            },
+        }
+    end)
+    if not layoutOk or layout == nil
+        or layout.position.X == nil or layout.position.Y == nil
+        or layout.size.X == nil or layout.size.Y == nil
+        or layout.minimum.X == nil or layout.minimum.Y == nil
+        or layout.maximum.X == nil or layout.maximum.Y == nil
+        or layout.alignment.X == nil or layout.alignment.Y == nil then
+        error("native wrapper layout snapshot failed: " ..
+            tostring(layoutError))
+    end
     dbg("wrapper stage | reparenting donor panel")
     donorItem:RemoveFromParent()
     donorPanel:RemoveFromParent()
@@ -1226,8 +1258,12 @@ local function attachIconWithNativeWrapper(
     if not isValid(iconSlot) then
         error("native wrapper rejected the Fast Travel icon")
     end
-    dbg("wrapper stage | applying donor layout")
-    iconSlot:SetLayout(donorLayout)
+    dbg("wrapper stage | applying donor layout scalars")
+    iconSlot:SetMinimum(layout.minimum)
+    iconSlot:SetMaximum(layout.maximum)
+    iconSlot:SetPosition(layout.position)
+    iconSlot:SetSize(layout.size)
+    iconSlot:SetAlignment(layout.alignment)
     iconSlot:SetAutoSize(true)
     iconSlot:SetZOrder(20)
     icon:SetVisibility(K.VISIBLE)
@@ -1374,6 +1410,7 @@ local function injectFastTravelEntry(mainMenu)
         return
     end
 
+    dbg("row injection stage | resolving libraries")
     local controller, controllerError = resolveLocalController()
     local umgLibrary, umgError = resolveUmgLibrary()
     local textLibrary, textError = resolveTextLibrary()
@@ -1383,6 +1420,7 @@ local function injectFastTravelEntry(mainMenu)
         return
     end
 
+    dbg("row injection stage | walking rail hierarchy")
     local mainList = nil
     local firstItem = nil
     local firstWrapper = nil
@@ -1400,18 +1438,21 @@ local function injectFastTravelEntry(mainMenu)
         return
     end
 
+    dbg("row injection stage | counting native rows")
     local nativeCount, countError =
         resolveNativeMenuCount(mainMenu, mainList)
     if nativeCount == nil then
         log("row injection failed closed: " .. tostring(countError))
         return
     end
+    dbg("row injection stage | native rows = " .. tostring(nativeCount))
     local lastItem = menuItemAndPanel(mainList, nativeCount - 1)
     if not isValid(lastItem) then
         log("row injection failed closed: final native item is unavailable")
         return
     end
 
+    dbg("row injection stage | counting injected rows")
     local rowsAbove, injectedError =
         countInjectedRows(parent, mainList)
     if rowsAbove == nil then
@@ -1420,6 +1461,7 @@ local function injectFastTravelEntry(mainMenu)
     end
     local fastTravelIndex = nativeCount + rowsAbove
 
+    dbg("row injection stage | resolving icon class")
     local iconClass = StaticFindObject(K.MAIN_MENU_ICON_CLASS)
     if not isValid(iconClass) then
         log("row injection failed closed: native menu icon class is unavailable")
@@ -1455,9 +1497,9 @@ local function injectFastTravelEntry(mainMenu)
         icon:BP_SetInputInteractionEnable(true)
         icon:SetDefaultAnimation()
 
-        local text = textLibrary:Conv_StringToText("Fast Travel")
-        icon:SetMenuName(text)
-        icon.MenuName:SetText(text)
+        icon:SetMenuName(textLibrary:Conv_StringToText("Fast Travel"))
+        icon.MenuName:SetText(
+            textLibrary:Conv_StringToText("Fast Travel"))
     end, debug.traceback)
     if not configured then
         if isValid(wrapperPanel) then
@@ -1858,10 +1900,6 @@ end
 -- geometry, and the icons report canHover=false. Nothing on screen can say which
 -- pin is being pointed at, so the pin is identified rather than aimed at.
 --
--- Note the Z: a pin is placed on a 2D map, so FRODMapPin::Pos comes back with
--- Z = 0 for ground sitting around Z 25000. Travelling there verbatim drops the
--- hero through the world, so the point is projected onto the navmesh first. The
--- query extent is deliberately tall because the whole answer is in that Z.
 -- HOW THE GAME ITSELF DOES HOVER
 --
 -- Not by geometry. URODInputWidgetBase -- the base of every interactive widget,
@@ -1884,98 +1922,10 @@ end
 -- URODMapMenuWidgetBase declares MapItemWidget. URODFastTravelMenuWidget does
 -- not: it builds one from FieldClass into MapWidgetCanvas, so for that screen
 -- the canvas children are where it lives.
--- A navmesh point is a floor position, while an ACharacter's actor origin is
--- the center of its capsule. The landing therefore adds the live hero capsule's
--- scaled half-height. Sending the surface Z directly makes K2_TeleportTo reject
--- the move because the capsule overlaps the floor.
---
--- Declared ahead of the do-block so the helpers inside cost no chunk-level local
--- slots: this file sits close to Lua's limit of 200 in the main chunk.
-local groundedPinPosition
-local projectPinOntoNavmesh
-
-do
-    local PIN_PROJECTION_EXTENT = { X = 500.0, Y = 500.0, Z = 100000.0 }
-    local PIN_LANDING_CLEARANCE = 5.0
-
-    local function pinLandingLift()
-        local hero, heroError = resolveLocalHero()
-        if hero == nil then return nil, tostring(heroError) end
-
-        local capsule = nil
-        local capsuleOk, capsuleError =
-            pcall(function() capsule = hero.CapsuleComponent end)
-        if not capsuleOk or not isValid(capsule) then
-            return nil, "hero capsule is unavailable: " .. tostring(capsuleError)
-        end
-
-        local height = nil
-        local heightOk, heightError =
-            pcall(function()
-                height = tonumber(capsule:GetScaledCapsuleHalfHeight())
-            end)
-        if not heightOk or height == nil or height <= 0.0 then
-            return nil, "hero capsule half-height is unreadable: " ..
-                tostring(heightError)
-        end
-        return height + PIN_LANDING_CLEARANCE, nil
-    end
-
-    function projectPinOntoNavmesh(flat)
-        local navigation = StaticFindObject(
-            "/Script/NavigationSystem.Default__NavigationSystemV1")
-        if not isValid(navigation) then
-            return nil, "NavigationSystemV1 is unavailable"
-        end
-        local controller, controllerError = resolveLocalController()
-        if controller == nil then return nil, tostring(controllerError) end
-
-        -- WorldEnemyDirector measured on this build that navigation
-        -- out-parameters arrive by mutating the passed table.
-        local projected = { X = 0.0, Y = 0.0, Z = 0.0 }
-        local ok, found = pcall(function()
-            return navigation:K2_ProjectPointToNavigation(
-                controller, flat, projected, nil, nil, PIN_PROJECTION_EXTENT)
-        end)
-        if not ok then
-            return nil, "K2_ProjectPointToNavigation failed: " .. tostring(found)
-        end
-        local surface = {
-            X = tonumber(projected.X),
-            Y = tonumber(projected.Y),
-            Z = tonumber(projected.Z),
-        }
-        if found ~= true or surface.X == nil or surface.Y == nil
-            or surface.Z == nil or surface.Z == 0.0 then
-            return nil, "no navmesh at those coordinates"
-        end
-        local lift, liftError = pinLandingLift()
-        if lift == nil then return nil, tostring(liftError) end
-        return {
-            X = surface.X,
-            Y = surface.Y,
-            Z = surface.Z + lift,
-        }, nil, surface.Z
-    end
-
-    function groundedPinPosition(rawPosition)
-        local flat = {
-            X = tonumber(rawPosition.X),
-            Y = tonumber(rawPosition.Y),
-            Z = tonumber(rawPosition.Z),
-        }
-        if flat.X == nil or flat.Y == nil or flat.Z == nil then
-            return nil, "pin position is not numeric"
-        end
-        local projected, projectionError, surfaceZ =
-            projectPinOntoNavmesh(flat)
-        if projected == nil then return nil, tostring(projectionError) end
-        log(string.format(
-            "PIN GROUND | (%.1f, %.1f) navmesh surface Z %.1f | capsule target Z %.1f",
-            flat.X, flat.Y, surfaceZ, projected.Z))
-        return projected, nil
-    end
-end
+-- FRODMapPin::Pos normally carries Z=0. The Lua layer therefore never invents
+-- a final terrain height. When the destination navmesh is not streamed, the
+-- working first hop is performed with movement disabled; the hero is released
+-- only after the final navmesh position is available.
 
 local function resolveMapItemWidget(mapWidget)
     if not isValid(mapWidget) then return nil, "no map screen" end
@@ -2920,11 +2870,11 @@ local function planarDistance(a, b)
     return math.sqrt(dx * dx + dy * dy)
 end
 
-local function performTeleport(position, label)
+local function performTeleport(position, label, onArrived)
     local hero, heroError = resolveLocalHero()
     if hero == nil then
         log("FAST TRAVEL ERROR | " .. tostring(heroError))
-        return
+        return false
     end
 
     local before = heroLocation()
@@ -2964,6 +2914,13 @@ local function performTeleport(position, label)
                     log(string.format(
                         "TELEPORT | %s | arrived | %.0f cm from target",
                         label, distance))
+                    if type(onArrived) == "function" then
+                        local callbackOk, callbackError = pcall(onArrived)
+                        if not callbackOk then
+                            log("FAST TRAVEL ERROR | arrival callback failed: " ..
+                                tostring(callbackError))
+                        end
+                    end
                 else
                     log(string.format(
                         "TELEPORT | %s | DID NOT ARRIVE | %.0f cm from target",
@@ -2975,7 +2932,271 @@ local function performTeleport(position, label)
     if not scheduled then
         log("FAST TRAVEL ERROR | teleport verification scheduling failed: " ..
             tostring(scheduleError))
+        return false
     end
+    return true
+end
+
+local function performPinTeleport(pin, onArrived)
+    if type(pin) ~= "table" or type(pin.index) ~= "number"
+        or type(pin.raw) ~= "table"
+        or type(pin.raw.X) ~= "number"
+        or type(pin.raw.Y) ~= "number"
+        or type(pin.raw.Z) ~= "number" then
+        log("PIN TRAVEL ERROR | pin identity or coordinates are invalid")
+        return false
+    end
+
+    local hero, heroError = resolveLocalHero()
+    if hero == nil then
+        log("PIN TRAVEL ERROR | " .. tostring(heroError))
+        return false
+    end
+    local capsule = nil
+    local capsuleOk, capsuleError =
+        pcall(function() capsule = hero.CapsuleComponent end)
+    if not capsuleOk or not isValid(capsule) then
+        log("PIN TRAVEL ERROR | hero capsule is unavailable: " ..
+            tostring(capsuleError))
+        return false
+    end
+    local halfHeight = nil
+    local heightOk, heightError = pcall(function()
+        halfHeight = tonumber(capsule:GetScaledCapsuleHalfHeight())
+    end)
+    if not heightOk or halfHeight == nil or halfHeight ~= halfHeight
+        or halfHeight <= 0.0 or halfHeight > 1000.0 then
+        log("PIN TRAVEL ERROR | hero capsule half-height is invalid: " ..
+            tostring(heightError or halfHeight))
+        return false
+    end
+
+    local controller, controllerError = resolveLocalController()
+    if controller == nil then
+        log("PIN TRAVEL ERROR | " .. tostring(controllerError))
+        return false
+    end
+    local navigation = StaticFindObject(
+        "/Script/NavigationSystem.Default__NavigationSystemV1")
+    if not isValid(navigation) then
+        log("PIN TRAVEL ERROR | NavigationSystemV1 is unavailable")
+        return false
+    end
+
+    local function projectFinalTarget()
+        local projected = { X = 0.0, Y = 0.0, Z = 0.0 }
+        local callOk, found = pcall(function()
+            return navigation:K2_ProjectPointToNavigation(
+                controller,
+                pin.raw,
+                projected,
+                nil,
+                nil,
+                { X = 500.0, Y = 500.0, Z = 100000.0 })
+        end)
+        local x = tonumber(projected.X)
+        local y = tonumber(projected.Y)
+        local z = tonumber(projected.Z)
+        if not callOk or found ~= true or x == nil or y == nil
+            or z == nil or z == 0.0 then
+            return nil
+        end
+        return {
+            X = x,
+            Y = y,
+            Z = z + halfHeight + 5.0,
+        }
+    end
+
+    local finalTarget = projectFinalTarget()
+    if finalTarget ~= nil then
+        log(string.format(
+            "PIN TARGET | navmesh ready | surface Z=%.1f | capsule target Z=%.1f",
+            finalTarget.Z - halfHeight - 5.0,
+            finalTarget.Z))
+        return performTeleport(finalTarget, "map pin", onArrived)
+    end
+
+    -- The destination cell is not streamed yet. Preserve the working first hop
+    -- used by v0.14.0, but disable character movement before it so the hero
+    -- cannot fall or take damage while the destination navmesh is loading.
+    local gameState, gameStateError = resolveWorldGameState()
+    if gameState == nil then
+        log("PIN TRAVEL ERROR | " .. tostring(gameStateError))
+        return false
+    end
+    local stageHeight = nil
+    local stageDistance = nil
+    local sweepOk, sweepError = pcall(function()
+        local gimmicks = gameState.RODAccessibleGimmicks
+        for index = 1, #gimmicks do
+            local gimmick = gimmicks[index]
+            if isValid(gimmick) then
+                local at = gimmick:K2_GetActorLocation()
+                local x = tonumber(at.X)
+                local y = tonumber(at.Y)
+                local z = tonumber(at.Z)
+                if x ~= nil and y ~= nil and z ~= nil then
+                    local dx = x - pin.raw.X
+                    local dy = y - pin.raw.Y
+                    local distance = math.sqrt(dx * dx + dy * dy)
+                    if stageDistance == nil or distance < stageDistance then
+                        stageHeight = z
+                        stageDistance = distance
+                    end
+                end
+            end
+        end
+    end)
+    if not sweepOk or stageHeight == nil then
+        log("PIN TRAVEL ERROR | staging height unavailable: " ..
+            tostring(sweepError))
+        return false
+    end
+
+    local movement = nil
+    local movementOk, movementError =
+        pcall(function() movement = hero.CharacterMovement end)
+    if not movementOk or not isValid(movement) then
+        log("PIN TRAVEL ERROR | CharacterMovement is unavailable: " ..
+            tostring(movementError))
+        return false
+    end
+    local originalMode = nil
+    local originalCustomMode = nil
+    local modeOk, modeError = pcall(function()
+        originalMode = tonumber(movement.MovementMode)
+        originalCustomMode = tonumber(movement.CustomMovementMode)
+    end)
+    if not modeOk or originalMode == nil or originalCustomMode == nil then
+        log("PIN TRAVEL ERROR | movement mode snapshot failed: " ..
+            tostring(modeError))
+        return false
+    end
+
+    local origin, originError = heroLocation()
+    if origin == nil then
+        log("PIN TRAVEL ERROR | " .. tostring(originError))
+        return false
+    end
+    local rotation = nil
+    local rotationOk, rotationError = pcall(function()
+        local value = hero:K2_GetActorRotation()
+        rotation = {
+            Pitch = tonumber(value.Pitch),
+            Yaw = tonumber(value.Yaw),
+            Roll = tonumber(value.Roll),
+        }
+    end)
+    if not rotationOk or rotation == nil or rotation.Pitch == nil
+        or rotation.Yaw == nil or rotation.Roll == nil then
+        log("PIN TRAVEL ERROR | rotation snapshot failed: " ..
+            tostring(rotationError))
+        return false
+    end
+
+    local restored = false
+    local function restoreMovement()
+        if restored then return end
+        restored = true
+        local restoreOk, restoreError = pcall(function()
+            movement:SetMovementMode(originalMode, originalCustomMode)
+        end)
+        if not restoreOk then
+            log("PIN TRAVEL ERROR | movement restore failed: " ..
+                tostring(restoreError))
+        end
+    end
+
+    local function rollback(reason)
+        local rollbackOk, rollbackError = pcall(function()
+            hero:K2_TeleportTo(origin, rotation)
+        end)
+        restoreMovement()
+        log("PIN TRAVEL ERROR | " .. tostring(reason) ..
+            " | rolled back=" .. tostring(rollbackOk) ..
+            (rollbackOk and "" or " | " .. tostring(rollbackError)))
+    end
+
+    local freezeOk, freezeError = pcall(function()
+        movement:StopMovementImmediately()
+        movement:DisableMovement()
+    end)
+    if not freezeOk then
+        restoreMovement()
+        log("PIN TRAVEL ERROR | movement freeze failed: " ..
+            tostring(freezeError))
+        return false
+    end
+
+    local stagingTarget = {
+        X = pin.raw.X,
+        Y = pin.raw.Y,
+        Z = stageHeight + 400.0,
+    }
+    local stagingOk, stagingAccepted = pcall(function()
+        return hero:K2_TeleportTo(stagingTarget, rotation)
+    end)
+    if not stagingOk or stagingAccepted ~= true then
+        rollback("staging teleport rejected: " .. tostring(stagingAccepted))
+        return false
+    end
+    log(string.format(
+        "PIN STAGING | target=(%.1f, %.1f, %.1f) | terminal %.0f cm away | movement frozen",
+        stagingTarget.X,
+        stagingTarget.Y,
+        stagingTarget.Z,
+        stageDistance))
+
+    local transactionOpenSerial = openSerial
+    local pollCount = 0
+    local pollNavmesh
+    pollNavmesh = function()
+        local scheduleOk, scheduleError = pcall(function()
+            ExecuteWithDelay(100, function()
+                ExecuteInGameThread(function()
+                    local stepOk, stepError = xpcall(function()
+                        if transactionOpenSerial ~= openSerial then
+                            rollback("map closed during pin staging")
+                            return
+                        end
+                        pollCount = pollCount + 1
+                        local settledTarget = projectFinalTarget()
+                        if settledTarget ~= nil then
+                            local started = performTeleport(
+                                settledTarget,
+                                "map pin",
+                                onArrived)
+                            if not started then
+                                rollback("final navmesh teleport rejected")
+                                return
+                            end
+                            restoreMovement()
+                            log(string.format(
+                                "PIN SETTLED | navmesh ready after %d ms | target Z=%.1f",
+                                pollCount * 100,
+                                settledTarget.Z))
+                            return
+                        end
+                        if pollCount >= 50 then
+                            rollback("destination navmesh unavailable after 5000 ms")
+                            return
+                        end
+                        pollNavmesh()
+                    end, debug.traceback)
+                    if not stepOk then
+                        rollback("pin staging callback failed: " ..
+                            tostring(stepError))
+                    end
+                end)
+            end)
+        end)
+        if not scheduleOk then
+            rollback("pin staging scheduling failed: " ..
+                tostring(scheduleError))
+        end
+    end
+    pollNavmesh()
     return true
 end
 
@@ -3778,16 +3999,9 @@ optionalHook(
                                 "MOD TELEPORT | map pin %d | EMapPinKind=%s | timestamp=%s",
                                 chosen.index, tostring(chosen.kind),
                                 tostring(chosen.timestamp)))
-                            local position, positionError =
-                                groundedPinPosition(chosen.raw)
-                            if position == nil then
-                                log("PIN TRAVEL ERROR | " ..
-                                    tostring(positionError))
-                                return
-                            end
-                            if performTeleport(position, "map pin") then
+                            performPinTeleport(chosen, function()
                                 dismissFastTravelScreen()
-                            end
+                            end)
                             return
                         end
                         log(string.format(
@@ -4118,9 +4332,9 @@ local commandOk, commandError = pcall(function()
             end
 
             -- WBP_Map_FastTravel_C only confirms terminals, so a pin cannot be
-            -- selected on it. FRODMapPin carries a world Pos, though, so the
-            -- destination itself is available: this travels to a pin by its
-            -- index in "fasttravel pins".
+            -- selected on it. FRODMapPin carries both the map Pos and its actual
+            -- MapPin world actor, so the destination is available without
+            -- inventing a terrain height.
             -- The escape hatch for a screen left unfocused by a viewport change.
             if subcommand == "close" then
                 reply("Force-closing the map screen; see the UE4SS console.")
@@ -4156,20 +4370,17 @@ local commandOk, commandError = pcall(function()
                         if pin == nil then
                             error("MapPins[" .. index .. "] is unavailable")
                         end
-                        -- Grounded, not raw: FRODMapPin::Pos carries Z = 0 and
-                        -- travelling to that drops the hero through the world.
-                        local position, positionError =
-                            groundedPinPosition(pin.Pos)
-                        if position == nil then
-                            error(tostring(positionError))
-                        end
-                        if not performTeleport(
-                            position,
-                            string.format(
-                                "pin %d kind=%s",
-                                index, tostring(pin.Kind))
-                        ) then
-                            error("K2_TeleportTo rejected the grounded pin")
+                        local position = pin.Pos
+                        local entry = {
+                            index = index,
+                            raw = {
+                                X = tonumber(position.X),
+                                Y = tonumber(position.Y),
+                                Z = tonumber(position.Z),
+                            },
+                        }
+                        if not performPinTeleport(entry, nil) then
+                            error("pin teleport transaction was rejected")
                         end
                     end, debug.traceback)
                     if not ok then
@@ -4360,22 +4571,14 @@ bindKey(CONFIG.PIN_TRAVEL_KEY, "travel to pin under cursor", function()
     end
 
     pinTravelBusy = true
-    ExecuteWithDelay(1200, function() pinTravelBusy = false end)
-
-    -- Height is resolved here, once, for this pin only.
-    local position, positionError = groundedPinPosition(chosen.raw)
-    if position == nil then
-        log("PIN TRAVEL | pin " .. chosen.index .. " has no usable height: " ..
-            tostring(positionError))
-        return
-    end
+    ExecuteWithDelay(6500, function() pinTravelBusy = false end)
 
     log(string.format(
         "PIN TRAVEL | pin %d | EMapPinKind=%s | timestamp=%s",
         chosen.index, tostring(chosen.kind), tostring(chosen.timestamp)))
-    if performTeleport(position, "map pin") then
+    performPinTeleport(chosen, function()
         dismissFastTravelScreen()
-    end
+    end)
 end)
 
 do

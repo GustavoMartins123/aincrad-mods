@@ -70,23 +70,7 @@ local isOpen = false
 
 local function isValid(object)
     if object == nil then return false end
-    local kind = type(object)
-    if kind ~= "userdata" and kind ~= "table" then return false end
-    local ok, valid = pcall(function()
-        if type(object.get_address) == "function" then
-            local addr = object:get_address()
-            if addr == nil or addr == 0 then return false end
-        elseif type(object.GetAddress) == "function" then
-            local addr = object:GetAddress()
-            if addr == nil or addr == 0 then return false end
-        end
-        if type(object.IsValid) == "function" then
-            return object:IsValid()
-        elseif type(object.is_valid) == "function" then
-            return object:is_valid()
-        end
-        return true
-    end)
+    local ok, valid = pcall(function() return object:IsValid() end)
     return ok and valid == true
 end
 

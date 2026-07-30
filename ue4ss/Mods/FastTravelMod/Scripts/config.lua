@@ -7,7 +7,11 @@ return {
     ENABLED = true,
 
     -- Extra focus, map-destination and catalog messages in UE4SS.log.
-    DEBUG_LOGS = false,
+    -- Temporarily ON to place the menu-open crash: it also emits the "row
+    -- injection stage" / "wrapper stage" breadcrumbs, and the last one written
+    -- before the log stops names the native call that died. Set back to false
+    -- once that crash is settled.
+    DEBUG_LOGS = true,
 
     -- Which map screen the Fast Travel row opens. They are different widgets and
     -- they accept different destinations:

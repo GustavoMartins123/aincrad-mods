@@ -1,5 +1,5 @@
 local MOD_NAME = "ExperienceNotifications"
-local MOD_VERSION = "1.2.0"
+local MOD_VERSION = "1.2.1"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -41,23 +41,7 @@ end
 
 local function isValid(object)
     if object == nil then return false end
-    local kind = type(object)
-    if kind ~= "userdata" and kind ~= "table" then return false end
-    local ok, valid = pcall(function()
-        if type(object.get_address) == "function" then
-            local addr = object:get_address()
-            if addr == nil or addr == 0 then return false end
-        elseif type(object.GetAddress) == "function" then
-            local addr = object:GetAddress()
-            if addr == nil or addr == 0 then return false end
-        end
-        if type(object.IsValid) == "function" then
-            return object:IsValid()
-        elseif type(object.is_valid) == "function" then
-            return object:is_valid()
-        end
-        return true
-    end)
+    local ok, valid = pcall(function() return object:IsValid() end)
     return ok and valid == true
 end
 
@@ -137,18 +121,44 @@ local function queueDisplay(amount)
     end)
 end
 
+-- IsA needs a UClass OBJECT. Handed a string it does not throw -- it silently
+-- returns false, so every acquisition would look like it came from something
+-- that is not an enemy and this mod would quietly never report anything.
+local enemyClass = nil
+local function resolveEnemyClass()
+    if isValid(enemyClass) then return enemyClass end
+    enemyClass = nil
+    local ok, class = pcall(function()
+        return StaticFindObject("/Script/ROD.RODEnemyCharacter")
+    end)
+    if ok and isValid(class) then enemyClass = class end
+    return enemyClass
+end
+
+-- Runs SYNCHRONOUSLY inside the hook, and must keep doing so. sourceParameter
+-- and acquisitionParameter point into the native call frame: they are alive for
+-- the duration of the hook call and dead the instant it returns. Reading them
+-- from a deferred callback is a use-after-free, and it is not survivable --
+-- an access violation is a hardware exception, so the surrounding xpcall never
+-- sees it and the process dies on the spot. This fires on every hit that awards
+-- anything, which is why deferring it turned every enemy into a crash.
+--
+-- Everything this needs is extracted here and handed on as a plain number;
+-- queueDisplay does the deferring, capturing nothing but that number.
 local function queueEnemyAcquisition(sourceParameter, acquisitionParameter)
     if CONFIG == nil or not CONFIG.ENABLED then return end
     local source
-    local okRead, readErr = pcall(function()
+    local okRead = pcall(function()
         source = readHookValue(sourceParameter, "Source")
     end)
     if not okRead or not isValid(source) then
         return
     end
 
+    local class = resolveEnemyClass()
+    if class == nil then return end
     local okEnemy, isEnemy = pcall(function()
-        return source:IsA("/Script/ROD.RODEnemyCharacter")
+        return source:IsA(class)
     end)
     if not okEnemy then
         error("Source class validation failed: " .. tostring(isEnemy))
@@ -283,17 +293,17 @@ end
 requireHook(
     "/Script/ROD.RODGameState:ApplyAcquisition",
     function(_, sourceParameter, acquisitionParameter)
-        ExecuteInGameThread(function()
-            local ok, hookError = xpcall(
-                function()
-                    queueEnemyAcquisition(sourceParameter, acquisitionParameter)
-                end,
-                debug.traceback
-            )
-            if not ok then
-                log("ACQUISITION HOOK ERROR | " .. tostring(hookError))
-            end
-        end)
+        -- No ExecuteInGameThread around this. The hook parameters die with the
+        -- call frame; see queueEnemyAcquisition.
+        local ok, hookError = xpcall(
+            function()
+                queueEnemyAcquisition(sourceParameter, acquisitionParameter)
+            end,
+            debug.traceback
+        )
+        if not ok then
+            log("ACQUISITION HOOK ERROR | " .. tostring(hookError))
+        end
     end
 )
 
