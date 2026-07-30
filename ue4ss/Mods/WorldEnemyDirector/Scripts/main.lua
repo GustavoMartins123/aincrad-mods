@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.7.4"
+local MOD_VERSION = "1.7.7"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -21,31 +21,18 @@ local RUNTIME_PATH = SCRIPT_DIR .. "runtime.lua"
 local RUNTIME_LOCK_PATH = RUNTIME_PATH .. ".lock"
 
 local STARTUP_SETTLE_MS = 2000
--- Used by the ClientRestart-after-travel path, which logs "waiting 5 seconds"
--- while actually waiting this. The string has been wrong for as long as it has
--- existed. Left at 1500 for now because cross-world travel gets a real
+-- Used by the ClientRestart-after-travel path. Left at 1500 because cross-world
+-- travel gets a real
 -- ClientRestart and the readiness-stability gate behind it, but it is the
 -- shortest settle in the mod guarding the most expensive transition -- if
 -- streaming crashes resurface after a map change rather than a fast travel,
 -- this is the number to raise.
 local RESTART_SETTLE_MS = 1500
--- Every same-world teleport goes through this: quest teleport-out and fast
--- travel alike (beginSameWorldSettle). It used to be 2000, on the reasoning that
--- staying in the same world is cheaper than travelling to a new one. The map
--- says otherwise -- a fast travel jumps tens of thousands of units, so World
--- Partition streams in a whole new region exactly like a real transition does,
--- and only the ClientRestart is skipped. Resuming into that produced an access
--- violation reading 0xffffffffffffffff about twelve seconds after a jump of
--- ~58000 units, on this mod's first spawn in the new region. That address is the
--- documented signature of UE4SS 3.0.1's use-after-free race dispatching
--- callbacks during level/asset streaming (mod_template techniques/
--- crash-safety.md, "Ambient background"): mod code cannot fix it, the only
--- lever is not doing callback work while streaming is in flight.
---
--- 5000 is what the travel path's log line has always claimed to wait. Note that
--- RESTART_SETTLE_MS is the value that path actually uses, and it is smaller than
--- this one -- see the comment there.
-local QUEST_TELEPORT_SETTLE_MS = 5000
+-- FastTravelMod now activates and validates the destination cell before moving
+-- the hero. Two seconds keeps the director out of the close/arrival lifecycle
+-- without adding another five-second wait after the destination is already
+-- locally ready.
+local QUEST_TELEPORT_SETTLE_MS = 2000
 local STABILITY_SAMPLES_REQUIRED = 3
 local DISCOVERY_STABILIZE_MS = 2000
 local SETTINGS_POLL_MS = 1000
@@ -58,11 +45,16 @@ local SPAWN_INITIALIZE_MS = 8000
 local SPAWN_Z_OFFSET_CM = 40.0
 local SPAWN_COLLISION_ALWAYS = 1
 local SPAWN_SCALE_MULTIPLY_ROOT = 1
+local OWNED_ACTOR_TAG = "WorldEnemyDirectorOwned"
 -- Requests allowed to expire unmatched, in a row, before multiplication is
 -- declared non-functional for this session.
 local UNMATCHED_SPAWN_GIVE_UP = 12
 -- How often origins near the hero are revisited when nothing was freed.
 local ORIGIN_SWEEP_MS = 3000
+-- Blueprint/AI initialization can change a capsule after the initial spawn
+-- check. Re-validate every owned actor after activation so an actor cannot stay
+-- in the world after losing its physical Pawn collision.
+local COLLISION_AUDIT_MS = 500
 local NAV_ATTEMPTS_PER_PASS = 1
 local NAV_MAX_ATTEMPTS = 12
 local NAV_MIN_SEPARATION_CM = 150.0
@@ -409,13 +401,13 @@ local navigationSystem = nil
 local gameplayStatics = nil
 local worldPartitionSubsystem = nil
 local cachedHero = nil
-local streamingGateReported = false
 local spawnContractVerified = false
 -- Consecutive spawn requests that expired without ever being matched to a
 -- new enemy. A spawn API that quietly does nothing looks exactly like this.
 local unmatchedSpawnStreak = 0
 local spawningProvenInert = false
 local nextOriginSweepMs = 0
+local nextCollisionAuditMs = 0
 local SPAWN_PACING_MS = 350
 local lastSpawnMs = 0
 local AMBIENT_CHECK_INTERVAL_MS = 4000
@@ -460,6 +452,7 @@ local function clearWorldReferences()
     spawningProvenInert = false
     cachedHero = nil
     nextOriginSweepMs = 0
+    nextCollisionAuditMs = 0
     lastSpawnMs = 0
     nextAmbientCheckMs = 0
     ambientCounter = 0
@@ -1727,6 +1720,35 @@ local function registerEnemy(enemy, reused, queued)
     end
 
     local request = (queued and queued.request) or takePendingSpawn(key)
+    local tagOk, ownedTag = pcall(function()
+        return enemy:ActorHasTag(FName(OWNED_ACTOR_TAG))
+    end)
+    if not tagOk or type(ownedTag) ~= "boolean" then
+        log("ENEMY ERROR | " .. key ..
+            " | ownership tag contract is unreadable")
+        if request ~= nil then
+            destroyPending(request, "ownership tag contract was unreadable")
+        end
+        return
+    end
+    if request ~= nil and ownedTag ~= true then
+        destroyPending(request, "spawned actor lost its ownership tag")
+        log("SPAWN ERROR | " .. key ..
+            " | canonical ownership tag is absent")
+        return
+    end
+    if request == nil and ownedTag == true then
+        local destroyed, destroyError =
+            pcall(function() enemy:K2_DestroyActor() end)
+        if not destroyed then
+            log("ORPHAN EXTRA ERROR | " .. key .. " | " ..
+                tostring(destroyError))
+        else
+            log("ORPHAN EXTRA REMOVED | " .. key ..
+                " | ownership survived reference quarantine")
+        end
+        return
+    end
     local previous = states[key]
     if previous ~= nil and not reused then return end
     if previous ~= nil then
@@ -1829,7 +1851,11 @@ local function registerEnemy(enemy, reused, queued)
     -- An extra this mod created has to be told to start. A naturally placed
     -- enemy arrived through the game's own spawn path and is already running.
     if state.owned then
-        activateSpawnedEnemy(enemy, key, state.spawnPosition)
+        if activateSpawnedEnemy(enemy, key, state.spawnPosition) ~= true then
+            states[key] = nil
+            destroyPending(request, "native collision contract was rejected")
+            return
+        end
     end
 
     -- INCLUDE_BOSSES controls mutation only. Boss classes and boss actors are
@@ -1936,27 +1962,54 @@ end
 -- nothing for a behaviour tree to run yet.
 local activationReported = false
 
-activateSpawnedEnemy = function(enemy, key, spawnPosition)
-    if not isValid(enemy) then return end
+local function spawnedEnemyCollisionContract(enemy)
+    if not isValid(enemy) then
+        return false, "enemy object is invalid"
+    end
+    local detail = nil
+    local collisionOk, collisionError = pcall(function()
+        if enemy:GetActorEnableCollision() ~= true then
+            error("actor collision is disabled")
+        end
+        local capsule = enemy.CapsuleComponent
+        if not isValid(capsule) then
+            error("capsule component is unavailable")
+        end
+        local enabled = tonumber(capsule:GetCollisionEnabled())
+        if enabled ~= 1 and enabled ~= 3 and enabled ~= 5 then
+            error("capsule has no query collision: " .. tostring(enabled))
+        end
+        local pawnResponse =
+            tonumber(capsule:GetCollisionResponseToChannel(2))
+        if pawnResponse ~= 2 then
+            error("capsule does not block Pawn: " .. tostring(pawnResponse))
+        end
+        local profile = capsule:GetCollisionProfileName():ToString()
+        if type(profile) ~= "string" or profile == ""
+            or profile == "None" then
+            error("capsule collision profile is unavailable")
+        end
+        detail = string.format(
+            "profile=%s enabled=%d Pawn=%d",
+            profile, enabled, pawnResponse)
+    end)
+    if not collisionOk then
+        return false, tostring(collisionError)
+    end
+    return true, detail
+end
 
+activateSpawnedEnemy = function(enemy, key, spawnPosition)
+    if not isValid(enemy) then return false end
+
+    -- Collision responses belong to the enemy Blueprint. The previous code
+    -- replaced every capsule and mesh channel with Block, destroying the
+    -- custom attack/overlap responses used by this game. Preserve the authored
+    -- profiles and reject the extra if its native pawn collision did not
+    -- initialize.
     pcall(function()
-        enemy:SetActorEnableCollision(true)
         enemy:SetCanBeDamaged(true)
         enemy.bCanBeDamaged = true
-    end)
-    pcall(function()
-        local capsule = enemy.CapsuleComponent
-        if isValid(capsule) then
-            capsule:SetCollisionEnabled(3)
-            capsule:SetCollisionResponseToAllChannels(2)
-        end
-    end)
-    pcall(function()
-        local mesh = enemy.Mesh
-        if isValid(mesh) then
-            mesh:SetCollisionEnabled(3)
-            mesh:SetCollisionResponseToAllChannels(2)
-        end
     end)
 
     if spawnPosition ~= nil then
@@ -2044,6 +2097,56 @@ activateSpawnedEnemy = function(enemy, key, spawnPosition)
             .. tostring(startedAI) .. " StartBehaviorTree ok="
             .. tostring(startedTree))
     end
+
+    local collisionOk, collisionError =
+        spawnedEnemyCollisionContract(enemy)
+    if not collisionOk then
+        log("SPAWN COLLISION ERROR | " .. tostring(key) .. " | " ..
+            tostring(collisionError))
+        return false
+    end
+    return true
+end
+
+-- The activation check above proves only that instant. StartAI, the behavior
+-- tree, pooling callbacks, and Blueprint state changes can still alter
+-- collision afterward. This audit is deliberately fail-closed: a live owned
+-- extra that no longer satisfies the exact capsule contract is destroyed. It
+-- is not repaired by writing guessed collision responses over the Blueprint.
+local function auditOwnedEnemyCollision()
+    if elapsedMs < nextCollisionAuditMs then return end
+    nextCollisionAuditMs = elapsedMs + COLLISION_AUDIT_MS
+
+    local rejected = {}
+    for _, state in pairs(states) do
+        if state.owned and isValid(state.object) then
+            local operational, lifecycleError =
+                enemyOperational(state.object)
+            if operational then
+                local valid, collisionError =
+                    spawnedEnemyCollisionContract(state.object)
+                if not valid then
+                    rejected[#rejected + 1] = {
+                        state = state,
+                        reason = collisionError,
+                    }
+                end
+            elseif lifecycleError ~= "enemy is dead" then
+                rejected[#rejected + 1] = {
+                    state = state,
+                    reason = "lifecycle contract lost: " ..
+                        tostring(lifecycleError),
+                }
+            end
+        end
+    end
+
+    for _, rejection in ipairs(rejected) do
+        local state = rejection.state
+        log("SPAWN COLLISION LOST | " .. tostring(state.key) .. " | " ..
+            tostring(rejection.reason) .. " | removing owned extra")
+        destroyOwned(state, "collision contract lost after activation")
+    end
 end
 
 -- Actors are not created while World Partition is still streaming.
@@ -2061,19 +2164,12 @@ end
 -- the middle of cell streaming is the one thing this mod does that fits both
 -- crashes, so it stops doing it. This is a mitigation, not a diagnosed fix.
 --
--- The gate fails open: if the subsystem cannot be resolved, spawning continues
--- and says so once, rather than silently disabling the feature forever.
 local function streamingIsSettled()
     if not isValid(worldPartitionSubsystem) then
         worldPartitionSubsystem = nil
         local ok, subsystem = pcall(FindFirstOf, "WorldPartitionSubsystem")
         if not ok or not isValid(subsystem) then
-            if not streamingGateReported then
-                streamingGateReported = true
-                log("SPAWN GATE | WorldPartitionSubsystem is unavailable; "
-                    .. "spawning without a streaming gate")
-            end
-            return true
+            return nil, "WorldPartitionSubsystem is unavailable"
         end
         worldPartitionSubsystem = subsystem
     end
@@ -2082,14 +2178,10 @@ local function streamingIsSettled()
         return worldPartitionSubsystem:IsAllStreamingCompleted()
     end)
     if not ok then
-        if not streamingGateReported then
-            streamingGateReported = true
-            log("SPAWN GATE | IsAllStreamingCompleted failed: "
-                .. tostring(completed) .. "; spawning without a streaming gate")
-        end
-        return true
+        return nil, "IsAllStreamingCompleted failed: " ..
+            tostring(completed)
     end
-    return completed == true
+    return completed == true, nil
 end
 
 local function processSpawnRequest()
@@ -2097,7 +2189,14 @@ local function processSpawnRequest()
     local request = table.remove(spawnQueue, 1)
     if request == nil or request.generation ~= generation then return end
     lastSpawnMs = elapsedMs
-    if not streamingIsSettled() then
+    local streamingSettled, streamingError = streamingIsSettled()
+    if streamingSettled == nil then
+        pauseForSpawnContractFailure(
+            "world partition spawn gate failed: " ..
+                tostring(streamingError))
+        return
+    end
+    if not streamingSettled then
         -- Put it back untouched: this is not a failed attempt, so it must not
         -- consume the navigation budget or age the request.
         table.insert(spawnQueue, 1, request)
@@ -2131,15 +2230,11 @@ local function processSpawnRequest()
     local spawnClass, classResolveError =
         resolveExactObject(request.classKey)
     if spawnClass == nil then
-        if isValid(request.classObject) then
-            spawnClass = request.classObject
-        else
-            pauseForSpawnContractFailure(
-                "spawn class resolution failed: " ..
-                    firstErrorLine(classResolveError)
-            )
-            return
-        end
+        pauseForSpawnContractFailure(
+            "spawn class resolution failed: " ..
+                firstErrorLine(classResolveError)
+        )
+        return
     end
 
     local isAmbient = request.isAmbient == true
@@ -2254,6 +2349,16 @@ local function processSpawnRequest()
             error("FinishSpawningActor returned a different actor")
         end
         request.object = finished
+        local tags = finished.Tags
+        if tags == nil then
+            error("spawned actor Tags array is unavailable")
+        end
+        if finished:ActorHasTag(FName(OWNED_ACTOR_TAG)) ~= true then
+            tags[#tags + 1] = FName(OWNED_ACTOR_TAG)
+        end
+        if finished:ActorHasTag(FName(OWNED_ACTOR_TAG)) ~= true then
+            error("spawned actor ownership tag did not persist")
+        end
         finished:SetEnemyLevel(request.level, false)
     end)
     if not okSpawn then
@@ -2588,6 +2693,7 @@ local function tick(stepMs)
 
     cleanupInvalidStates()
     expirePendingSpawns()
+    auditOwnedEnemyCollision()
     if not discoveryBatch then
         -- reconcileNearbyOrigins is O(origins x states); running it every tick
         -- alongside recycling was the other half of the stutter. It only has
@@ -2726,6 +2832,44 @@ requireHook(
     "/Script/ROD.RODPlayerState:ServerDecideFastTravel",
     function()
         beginSameWorldSettle("ServerDecideFastTravel(same-world)")
+    end
+)
+
+-- Mod-performed same-world travel does not enter ServerDecideFastTravel.
+-- K2_TeleportTo is the actual engine move used by FastTravelMod, so a large
+-- move of the local hero is the canonical boundary at which every retained
+-- enemy/world reference must be released. Small corrective teleports stay
+-- below the threshold and do not interrupt the director.
+requireHook(
+    "/Script/Engine.Actor:K2_TeleportTo",
+    function(actorParameter, destinationParameter)
+        local ok, hookError = pcall(function()
+            local actor = actorParameter:get()
+            local hero = resolveHeroObject()
+            if not isValid(actor) or not isValid(hero)
+                or objectKey(actor) ~= objectKey(hero) then
+                return
+            end
+
+            local current, currentError = actorLocation(hero)
+            if current == nil then error(currentError) end
+            local destination = vector(destinationParameter:get())
+            if destination == nil then
+                error("K2_TeleportTo destination is invalid")
+            end
+            local dx = destination.X - current.X
+            local dy = destination.Y - current.Y
+            local distance = math.sqrt(dx * dx + dy * dy)
+            if distance >= 3000.0 then
+                beginSameWorldSettle(string.format(
+                    "local hero K2_TeleportTo %.0f cm",
+                    distance))
+            end
+        end)
+        if not ok then
+            log("WORLD QUARANTINE ERROR | K2_TeleportTo hook | " ..
+                tostring(hookError))
+        end
     end
 )
 

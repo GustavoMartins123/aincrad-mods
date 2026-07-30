@@ -1,4 +1,4 @@
--- FastTravelMod v0.14.5
+-- FastTravelMod v0.15.3
 --
 -- TWO MAPS, ONE OF THEM WRONG
 --
@@ -23,12 +23,17 @@
 -- working fast travel screen for an unproven confirm interception on a screen
 -- that is not the game's fast travel UI. It is opt-in via MAP_TARGET now.
 --
--- PINS ON THE FAST TRAVEL SCREEN
+-- FAST TRAVEL ANYWHERE
 --
--- Pin hover uses URODInputWidgetBase::GetIsMouseHover, which is where the game
--- keeps hover state. Icons get SetInputEnable(true) when the screen opens, since
--- an icon with input disabled never receives hover. Destinations still come from
--- ARODGameState::MapPins. See enablePinIconInput and hoveredPinTimestamp.
+-- F9 uses the field map cursor itself; placing a pin is not required. The
+-- player's world position, the player/cursor render translations, the live
+-- FieldMapDistancePerPixel and RODInGameUIManager::ConvertMapLocation form the
+-- complete cursor-to-world transform.
+--
+-- A temporary WorldPartitionStreamingSourceComponent loads the destination
+-- without moving the hero. The move is fail-closed until nine WorldStatic
+-- traces support the real hero capsule footprint in two consecutive probes.
+-- Navmesh is deliberately not part of this player-collision contract.
 --
 -- Natively the second is opened by GA_AvatarMenu_AccessTerminal_C, which needs a
 -- real terminal actor as its Target. This mod instead constructs the widget and
@@ -78,13 +83,14 @@
 --   ARODGameState::RODAccessibleGimmicks
 --   ARODAccessibleGimmickBase::ID / WarpOutTransforms / AccessTransforms
 --   ARODGameState::MapPins (FRODMapPin::Kind / Pos / Timestamp)
---   URODIconForMapWidgetBase::GetMapIconKind / MapIconKind / Timestamp
---   URODInputWidgetBase::SetInputEnable / IsInputEnable
---   UWidget::RenderTransform (icon and cursor positions)
---   UWidget::SetVisibility / GetVisibility / SetIsEnabled / GetParent
---   URODMapItemWidgetBase::PinIconWidgets
---   URODFieldMapItemWidget::CurrentStayTerminalIconWidget
---   UWidget::GetCachedGeometry / USlateBlueprintLibrary::LocalToAbsolute
+--   URODInGameUIManager::ConvertMapLocation
+--   URODFieldMapItemWidget::FieldMapDistancePerPixel / ImageAngle
+--   URODMapItemWidgetBase::PlayerIconWidget / CursorWidget / MapImageSize
+--   UWidget::RenderTransform
+--   UWorldPartitionStreamingSourceComponent
+--   UROD_BlueprintFunctionLibrary::GetZLineTraceLoc
+--   ExecuteInGameThreadWithDelay / LoopInGameThreadWithDelay
+--   CancelDelayedAction
 --   URODWidgetBPFunctionLibrary::SetCurrentMenuInputActionEnable
 --   AActor::K2_TeleportTo(FVector, FRotator)
 --   WBP_Map_FastTravel_C
@@ -124,8 +130,20 @@
 -- is unavailable, the operation stops and reports the error.
 
 local MOD_NAME = "FastTravelMod"
-local MOD_VERSION = "v0.14.5"
+local MOD_VERSION = "v0.15.3"
 local SUPPORTED_SDK = "Echoes of Aincrad 1.0.3"
+
+-- This UE4SS build exposes owned, cancellable game-thread delayed actions.
+-- The older ExecuteWithDelay -> ExecuteInGameThread double-hop stores two Lua
+-- registry references per step and produced the measured fatal
+-- "Registry::get_function_ref | Ref was not function" abort. There is no
+-- legacy scheduler path.
+if type(ExecuteInGameThreadWithDelay) ~= "function"
+    or type(LoopInGameThreadWithDelay) ~= "function"
+    or type(CancelDelayedAction) ~= "function" then
+    error("[" .. MOD_NAME ..
+        "] owned game-thread delayed-action contract is unavailable")
+end
 
 -- Folded into one table: this file sits at Lua's limit of 200 locals in the
 -- main chunk, and thirty individual constants is thirty slots.
@@ -175,7 +193,7 @@ local K = {
     MENU_INJECTION_DELAY_MS = 600,
     MENU_TRANSITION_POLL_MS = 50,
     MENU_TRANSITION_TIMEOUT_MS = 3000,
-    OPEN_VERIFICATION_DELAY_MS = 2500,
+    OPEN_VERIFICATION_DELAY_MS = 3000,
     TELEPORT_FINALIZE_DELAY_MS = 900,
     MENU_END_ALL_CLOSE = 2,
 
@@ -237,7 +255,7 @@ local CONFIG = {
     MAP_MENU_KEY = "",
     MAP_TARGET = "fasttravel",
     FORCE_CLOSE_KEY = "F8",
-    PIN_TRAVEL_KEY = "F9",
+    CURSOR_TRAVEL_KEY = "F9",
 }
 
 local runtimeHealthy = true
@@ -254,6 +272,7 @@ local teleportMapWidget = nil
 local menuCloseBusy = false
 local teleportMapModeActive = false
 local mapTeleportBusy = false
+local cursorTravelBusy = false
 local mapIconDestinations = {}
 -- UpdateIcon fires once per icon and a floor map carries well over a hundred of
 -- them, all reporting the same map widget. Resolving that widget's full object
@@ -368,7 +387,7 @@ local function applySettings(settings)
         MAP_MENU_KEY = true,
         MAP_TARGET = true,
         FORCE_CLOSE_KEY = true,
-        PIN_TRAVEL_KEY = true,
+        CURSOR_TRAVEL_KEY = true,
     }
     for key in pairs(settings) do
         if booleanKeys[key] ~= true and stringKeys[key] ~= true then
@@ -399,8 +418,8 @@ local function applySettings(settings)
     if settings.FORCE_CLOSE_KEY ~= nil then
         CONFIG.FORCE_CLOSE_KEY = settings.FORCE_CLOSE_KEY
     end
-    if settings.PIN_TRAVEL_KEY ~= nil then
-        CONFIG.PIN_TRAVEL_KEY = settings.PIN_TRAVEL_KEY
+    if settings.CURSOR_TRAVEL_KEY ~= nil then
+        CONFIG.CURSOR_TRAVEL_KEY = settings.CURSOR_TRAVEL_KEY
     end
     runtimeHealthy = true
 end
@@ -995,18 +1014,16 @@ end
 
 local function scheduleNativeTravelState(source, delayMs)
     local scheduled, scheduleError = pcall(function()
-        ExecuteWithDelay(delayMs or 0, function()
-            ExecuteInGameThread(function()
-                local ok, stateError =
-                    xpcall(function()
-                        logNativeTravelState(source)
-                    end, debug.traceback)
-                if not ok then
-                    log("NATIVE STATE ERROR | source=" ..
-                        tostring(source) .. " | " ..
-                        tostring(stateError))
-                end
-            end)
+        ExecuteInGameThreadWithDelay(delayMs or 0, function()
+            local ok, stateError =
+                xpcall(function()
+                    logNativeTravelState(source)
+                end, debug.traceback)
+            if not ok then
+                log("NATIVE STATE ERROR | source=" ..
+                    tostring(source) .. " | " ..
+                    tostring(stateError))
+            end
         end)
     end)
     if not scheduled then
@@ -1061,6 +1078,7 @@ local function failCurrentMenu(reason)
     openBusy = false
     teleportMapModeActive = false
     mapTeleportBusy = false
+    cursorTravelBusy = false
     mapIconDestinations = {}
     teleportMapWidgetKey = nil
     teleportMapWidget = nil
@@ -1551,20 +1569,6 @@ local function injectFastTravelEntry(mainMenu)
         "Fast Travel row added at index %d (%d native, %d injected above)",
         fastTravelIndex, nativeCount, rowsAbove))
 
-    ExecuteWithDelay(850, function()
-        ExecuteInGameThread(function()
-            if activeContext ~= context
-                or not isValid(context.wrapperPanel) then
-                return
-            end
-            local enforced, enforceError = enforceLetterIcon(context)
-            if enforced ~= true then
-                failCurrentMenu(
-                    "post-animation icon validation failed: " ..
-                    tostring(enforceError))
-            end
-        end)
-    end)
 end
 
 local function focusIcon(context, icon, index)
@@ -1783,7 +1787,7 @@ end
 local function withInputLock(action)
     if inputLocked then return end
     inputLocked = true
-    ExecuteWithDelay(60, function() inputLocked = false end)
+    ExecuteInGameThreadWithDelay(60, function() inputLocked = false end)
     action()
 end
 
@@ -1879,6 +1883,7 @@ local function failPendingOpen(serial, reason)
     openBusy = false
     teleportMapModeActive = false
     mapTeleportBusy = false
+    cursorTravelBusy = false
     mapIconDestinations = {}
     teleportMapWidgetKey = nil
     teleportMapWidget = nil
@@ -1922,10 +1927,12 @@ end
 -- URODMapMenuWidgetBase declares MapItemWidget. URODFastTravelMenuWidget does
 -- not: it builds one from FieldClass into MapWidgetCanvas, so for that screen
 -- the canvas children are where it lives.
--- FRODMapPin::Pos normally carries Z=0. The Lua layer therefore never invents
--- a final terrain height. When the destination navmesh is not streamed, the
--- working first hop is performed with movement disabled; the hero is released
--- only after the final navmesh position is available.
+-- F9 is not tied to a pin. The field map's own distance-per-pixel and the
+-- RODInGameUIManager world-to-map transform turn the live cursor translation
+-- into an exact world XY. Before the hero moves, a temporary World Partition
+-- streaming source loads that XY. Teleport is allowed only after the game's
+-- WorldStatic trace supports the complete capsule footprint twice in a row.
+-- There is no approach hop, alternate destination, or guessed Z.
 
 local function resolveMapItemWidget(mapWidget)
     if not isValid(mapWidget) then return nil, "no map screen" end
@@ -1960,185 +1967,6 @@ local function resolveMapItemWidget(mapWidget)
     return nil, "no RODMapItemWidgetBase under MapWidgetCanvas"
 end
 
--- The placed pins' icons, paired with their Timestamp. The timestamp join
--- between FRODMapPin and URODIconForMapWidgetBase is measured working:
---   MapPins[1] timestamp=33.5873  <->  PinIcon[8] kind=27 timestamp=33.5873
--- Spare pool slots read back with Timestamp 0 and are skipped.
-local function placedPinIcons(item)
-    local icons = nil
-    pcall(function() icons = item.PinIconWidgets end)
-    if icons == nil then return {} end
-    local count = 0
-    pcall(function() count = #icons end)
-
-    local placed = {}
-    for index = 1, count do
-        local icon = nil
-        pcall(function() icon = icons[index] end)
-        if isValid(icon) then
-            local timestamp = nil
-            pcall(function() timestamp = tonumber(icon.Timestamp) end)
-            if timestamp ~= nil and timestamp ~= 0.0 then
-                placed[#placed + 1] = { icon = icon, timestamp = timestamp }
-            end
-        end
-    end
-    return placed
-end
-
--- ESlateVisibility. A widget only takes part in hit testing at Visible; at
--- HitTestInvisible its whole subtree is excluded, and at SelfHitTestInvisible
--- only the widget itself is, with its children still testable.
-local SLATE_VISIBLE = 0
-local SLATE_HIT_TEST_INVISIBLE = 3
-local SLATE_SELF_HIT_TEST_INVISIBLE = 4
-local SLATE_VISIBILITY_NAMES = {
-    [0] = "Visible", [1] = "Collapsed", [2] = "Hidden",
-    [3] = "HitTestInvisible", [4] = "SelfHitTestInvisible",
-}
-local PIN_ANCESTOR_LIMIT = 8
-
-local function visibilityName(value)
-    return SLATE_VISIBILITY_NAMES[value] or tostring(value)
-end
-
--- The <MISSING STRING TABLE ENTRY> labels track whether a WBP_Map_C has been
--- constructed this session. They were correct while v0.13.0's icon helper
--- existed -- which built one on every open -- and came back the moment it was
--- removed; the log shows them correct after a WBP_Map_C construction at
--- 20:16:48 and missing at 20:22 with none. Constructing the reference map
--- evidently pulls in the string assets the fast travel screen's keys resolve
--- against.
---
--- So the widget is built once and kept, and nothing else is done with it. The
--- parts that made the old helper dangerous -- redirecting its MapItemWidget at
--- another screen and calling GetIconForMap/UpdateIcon through it -- are not
--- coming back.
-local mapStringCompanion = nil
-local buildingStringCompanion = false
-
-local function ensureMapStringCompanion()
-    if isValid(mapStringCompanion) then return end
-
-    local controller, controllerError = resolveLocalController()
-    if controller == nil then
-        log("MAP STRINGS | " .. tostring(controllerError))
-        return
-    end
-    local umgLibrary, umgError = resolveUmgLibrary()
-    if umgLibrary == nil then
-        log("MAP STRINGS | " .. tostring(umgError))
-        return
-    end
-
-    local widgetClass = StaticFindObject(
-        "/Game/ROD/Widget/Cockpit/Minimap/WBP_Map.WBP_Map_C")
-    if not isValid(widgetClass) then
-        log("MAP STRINGS | WBP_Map_C class is not loaded")
-        return
-    end
-
-    buildingStringCompanion = true
-    local created = nil
-    local ok, createError = pcall(function()
-        created = umgLibrary:Create(controller, widgetClass, controller)
-    end)
-    buildingStringCompanion = false
-
-    if not ok or not isValid(created) then
-        log("MAP STRINGS | companion creation failed: " ..
-            tostring(createError))
-        return
-    end
-    mapStringCompanion = created
-    log("MAP STRINGS | reference map companion built for string resolution")
-end
-
--- Called when the screen is presented.
---
--- SetInputEnable alone was not enough -- measured, it wrote cleanly
--- ("IsInputEnable false -> true | write=true" on all five pins) and hover still
--- never fired. Input permission is not hit testing: map icons are drawn so they
--- do not intercept the mouse over the map, and a widget outside hit testing
--- cannot report hover no matter what its input flags say.
---
--- So visibility is raised to Visible on the icon, and any ancestor sitting at
--- HitTestInvisible is moved to SelfHitTestInvisible -- which re-admits the
--- children to hit testing without letting the ancestor start swallowing clicks
--- itself.
-local function enablePinIconInput(mapWidget)
-    ensureMapStringCompanion()
-
-    local item, itemError = resolveMapItemWidget(mapWidget)
-    if item == nil then
-        log("PIN HOVER | map item unavailable: " .. tostring(itemError))
-        return
-    end
-
-    local placed = placedPinIcons(item)
-    if #placed == 0 then
-        log("PIN HOVER | no placed pin icon on this screen")
-        return
-    end
-
-    for _, entry in ipairs(placed) do
-        local beforeInput, beforeVisibility
-        pcall(function() beforeInput = entry.icon:IsInputEnable() end)
-        pcall(function()
-            beforeVisibility = tonumber(entry.icon:GetVisibility())
-        end)
-
-        local wrote = pcall(function()
-            entry.icon:SetInputEnable(true)
-            entry.icon:SetInputEnableIndividualAll(true)
-            entry.icon:SetIsEnabled(true)
-            entry.icon:SetVisibility(SLATE_VISIBLE)
-        end)
-
-        local afterInput, afterVisibility
-        pcall(function() afterInput = entry.icon:IsInputEnable() end)
-        pcall(function()
-            afterVisibility = tonumber(entry.icon:GetVisibility())
-        end)
-
-        log(string.format(
-            "PIN HOVER | pin timestamp=%s | input %s -> %s | visibility %s -> %s | write=%s",
-            tostring(entry.timestamp),
-            tostring(beforeInput), tostring(afterInput),
-            visibilityName(beforeVisibility), visibilityName(afterVisibility),
-            tostring(wrote)))
-
-        -- One HitTestInvisible ancestor is enough to keep the icon out of hit
-        -- testing however the icon itself is configured.
-        pcall(function()
-            local node = entry.icon:GetParent()
-            local depth = 0
-            while isValid(node) and depth < PIN_ANCESTOR_LIMIT do
-                depth = depth + 1
-                local current = tonumber(node:GetVisibility())
-                if current == SLATE_HIT_TEST_INVISIBLE then
-                    local changed = pcall(function()
-                        node:SetVisibility(SLATE_SELF_HIT_TEST_INVISIBLE)
-                    end)
-                    local now = nil
-                    pcall(function() now = tonumber(node:GetVisibility()) end)
-                    log(string.format(
-                        "PIN HOVER | ancestor %d %s | %s -> %s | write=%s",
-                        depth, tostring(objectName(node)),
-                        visibilityName(current), visibilityName(now),
-                        tostring(changed)))
-                else
-                    dbg(string.format(
-                        "PIN HOVER | ancestor %d %s is %s",
-                        depth, tostring(objectName(node)),
-                        visibilityName(current)))
-                end
-                node = node:GetParent()
-            end
-        end)
-    end
-end
-
 -- WHERE THE POSITIONS ACTUALLY ARE
 --
 -- The canvas slot read 0,0 for every widget including the cursor, and so did
@@ -2146,7 +1974,6 @@ end
 -- across a map is positioned by render translation, not by its slot.
 -- UWidget::RenderTransform is a plain property, so this is a field read with no
 -- UFunction call behind it.
-local PIN_TRANSLATION_TOLERANCE = 60.0
 
 local function widgetTranslation(widget)
     if not isValid(widget) then return nil end
@@ -2157,128 +1984,6 @@ local function widgetTranslation(widget)
     end)
     if at == nil or at.X == nil or at.Y == nil then return nil end
     return at
-end
-
--- The pin whose icon sits closest to the cursor. The screen's own box does not
--- move onto pins -- that selection lives in its Blueprint and is not reachable
--- -- so this reproduces only the decision, not the highlight.
-local function nearestPinByTranslation(item)
-    local cursorAt = nil
-    pcall(function() cursorAt = widgetTranslation(item.CursorWidget) end)
-    if cursorAt == nil then
-        return nil, "the map cursor has no readable render translation"
-    end
-
-    local placed = placedPinIcons(item)
-    if #placed == 0 then return nil, "no placed pin icon on this screen" end
-
-    local best, bestDistance = nil, nil
-    local report = {}
-    for _, entry in ipairs(placed) do
-        local at = widgetTranslation(entry.icon)
-        if at ~= nil then
-            local dx, dy = at.X - cursorAt.X, at.Y - cursorAt.Y
-            local distance = math.sqrt(dx * dx + dy * dy)
-            report[#report + 1] = string.format(
-                "%s@%.0f,%.0f=%.0f", tostring(entry.timestamp),
-                at.X, at.Y, distance)
-            if bestDistance == nil or distance < bestDistance then
-                best, bestDistance = entry, distance
-            end
-        end
-    end
-
-    log(string.format(
-        "PIN HOVER | cursor at %.0f,%.0f | pins [%s]",
-        cursorAt.X, cursorAt.Y, table.concat(report, " ")))
-
-    if best == nil then
-        return nil, "no pin icon has a readable render translation"
-    end
-    if bestDistance > PIN_TRANSLATION_TOLERANCE then
-        return nil, string.format(
-            "nearest pin is %.0f px from the cursor", bestDistance)
-    end
-    return best.timestamp, nil
-end
-
--- Which placed pin icon the mouse is on, asked of the icons themselves.
-local function hoveredPinTimestamp(mapWidget)
-    local item, itemError = resolveMapItemWidget(mapWidget)
-    if item == nil then return nil, tostring(itemError) end
-
-    local placed = placedPinIcons(item)
-    if #placed == 0 then return nil, "no placed pin icon on this screen" end
-
-    local report = {}
-    for _, entry in ipairs(placed) do
-        local hovered = nil
-        pcall(function() hovered = entry.icon:GetIsMouseHover() end)
-        report[#report + 1] = string.format(
-            "%s:%s", tostring(entry.timestamp), tostring(hovered))
-        if hovered == true then
-            log("PIN HOVER | mouse is on pin timestamp=" ..
-                tostring(entry.timestamp))
-            return entry.timestamp, nil
-        end
-    end
-    -- Slate hover never fires for these icons: measured, GetIsMouseHover stays
-    -- false on all of them even once they are Visible and input-enabled, and the
-    -- game never calls GetCanHoverIcon either. Falling back to the cursor's own
-    -- render translation, which is the same decision the screen makes for
-    -- terminals, just made here.
-    local nearest, nearestError = nearestPinByTranslation(item)
-    if nearest ~= nil then return nearest, nil end
-
-    return nil, "no pin hovered [" .. table.concat(report, ", ") ..
-        "] and " .. tostring(nearestError)
-end
-
-local function livePinsInWorld()
-    local gameState, gameStateError = resolveWorldGameState()
-    if gameState == nil then return nil, tostring(gameStateError) end
-
-    local pins = nil
-    local readOk, readError = pcall(function() pins = gameState.MapPins end)
-    if not readOk or pins == nil then
-        return nil, "MapPins is unavailable: " .. tostring(readError)
-    end
-    local count = 0
-    pcall(function() count = #pins end)
-    if count == 0 then return {}, "no map pin is placed" end
-
-    -- Grounding is not done here. It costs a navigation query per pin, and this
-    -- runs on a keypress that repeats -- fifty invocations in ten seconds, in
-    -- the log that exposed it. Only the raw pin data is collected; the height is
-    -- resolved once, for the one pin actually being travelled to.
-    local live = {}
-    for index = 1, count do
-        local pin = nil
-        pcall(function() pin = pins[index] end)
-        if pin ~= nil then
-            local kind, timestamp, raw
-            pcall(function() kind = tonumber(pin.Kind) end)
-            pcall(function() timestamp = tonumber(pin.Timestamp) end)
-            pcall(function()
-                raw = { X = tonumber(pin.Pos.X), Y = tonumber(pin.Pos.Y),
-                        Z = tonumber(pin.Pos.Z) }
-            end)
-            if kind ~= nil and kind ~= 0 and raw ~= nil and raw.X ~= nil then
-                live[#live + 1] = {
-                    index = index,
-                    kind = kind,
-                    timestamp = timestamp,
-                    raw = raw,
-                }
-            end
-        end
-    end
-    if #live == 0 then
-        return {}, string.format(
-            "%d map pin(s) exist but none carry a usable kind and position",
-            count)
-    end
-    return live, nil
 end
 
 local function verifyTeleportMapOpen(serial)
@@ -2334,9 +2039,9 @@ local function verifyTeleportMapOpen(serial)
     teleportMapWidgetKey = objectName(presented[1])
     teleportMapModeActive = true
     log(string.format(
-        "map screen presented | %s | select an eligible icon and confirm",
-        tostring(fragment)))
-    enablePinIconInput(presented[1])
+        "map screen presented | %s | confirm a native destination or press %s at the cursor",
+        tostring(fragment),
+        tostring(CONFIG.CURSOR_TRAVEL_KEY)))
 end
 
 local function activateTeleportMapAbility(serial, contract)
@@ -2389,12 +2094,10 @@ local function activateTeleportMapAbility(serial, contract)
         " | class=" .. contract.mapAbilityClassName ..
         " | trigger=" .. contract.mapAbilityTriggerTagName)
     local scheduled, scheduleError = pcall(function()
-        ExecuteWithDelay(
+        ExecuteInGameThreadWithDelay(
             K.OPEN_VERIFICATION_DELAY_MS,
             function()
-                ExecuteInGameThread(function()
-                    verifyTeleportMapOpen(serial)
-                end)
+                verifyTeleportMapOpen(serial)
             end)
     end)
     if not scheduled then
@@ -2554,12 +2257,17 @@ local function openFastTravelMenu(serial)
     log("fast travel widget constructed | " .. tostring(objectName(widget)))
 
     local scheduled, scheduleError = pcall(function()
-        ExecuteWithDelay(
+        ExecuteInGameThreadWithDelay(
             K.OPEN_VERIFICATION_DELAY_MS,
             function()
-                ExecuteInGameThread(function()
-                    verifyTeleportMapOpen(serial)
-                end)
+                if serial == openSerial and openBusy then
+                    failPendingOpen(
+                        serial,
+                        "EndOpenAnimEvent did not present the fast travel "
+                            .. "screen within " ..
+                            tostring(K.OPEN_VERIFICATION_DELAY_MS) ..
+                            " ms")
+                end
             end)
     end)
     if not scheduled then
@@ -2592,13 +2300,11 @@ local function waitForMainMenuAbilityEnd(
                 tostring(elapsedMs) .. " ms")
         end
 
-        ExecuteWithDelay(K.MENU_TRANSITION_POLL_MS, function()
-            ExecuteInGameThread(function()
-                waitForMainMenuAbilityEnd(
-                    serial,
-                    contract,
-                    elapsedMs + K.MENU_TRANSITION_POLL_MS)
-            end)
+        ExecuteInGameThreadWithDelay(K.MENU_TRANSITION_POLL_MS, function()
+            waitForMainMenuAbilityEnd(
+                serial,
+                contract,
+                elapsedMs + K.MENU_TRANSITION_POLL_MS)
         end)
     end, debug.traceback)
     if not transitionOk then
@@ -2738,10 +2444,8 @@ end
 
 local function scheduleFastTravelOpen(source)
     local scheduled, scheduleError = pcall(function()
-        ExecuteWithDelay(0, function()
-            ExecuteInGameThread(function()
-                requestFastTravelOpen(source)
-            end)
+        ExecuteInGameThreadWithDelay(0, function()
+            requestFastTravelOpen(source)
         end)
     end)
     if not scheduled then
@@ -2843,7 +2547,7 @@ end
 -- teleport into unstreamed World Partition cells is a real possibility and a
 -- silent failure is what cost this mod two sessions.
 local TELEPORT_VERIFY_DELAY_MS = 500
-local TELEPORT_ARRIVAL_TOLERANCE = 1500.0
+local TELEPORT_ARRIVAL_TOLERANCE = 200.0
 
 local function heroLocation()
     local hero, heroError = resolveLocalHero()
@@ -2863,11 +2567,12 @@ local function heroLocation()
     return position, nil
 end
 
-local function planarDistance(a, b)
+local function spatialDistance(a, b)
     if a == nil or b == nil then return nil end
     local dx = a.X - b.X
     local dy = a.Y - b.Y
-    return math.sqrt(dx * dx + dy * dy)
+    local dz = a.Z - b.Z
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
 local function performTeleport(position, label, onArrived)
@@ -2901,32 +2606,30 @@ local function performTeleport(position, label, onArrived)
         position.X, position.Y, position.Z))
 
     local scheduled, scheduleError = pcall(function()
-        ExecuteWithDelay(TELEPORT_VERIFY_DELAY_MS, function()
-            ExecuteInGameThread(function()
-                local after = heroLocation()
-                local distance = planarDistance(after, position)
-                if distance == nil then
-                    log("TELEPORT | " .. label ..
-                        " | arrival unverifiable; hero location unreadable")
-                    return
-                end
-                if distance <= TELEPORT_ARRIVAL_TOLERANCE then
-                    log(string.format(
-                        "TELEPORT | %s | arrived | %.0f cm from target",
-                        label, distance))
-                    if type(onArrived) == "function" then
-                        local callbackOk, callbackError = pcall(onArrived)
-                        if not callbackOk then
-                            log("FAST TRAVEL ERROR | arrival callback failed: " ..
-                                tostring(callbackError))
-                        end
+        ExecuteInGameThreadWithDelay(TELEPORT_VERIFY_DELAY_MS, function()
+            local after = heroLocation()
+            local distance = spatialDistance(after, position)
+            if distance == nil then
+                log("TELEPORT | " .. label ..
+                    " | arrival unverifiable; hero location unreadable")
+                return
+            end
+            if distance <= TELEPORT_ARRIVAL_TOLERANCE then
+                log(string.format(
+                    "TELEPORT | %s | arrived | %.0f cm from target",
+                    label, distance))
+                if type(onArrived) == "function" then
+                    local callbackOk, callbackError = pcall(onArrived)
+                    if not callbackOk then
+                        log("FAST TRAVEL ERROR | arrival callback failed: " ..
+                            tostring(callbackError))
                     end
-                else
-                    log(string.format(
-                        "TELEPORT | %s | DID NOT ARRIVE | %.0f cm from target",
-                        label, distance))
                 end
-            end)
+            else
+                log(string.format(
+                    "TELEPORT | %s | DID NOT ARRIVE | %.0f cm from target",
+                    label, distance))
+            end
         end)
     end)
     if not scheduled then
@@ -2937,269 +2640,414 @@ local function performTeleport(position, label, onArrived)
     return true
 end
 
-local function performPinTeleport(pin, onArrived)
-    if type(pin) ~= "table" or type(pin.index) ~= "number"
-        or type(pin.raw) ~= "table"
-        or type(pin.raw.X) ~= "number"
-        or type(pin.raw.Y) ~= "number"
-        or type(pin.raw.Z) ~= "number" then
-        log("PIN TRAVEL ERROR | pin identity or coordinates are invalid")
+local function performMapCoordinateTeleport(
+    destination, label, onArrived, onFinished
+)
+    local finished = false
+    local function finish(success, reason)
+        if finished then return end
+        finished = true
+        if success ~= true and reason ~= nil then
+            log("CURSOR TRAVEL ERROR | " .. tostring(reason))
+        end
+        if type(onFinished) == "function" then
+            local callbackOk, callbackError =
+                pcall(onFinished, success == true, reason)
+            if not callbackOk then
+                log("CURSOR TRAVEL ERROR | completion callback failed: " ..
+                    tostring(callbackError))
+            end
+        end
+    end
+
+    if type(destination) ~= "table"
+        or type(destination.X) ~= "number"
+        or type(destination.Y) ~= "number"
+        or destination.X ~= destination.X
+        or destination.Y ~= destination.Y then
+        finish(false, "world cursor coordinates are invalid")
         return false
     end
 
     local hero, heroError = resolveLocalHero()
     if hero == nil then
-        log("PIN TRAVEL ERROR | " .. tostring(heroError))
+        finish(false, heroError)
         return false
     end
-    local capsule = nil
-    local capsuleOk, capsuleError =
-        pcall(function() capsule = hero.CapsuleComponent end)
-    if not capsuleOk or not isValid(capsule) then
-        log("PIN TRAVEL ERROR | hero capsule is unavailable: " ..
-            tostring(capsuleError))
-        return false
-    end
-    local halfHeight = nil
-    local heightOk, heightError = pcall(function()
-        halfHeight = tonumber(capsule:GetScaledCapsuleHalfHeight())
-    end)
-    if not heightOk or halfHeight == nil or halfHeight ~= halfHeight
-        or halfHeight <= 0.0 or halfHeight > 1000.0 then
-        log("PIN TRAVEL ERROR | hero capsule half-height is invalid: " ..
-            tostring(heightError or halfHeight))
-        return false
-    end
-
-    local controller, controllerError = resolveLocalController()
-    if controller == nil then
-        log("PIN TRAVEL ERROR | " .. tostring(controllerError))
-        return false
-    end
-    local navigation = StaticFindObject(
-        "/Script/NavigationSystem.Default__NavigationSystemV1")
-    if not isValid(navigation) then
-        log("PIN TRAVEL ERROR | NavigationSystemV1 is unavailable")
-        return false
-    end
-
-    local function projectFinalTarget()
-        local projected = { X = 0.0, Y = 0.0, Z = 0.0 }
-        local callOk, found = pcall(function()
-            return navigation:K2_ProjectPointToNavigation(
-                controller,
-                pin.raw,
-                projected,
-                nil,
-                nil,
-                { X = 500.0, Y = 500.0, Z = 100000.0 })
-        end)
-        local x = tonumber(projected.X)
-        local y = tonumber(projected.Y)
-        local z = tonumber(projected.Z)
-        if not callOk or found ~= true or x == nil or y == nil
-            or z == nil or z == 0.0 then
-            return nil
-        end
-        return {
-            X = x,
-            Y = y,
-            Z = z + halfHeight + 5.0,
-        }
-    end
-
-    local finalTarget = projectFinalTarget()
-    if finalTarget ~= nil then
-        log(string.format(
-            "PIN TARGET | navmesh ready | surface Z=%.1f | capsule target Z=%.1f",
-            finalTarget.Z - halfHeight - 5.0,
-            finalTarget.Z))
-        return performTeleport(finalTarget, "map pin", onArrived)
-    end
-
-    -- The destination cell is not streamed yet. Preserve the working first hop
-    -- used by v0.14.0, but disable character movement before it so the hero
-    -- cannot fall or take damage while the destination navmesh is loading.
-    local gameState, gameStateError = resolveWorldGameState()
-    if gameState == nil then
-        log("PIN TRAVEL ERROR | " .. tostring(gameStateError))
-        return false
-    end
-    local stageHeight = nil
-    local stageDistance = nil
-    local sweepOk, sweepError = pcall(function()
-        local gimmicks = gameState.RODAccessibleGimmicks
-        for index = 1, #gimmicks do
-            local gimmick = gimmicks[index]
-            if isValid(gimmick) then
-                local at = gimmick:K2_GetActorLocation()
-                local x = tonumber(at.X)
-                local y = tonumber(at.Y)
-                local z = tonumber(at.Z)
-                if x ~= nil and y ~= nil and z ~= nil then
-                    local dx = x - pin.raw.X
-                    local dy = y - pin.raw.Y
-                    local distance = math.sqrt(dx * dx + dy * dy)
-                    if stageDistance == nil or distance < stageDistance then
-                        stageHeight = z
-                        stageDistance = distance
-                    end
-                end
-            end
-        end
-    end)
-    if not sweepOk or stageHeight == nil then
-        log("PIN TRAVEL ERROR | staging height unavailable: " ..
-            tostring(sweepError))
-        return false
-    end
-
-    local movement = nil
-    local movementOk, movementError =
-        pcall(function() movement = hero.CharacterMovement end)
-    if not movementOk or not isValid(movement) then
-        log("PIN TRAVEL ERROR | CharacterMovement is unavailable: " ..
-            tostring(movementError))
-        return false
-    end
-    local originalMode = nil
-    local originalCustomMode = nil
-    local modeOk, modeError = pcall(function()
-        originalMode = tonumber(movement.MovementMode)
-        originalCustomMode = tonumber(movement.CustomMovementMode)
-    end)
-    if not modeOk or originalMode == nil or originalCustomMode == nil then
-        log("PIN TRAVEL ERROR | movement mode snapshot failed: " ..
-            tostring(modeError))
-        return false
-    end
-
     local origin, originError = heroLocation()
     if origin == nil then
-        log("PIN TRAVEL ERROR | " .. tostring(originError))
-        return false
-    end
-    local rotation = nil
-    local rotationOk, rotationError = pcall(function()
-        local value = hero:K2_GetActorRotation()
-        rotation = {
-            Pitch = tonumber(value.Pitch),
-            Yaw = tonumber(value.Yaw),
-            Roll = tonumber(value.Roll),
-        }
-    end)
-    if not rotationOk or rotation == nil or rotation.Pitch == nil
-        or rotation.Yaw == nil or rotation.Roll == nil then
-        log("PIN TRAVEL ERROR | rotation snapshot failed: " ..
-            tostring(rotationError))
+        finish(false, originError)
         return false
     end
 
-    local restored = false
-    local function restoreMovement()
-        if restored then return end
-        restored = true
-        local restoreOk, restoreError = pcall(function()
-            movement:SetMovementMode(originalMode, originalCustomMode)
-        end)
-        if not restoreOk then
-            log("PIN TRAVEL ERROR | movement restore failed: " ..
-                tostring(restoreError))
+    local capsule = nil
+    local halfHeight = nil
+    local radius = nil
+    local capsuleOk, capsuleError = pcall(function()
+        capsule = hero.CapsuleComponent
+        if not isValid(capsule) then
+            error("hero capsule is unavailable")
         end
-    end
-
-    local function rollback(reason)
-        local rollbackOk, rollbackError = pcall(function()
-            hero:K2_TeleportTo(origin, rotation)
-        end)
-        restoreMovement()
-        log("PIN TRAVEL ERROR | " .. tostring(reason) ..
-            " | rolled back=" .. tostring(rollbackOk) ..
-            (rollbackOk and "" or " | " .. tostring(rollbackError)))
-    end
-
-    local freezeOk, freezeError = pcall(function()
-        movement:StopMovementImmediately()
-        movement:DisableMovement()
+        halfHeight = tonumber(capsule:GetScaledCapsuleHalfHeight())
+        radius = tonumber(capsule:GetScaledCapsuleRadius())
     end)
-    if not freezeOk then
-        restoreMovement()
-        log("PIN TRAVEL ERROR | movement freeze failed: " ..
-            tostring(freezeError))
+    if not capsuleOk or halfHeight == nil or halfHeight ~= halfHeight
+        or halfHeight <= 0.0 or halfHeight > 1000.0
+        or radius == nil or radius ~= radius
+        or radius <= 0.0 or radius > halfHeight then
+        finish(false, "hero capsule contract failed: " ..
+            tostring(capsuleError or
+                string.format("radius=%s halfHeight=%s",
+                    tostring(radius), tostring(halfHeight))))
         return false
     end
 
-    local stagingTarget = {
-        X = pin.raw.X,
-        Y = pin.raw.Y,
-        Z = stageHeight + 400.0,
+    local gameplayStatics =
+        StaticFindObject("/Script/Engine.Default__GameplayStatics")
+    local sourceActorClass =
+        StaticFindObject("/Script/Engine.TargetPoint")
+    local sourceComponentClass =
+        StaticFindObject(
+            "/Script/Engine.WorldPartitionStreamingSourceComponent")
+    if not isValid(gameplayStatics)
+        or not isValid(sourceActorClass)
+        or not isValid(sourceComponentClass) then
+        finish(false,
+            "World Partition streaming-source contract is unavailable")
+        return false
+    end
+
+    local sourceTransform = {
+        Rotation = { X = 0.0, Y = 0.0, Z = 0.0, W = 1.0 },
+        Translation = {
+            X = destination.X,
+            Y = destination.Y,
+            Z = origin.Z,
+        },
+        Scale3D = { X = 1.0, Y = 1.0, Z = 1.0 },
     }
-    local stagingOk, stagingAccepted = pcall(function()
-        return hero:K2_TeleportTo(stagingTarget, rotation)
-    end)
-    if not stagingOk or stagingAccepted ~= true then
-        rollback("staging teleport rejected: " .. tostring(stagingAccepted))
-        return false
-    end
-    log(string.format(
-        "PIN STAGING | target=(%.1f, %.1f, %.1f) | terminal %.0f cm away | movement frozen",
-        stagingTarget.X,
-        stagingTarget.Y,
-        stagingTarget.Z,
-        stageDistance))
+    local identityTransform = {
+        Rotation = { X = 0.0, Y = 0.0, Z = 0.0, W = 1.0 },
+        Translation = { X = 0.0, Y = 0.0, Z = 0.0 },
+        Scale3D = { X = 1.0, Y = 1.0, Z = 1.0 },
+    }
 
-    local transactionOpenSerial = openSerial
-    local pollCount = 0
-    local pollNavmesh
-    pollNavmesh = function()
-        local scheduleOk, scheduleError = pcall(function()
-            ExecuteWithDelay(100, function()
-                ExecuteInGameThread(function()
-                    local stepOk, stepError = xpcall(function()
-                        if transactionOpenSerial ~= openSerial then
-                            rollback("map closed during pin staging")
-                            return
-                        end
-                        pollCount = pollCount + 1
-                        local settledTarget = projectFinalTarget()
-                        if settledTarget ~= nil then
-                            local started = performTeleport(
-                                settledTarget,
-                                "map pin",
-                                onArrived)
-                            if not started then
-                                rollback("final navmesh teleport rejected")
-                                return
-                            end
-                            restoreMovement()
-                            log(string.format(
-                                "PIN SETTLED | navmesh ready after %d ms | target Z=%.1f",
-                                pollCount * 100,
-                                settledTarget.Z))
-                            return
-                        end
-                        if pollCount >= 50 then
-                            rollback("destination navmesh unavailable after 5000 ms")
-                            return
-                        end
-                        pollNavmesh()
-                    end, debug.traceback)
-                    if not stepOk then
-                        rollback("pin staging callback failed: " ..
-                            tostring(stepError))
-                    end
-                end)
-            end)
+    local sourceActor = nil
+    local sourceComponent = nil
+    local cleaned = false
+    local pollHandle = nil
+    local watchdogHandle = nil
+    local function cancelOwnedAction(handle)
+        if handle == nil then return end
+        local cancelled, cancelError = pcall(function()
+            return CancelDelayedAction(handle)
         end)
-        if not scheduleOk then
-            rollback("pin staging scheduling failed: " ..
-                tostring(scheduleError))
+        if not cancelled then
+            log("CURSOR TRAVEL ERROR | delayed-action cancellation failed: " ..
+                tostring(cancelError))
         end
     end
-    pollNavmesh()
+    local function stopPolling()
+        local handle = pollHandle
+        pollHandle = nil
+        cancelOwnedAction(handle)
+    end
+    local function stopWatchdog()
+        local handle = watchdogHandle
+        watchdogHandle = nil
+        cancelOwnedAction(handle)
+    end
+    local function cleanupSource()
+        if cleaned then return end
+        cleaned = true
+        if isValid(sourceComponent) then
+            pcall(function()
+                sourceComponent:DisableStreamingSource()
+            end)
+        end
+        if isValid(sourceActor) then
+            pcall(function() sourceActor:K2_DestroyActor() end)
+        end
+    end
+    local function abort(reason)
+        stopPolling()
+        stopWatchdog()
+        cleanupSource()
+        finish(false, reason)
+    end
+
+    local sourceOk, sourceError = pcall(function()
+        sourceActor = gameplayStatics:BeginDeferredActorSpawnFromClass(
+            hero,
+            sourceActorClass,
+            sourceTransform,
+            1,
+            hero,
+            1)
+        if not isValid(sourceActor) then
+            error("temporary TargetPoint creation returned null")
+        end
+        local completedActor = gameplayStatics:FinishSpawningActor(
+            sourceActor,
+            sourceTransform,
+            1)
+        if not isValid(completedActor)
+            or objectName(completedActor) ~= objectName(sourceActor) then
+            error("temporary TargetPoint completion failed")
+        end
+        sourceActor = completedActor
+        sourceActor:SetActorHiddenInGame(true)
+        sourceActor:SetActorEnableCollision(false)
+
+        sourceComponent = sourceActor:AddComponentByClass(
+            sourceComponentClass,
+            false,
+            identityTransform,
+            false)
+        if not isValid(sourceComponent) then
+            error("WorldPartitionStreamingSourceComponent creation returned null")
+        end
+        sourceComponent:DisableStreamingSource()
+        sourceComponent.TargetBehavior = 0
+        sourceComponent.Priority = 0
+        sourceComponent.TargetState = 1
+        sourceComponent:EnableStreamingSource()
+        if sourceComponent:IsStreamingSourceEnabled() ~= true then
+            error("World Partition streaming source did not enable")
+        end
+    end)
+    if not sourceOk then
+        abort("streaming source creation failed: " .. tostring(sourceError))
+        return false
+    end
+
+    log(string.format(
+        "CURSOR PRELOAD | worldXY=(%.1f, %.1f) | source=%s | player not moved",
+        destination.X,
+        destination.Y,
+        tostring(objectName(sourceActor))))
+
+    local transactionSerial = openSerial
+    local pollCount = 0
+    local stableReadyCount = 0
+    local lastReadyTarget = nil
+    local lastProbeError = "destination cell has not activated yet"
+
+    -- Navmesh is an AI pathfinding product, not the authoritative geometry
+    -- beneath the player. Some valid solid surfaces never expose navmesh, while
+    -- a streamed navmesh does not prove that the complete player capsule is
+    -- supported. The canonical landing contract is therefore physical:
+    --
+    --   * WorldStatic must answer beneath the centre and eight samples spanning
+    --     the real scaled capsule footprint;
+    --   * all samples must stay on one locally coherent surface;
+    --   * two consecutive probes must agree;
+    --   * K2_TeleportTo must finally accept the capsule without encroachment.
+    --
+    -- A missing sample is an edge, void, water-only area, or unloaded collision
+    -- cell. There is no substitute destination and the player never moves.
+    local function probeDestination()
+        local floorLibrary = StaticFindObject(
+            "/Script/ROD.Default__ROD_BlueprintFunctionLibrary")
+        if not isValid(floorLibrary) then
+            return nil, "WorldStatic floor-validation contract is unavailable"
+        end
+
+        local footprintRadius = radius * 0.70
+        local diagonal = footprintRadius * 0.70710678118655
+        local samples = {
+            { X = 0.0, Y = 0.0 },
+            { X = footprintRadius, Y = 0.0 },
+            { X = -footprintRadius, Y = 0.0 },
+            { X = 0.0, Y = footprintRadius },
+            { X = 0.0, Y = -footprintRadius },
+            { X = diagonal, Y = diagonal },
+            { X = diagonal, Y = -diagonal },
+            { X = -diagonal, Y = diagonal },
+            { X = -diagonal, Y = -diagonal },
+        }
+        local floorMinZ = nil
+        local floorMaxZ = nil
+        for index, offset in ipairs(samples) do
+            local sampleX = destination.X + offset.X
+            local sampleY = destination.Y + offset.Y
+            local tracedFloor = { X = 0.0, Y = 0.0, Z = 0.0 }
+            local floorOk, floorFound = pcall(function()
+                return floorLibrary:GetZLineTraceLoc(
+                    tracedFloor,
+                    hero,
+                    {
+                        X = sampleX,
+                        Y = sampleY,
+                        Z = origin.Z + 50000.0,
+                    },
+                    100000.0,
+                    0)
+            end)
+            local floorX = tonumber(tracedFloor.X)
+            local floorY = tonumber(tracedFloor.Y)
+            local floorZ = tonumber(tracedFloor.Z)
+            if not floorOk or floorFound ~= true
+                or floorX == nil or floorY == nil or floorZ == nil
+                or floorX ~= floorX or floorY ~= floorY or floorZ ~= floorZ then
+                return nil, string.format(
+                    "WorldStatic does not support capsule sample %d/9",
+                    index)
+            end
+            local horizontalError = math.sqrt(
+                (floorX - sampleX) * (floorX - sampleX)
+                    + (floorY - sampleY) * (floorY - sampleY))
+            if horizontalError > 25.0 then
+                return nil, string.format(
+                    "WorldStatic sample %d moved %.0f cm from its trace",
+                    index, horizontalError)
+            end
+            floorMinZ = floorMinZ == nil
+                and floorZ or math.min(floorMinZ, floorZ)
+            floorMaxZ = floorMaxZ == nil
+                and floorZ or math.max(floorMaxZ, floorZ)
+        end
+
+        local floorSpread = floorMaxZ - floorMinZ
+        local maximumSpread = math.max(40.0, radius * 1.5)
+        if floorSpread > maximumSpread then
+            return nil, string.format(
+                "WorldStatic varies %.0f cm beneath the %.0f cm capsule radius",
+                floorSpread, radius)
+        end
+
+        return {
+            position = {
+                X = destination.X,
+                Y = destination.Y,
+                Z = floorMaxZ + halfHeight + 5.0,
+            },
+            floorMinZ = floorMinZ,
+            floorMaxZ = floorMaxZ,
+            floorSpread = floorSpread,
+            sampleCount = #samples,
+        }, nil
+    end
+
+    local function teleportValidatedTarget(validated)
+        stopPolling()
+        local target = validated.position
+        log(string.format(
+            "CURSOR SAFE | WorldStatic footprint=%d/9 | floorZ=%.1f..%.1f "
+                .. "| spread=%.1f | capsule r=%.1f hh=%.1f | targetZ=%.1f",
+            validated.sampleCount,
+            validated.floorMinZ,
+            validated.floorMaxZ,
+            validated.floorSpread,
+            radius,
+            halfHeight,
+            target.Z))
+
+        local arrived = false
+        local moveStarted = performTeleport(target, label, function()
+            arrived = true
+            stopWatchdog()
+            if type(onArrived) == "function" then
+                local callbackOk, callbackError = pcall(onArrived)
+                if not callbackOk then
+                    log("CURSOR TRAVEL ERROR | arrival callback failed: " ..
+                        tostring(callbackError))
+                end
+            end
+            finish(true, nil)
+            ExecuteInGameThreadWithDelay(750, cleanupSource)
+        end)
+        if not moveStarted then
+            abort("K2_TeleportTo rejected the validated destination")
+            return
+        end
+
+        local watchdogOk, watchdogError = pcall(function()
+            watchdogHandle = ExecuteInGameThreadWithDelay(2500, function()
+                watchdogHandle = nil
+                if arrived or finished then return end
+                abort("arrival verification did not confirm the destination")
+            end)
+            if type(watchdogHandle) ~= "number" then
+                error("arrival watchdog returned no action handle")
+            end
+        end)
+        if not watchdogOk then
+            abort("arrival watchdog scheduling failed: " ..
+                tostring(watchdogError))
+        end
+    end
+
+    local scheduleOk, handleOrError = pcall(function()
+        return LoopInGameThreadWithDelay(100, function()
+            local stepOk, stepError = xpcall(function()
+                if finished then
+                    stopPolling()
+                    return
+                end
+                if transactionSerial ~= openSerial
+                    or not teleportMapModeActive then
+                    abort("map closed while destination was loading")
+                    return
+                end
+                if not isValid(sourceActor)
+                    or not isValid(sourceComponent) then
+                    abort("streaming source became invalid")
+                    return
+                end
+
+                pollCount = pollCount + 1
+                local validated, probeError = probeDestination()
+                if validated ~= nil then
+                    local target = validated.position
+                    local stable = lastReadyTarget ~= nil
+                        and math.abs(target.X - lastReadyTarget.X) <= 25.0
+                        and math.abs(target.Y - lastReadyTarget.Y) <= 25.0
+                        and math.abs(target.Z - lastReadyTarget.Z) <= 25.0
+                    if stable then
+                        stableReadyCount = stableReadyCount + 1
+                    else
+                        stableReadyCount = 1
+                    end
+                    lastReadyTarget = {
+                        X = target.X,
+                        Y = target.Y,
+                        Z = target.Z,
+                    }
+                    lastProbeError = nil
+                else
+                    stableReadyCount = 0
+                    lastReadyTarget = nil
+                    lastProbeError = tostring(probeError)
+                end
+                if stableReadyCount >= 2 then
+                    log(string.format(
+                        "CURSOR PRELOAD | destination collision ready after %d ms",
+                        pollCount * 100))
+                    teleportValidatedTarget(validated)
+                    return
+                end
+                if pollCount >= 100 then
+                    abort("destination did not expose a stable "
+                        .. "WorldStatic capsule footprint within "
+                        .. "10000 ms | "
+                        .. tostring(lastProbeError))
+                end
+            end, debug.traceback)
+            if not stepOk then
+                abort("streaming callback failed: " ..
+                    tostring(stepError))
+            end
+        end)
+    end)
+    if not scheduleOk or type(handleOrError) ~= "number" then
+        abort("streaming loop scheduling failed: " ..
+            tostring(handleOrError))
+        return false
+    end
+    pollHandle = handleOrError
     return true
 end
-
 local function finalizeMapTeleport(source)
     local finalizeOk, finalizeError = xpcall(function()
         restorePlayableCamera(source)
@@ -3207,6 +3055,7 @@ local function finalizeMapTeleport(source)
 
     teleportMapModeActive = false
     mapTeleportBusy = false
+    cursorTravelBusy = false
     mapIconDestinations = {}
     openBusy = false
     teleportMapWidgetKey = nil
@@ -3275,10 +3124,8 @@ local function requestSelectedMapTeleport(mapWidget, source)
     end
 
     local scheduled, scheduleError = pcall(function()
-        ExecuteWithDelay(K.TELEPORT_FINALIZE_DELAY_MS, function()
-            ExecuteInGameThread(function()
-                finalizeMapTeleport(source)
-            end)
+        ExecuteInGameThreadWithDelay(K.TELEPORT_FINALIZE_DELAY_MS, function()
+            finalizeMapTeleport(source)
         end)
     end)
     if not scheduled then
@@ -3441,10 +3288,8 @@ local function dismissFastTravelScreen()
     end
 
     local scheduled, scheduleError = pcall(function()
-        ExecuteWithDelay(K.TELEPORT_FINALIZE_DELAY_MS, function()
-            ExecuteInGameThread(function()
-                finalizeMapTeleport("fast travel map")
-            end)
+        ExecuteInGameThreadWithDelay(K.TELEPORT_FINALIZE_DELAY_MS, function()
+            finalizeMapTeleport("fast travel map")
         end)
     end)
     if not scheduled then
@@ -3472,6 +3317,7 @@ local function forceCloseMapScreen(source)
     teleportMapWidget = nil
     teleportMapWidgetKey = nil
     mapTeleportBusy = false
+    cursorTravelBusy = false
     openBusy = false
     mapIconDestinations = {}
     openSerial = openSerial + 1
@@ -3544,10 +3390,8 @@ local function interceptMapTeleport(
     mapTeleportBusy = true
 
     local scheduled, scheduleError = pcall(function()
-        ExecuteWithDelay(0, function()
-            ExecuteInGameThread(function()
-                requestSelectedMapTeleport(mapWidget, source)
-            end)
+        ExecuteInGameThreadWithDelay(0, function()
+            requestSelectedMapTeleport(mapWidget, source)
         end)
     end)
     if not scheduled then
@@ -3621,24 +3465,22 @@ local function closeMainMenuFromFastTravel()
     if menuCloseBusy then return end
     menuCloseBusy = true
 
-    ExecuteWithDelay(0, function()
-        ExecuteInGameThread(function()
-            local controller, controllerError = resolveLocalController()
-            local rodLibrary, libraryError = resolveRodWidgetLibrary()
-            if controller == nil or rodLibrary == nil then
-                menuCloseBusy = false
-                failCurrentMenu(controllerError or libraryError)
-                return
-            end
-            local closed, closeError = pcall(function()
-                rodLibrary:EndMenu(controller)
-            end)
-            if not closed then
-                menuCloseBusy = false
-                failCurrentMenu("Start Menu close failed: " ..
-                    tostring(closeError))
-            end
+    ExecuteInGameThreadWithDelay(0, function()
+        local controller, controllerError = resolveLocalController()
+        local rodLibrary, libraryError = resolveRodWidgetLibrary()
+        if controller == nil or rodLibrary == nil then
+            menuCloseBusy = false
+            failCurrentMenu(controllerError or libraryError)
+            return
+        end
+        local closed, closeError = pcall(function()
+            rodLibrary:EndMenu(controller)
         end)
+        if not closed then
+            menuCloseBusy = false
+            failCurrentMenu("Start Menu close failed: " ..
+                tostring(closeError))
+        end
     end)
 end
 
@@ -3931,12 +3773,15 @@ optionalHook(
     end
 )
 
-optionalHook(
+requireHook(
     "/Script/ROD.RODFastTravelMenuWidget:EndOpenAnimEvent",
-    function(selfParameter)
+    guardedHookCallback("fast-travel open animation", function(selfParameter)
         log("FT MAP | open animation finished | widget=" ..
             tostring(objectName(hookValue(selfParameter))))
-    end
+        if openBusy then
+            verifyTeleportMapOpen(openSerial)
+        end
+    end)
 )
 
 optionalHook(
@@ -3954,90 +3799,27 @@ optionalHook(
         -- Only the mod's own screen is taken over; a real terminal keeps its
         -- native transaction.
         if not teleportMapModeActive then return end
-        -- "None" is the screen telling us it could not decide a destination.
-        -- It is what the city map produces: RODAccessibleGimmicks there holds
-        -- the two gimmicks of the town world, not the floor's terminals, so
-        -- there is nothing on that map this can travel to. Refused once, quietly,
-        -- instead of three failed lookups.
-        -- ID=None is either a confirmed pin (which has no terminal ID) or the
-        -- town map, which has no terminals to decide on at all. The focused
-        -- widget tells the two apart.
         if id == "None" then
-            if nativeDecisionBusy then return end
-            nativeDecisionBusy = true
-            ExecuteWithDelay(NATIVE_DECISION_COOLDOWN_MS, function()
-                nativeDecisionBusy = false
-            end)
-            ExecuteWithDelay(0, function()
-                ExecuteInGameThread(function()
-                    -- The hovered pin is asked of the icons through
-                    -- URODInputWidgetBase::GetIsMouseHover, which is where the
-                    -- game keeps hover. Coordinates were the wrong question.
-                    local livePins, livePinsError = livePinsInWorld()
-                    if livePins ~= nil and #livePins > 0 then
-                        local chosen = nil
-                        local hovered, hoverError =
-                            hoveredPinTimestamp(teleportMapWidget)
-                        if hovered ~= nil then
-                            for _, entry in ipairs(livePins) do
-                                if entry.timestamp == hovered then
-                                    chosen = entry
-                                    break
-                                end
-                            end
-                        end
-                        -- With a single pin placed there is nothing to
-                        -- disambiguate, so hover is not required for it.
-                        if chosen == nil and #livePins == 1 then
-                            chosen = livePins[1]
-                            log("FAST TRAVEL | no pin hovered (" ..
-                                tostring(hoverError) ..
-                                "); one pin is placed, taking it")
-                        end
-                        if chosen ~= nil then
-                            log(string.format(
-                                "MOD TELEPORT | map pin %d | EMapPinKind=%s | timestamp=%s",
-                                chosen.index, tostring(chosen.kind),
-                                tostring(chosen.timestamp)))
-                            performPinTeleport(chosen, function()
-                                dismissFastTravelScreen()
-                            end)
-                            return
-                        end
-                        log(string.format(
-                            "FAST TRAVEL | %d pins placed, none hovered | %s",
-                            #livePins, tostring(hoverError)))
-                        return
-                    end
-                    if livePinsError ~= nil then
-                        log("FAST TRAVEL | map pins unavailable: " ..
-                            tostring(livePinsError))
-                    end
-
-                    log("FAST TRAVEL | no destination decided (ID=None)"
-                        .. " and no map pin is placed here.")
-                    return
-                end)
-            end)
+            log("FT MAP | no native terminal destination; " ..
+                tostring(CONFIG.CURSOR_TRAVEL_KEY) ..
+                " teleports to the map cursor")
             return
         end
         -- One confirm produces three of these about 200 ms apart. The gate is
         -- set here, synchronously, so the second and third never queue work.
         if nativeDecisionBusy then return end
         nativeDecisionBusy = true
-        ExecuteWithDelay(NATIVE_DECISION_COOLDOWN_MS, function()
+        ExecuteInGameThreadWithDelay(NATIVE_DECISION_COOLDOWN_MS, function()
             nativeDecisionBusy = false
         end)
 
-        ExecuteWithDelay(0, function()
-            ExecuteInGameThread(function()
-                local ok, handlerError =
-                    xpcall(handleNativeFastTravelDecision, debug.traceback, id)
-                if not ok then
-                    log("FAST TRAVEL ERROR | decision handling failed: " ..
-                        tostring(handlerError))
-                end
-            end)
+        ExecuteInGameThreadWithDelay(0, function()
+            local ok, handlerError =
+                xpcall(handleNativeFastTravelDecision, debug.traceback, id)
+            if not ok then
+                log("FAST TRAVEL ERROR | decision handling failed: " ..
+                    tostring(handlerError))
+            end
         end)
     end
 )
@@ -4124,6 +3906,7 @@ requireHook(
         openBusy = false
         teleportMapModeActive = false
         mapTeleportBusy = false
+        cursorTravelBusy = false
         mapIconDestinations = {}
         openSerial = openSerial + 1
         teleportMapWidgetKey = nil
@@ -4144,6 +3927,7 @@ requireHook(
             openBusy = false
             teleportMapModeActive = false
             mapTeleportBusy = false
+            cursorTravelBusy = false
             mapIconDestinations = {}
             openSerial = openSerial + 1
             pendingMapAbility = nil
@@ -4161,7 +3945,6 @@ for _, notification in ipairs({
 }) do
     local notifyOk, notifyError = pcall(function()
         NotifyOnNewObject(notification.class, function(widget)
-            if buildingStringCompanion then return end
             local fragment = mapScreenFragment(widget)
             if fragment ~= nil then
                 teleportMapWidgetKey = objectName(widget)
@@ -4193,18 +3976,16 @@ local notifyMainMenuOk, notifyMainMenuError = pcall(function()
             end
             pendingInjectionKeys[menuKey] = true
 
-            ExecuteWithDelay(K.MENU_INJECTION_DELAY_MS, function()
+            ExecuteInGameThreadWithDelay(K.MENU_INJECTION_DELAY_MS, function()
                 pendingInjectionKeys[menuKey] = nil
-                ExecuteInGameThread(function()
-                    local resolved, resolveError =
-                        resolveConstructedMainMenu(menuKey)
-                    if resolved == nil then
-                        log("Start Menu injection failed closed: " ..
-                            tostring(resolveError))
-                        return
-                    end
-                    injectFastTravelEntry(resolved)
-                end)
+                local resolved, resolveError =
+                    resolveConstructedMainMenu(menuKey)
+                if resolved == nil then
+                    log("Start Menu injection failed closed: " ..
+                        tostring(resolveError))
+                    return
+                end
+                injectFastTravelEntry(resolved)
             end)
         end
     )
@@ -4379,7 +4160,11 @@ local commandOk, commandError = pcall(function()
                                 Z = tonumber(position.Z),
                             },
                         }
-                        if not performPinTeleport(entry, nil) then
+                        if not performMapCoordinateTeleport(
+                            entry.raw,
+                            "map pin " .. tostring(index),
+                            nil,
+                            nil) then
                             error("pin teleport transaction was rejected")
                         end
                     end, debug.traceback)
@@ -4519,66 +4304,178 @@ bindKey(CONFIG.FORCE_CLOSE_KEY, "force close map", function()
     forceCloseMapScreen("keybind")
 end)
 
--- WHY PIN TRAVEL NEEDS ITS OWN KEY
---
--- "Confirmar" is greyed out unless the cursor is on a destination the screen
--- accepts, and it accepts only safe areas and teleport terminals. Over a pin the
--- button is dead, so ServerDecideFastTravel never fires and there is no confirm
--- to intercept. Detecting the pin correctly changes nothing while the trigger
--- itself cannot happen.
---
--- This key is that trigger. It only acts while the mod's own screen is open.
-local pinTravelBusy = false
-
-bindKey(CONFIG.PIN_TRAVEL_KEY, "travel to pin under cursor", function()
-    -- A held key repeats several times a second. Without this the last attempt
-    -- fired fifty times in ten seconds, each running navigation queries.
-    if pinTravelBusy then return end
+-- F9 is the canonical "Anywhere" action. The cursor and the player icon share
+-- the field map's render coordinate system. RODInGameUIManager supplies the
+-- game's world-to-map rotation, and FieldMapDistancePerPixel supplies its live
+-- zoom. Inverting that measured transform yields the world XY below the cursor
+-- without requiring a pin or choosing a nearby terminal.
+bindKey(CONFIG.CURSOR_TRAVEL_KEY, "travel to map cursor", function()
+    if cursorTravelBusy then return end
 
     if not teleportMapModeActive or not isValid(teleportMapWidget) then
-        log("PIN TRAVEL | the fast travel map is not open")
         return
     end
 
-    local livePins, livePinsError = livePinsInWorld()
-    if livePins == nil or #livePins == 0 then
-        log("PIN TRAVEL | " .. tostring(livePinsError or "no map pin is placed"))
+    local item, itemError = resolveMapItemWidget(teleportMapWidget)
+    if item == nil then
+        log("CURSOR TRAVEL ERROR | " .. tostring(itemError))
         return
     end
 
-    local chosen = nil
-    if #livePins == 1 then
-        chosen = livePins[1]
-    else
-        local item, itemError = resolveMapItemWidget(teleportMapWidget)
-        if item == nil then
-            log("PIN TRAVEL | " .. tostring(itemError))
-            return
-        end
-        local timestamp, nearestError = nearestPinByTranslation(item)
-        if timestamp == nil then
-            log("PIN TRAVEL | " .. tostring(nearestError) ..
-                " | move the cursor onto a pin")
-            return
-        end
-        for _, entry in ipairs(livePins) do
-            if entry.timestamp == timestamp then chosen = entry end
-        end
-        if chosen == nil then
-            log("PIN TRAVEL | the nearest icon matches no placed pin")
-            return
-        end
+    local heroPosition, heroError = heroLocation()
+    if heroPosition == nil then
+        log("CURSOR TRAVEL ERROR | " .. tostring(heroError))
+        return
     end
 
-    pinTravelBusy = true
-    ExecuteWithDelay(6500, function() pinTravelBusy = false end)
+    local playerIcon = nil
+    local cursorWidget = nil
+    local distancePerPixel = nil
+    local imageAngle = nil
+    local mapImageSize = nil
+    local uiManager = nil
+    local contractOk, contractError = pcall(function()
+        playerIcon = item.PlayerIconWidget
+        cursorWidget = item.CursorWidget
+        distancePerPixel = tonumber(item.FieldMapDistancePerPixel)
+        imageAngle = tonumber(item.ImageAngle)
+        mapImageSize = tonumber(item.MapImageSize)
+        uiManager = weakObject(teleportMapWidget.UIManagerRef)
+    end)
+    if not contractOk
+        or not isValid(playerIcon)
+        or not isValid(cursorWidget)
+        or not isValid(uiManager)
+        or distancePerPixel == nil
+        or distancePerPixel ~= distancePerPixel
+        or distancePerPixel <= 0.0
+        or imageAngle == nil
+        or imageAngle ~= imageAngle
+        or mapImageSize == nil
+        or mapImageSize <= 0.0 then
+        log("CURSOR TRAVEL ERROR | field-map transform is unavailable: " ..
+            tostring(contractError))
+        return
+    end
+
+    local playerAt = widgetTranslation(playerIcon)
+    local cursorAt = widgetTranslation(cursorWidget)
+    if playerAt == nil or cursorAt == nil then
+        log("CURSOR TRAVEL ERROR | player/cursor render translation is unreadable")
+        return
+    end
+
+    -- ConvertMapLocation is used at neutral scale so it contributes only the
+    -- game's axis swap and rotation. The widget's measured cm-per-pixel then
+    -- supplies the current scale. Inverting the resulting 2x2 matrix converts
+    -- the player-to-cursor screen delta back to a world delta.
+    local convertedOrigin = nil
+    local convertedX = nil
+    local convertedY = nil
+    local conversionOk, conversionError = pcall(function()
+        local zero = { X = 0.0, Y = 0.0, Z = 0.0 }
+        convertedOrigin = uiManager:ConvertMapLocation(
+            zero, zero, imageAngle, 1.0)
+        convertedX = uiManager:ConvertMapLocation(
+            { X = 1.0, Y = 0.0, Z = 0.0 },
+            zero,
+            imageAngle,
+            1.0)
+        convertedY = uiManager:ConvertMapLocation(
+            { X = 0.0, Y = 1.0, Z = 0.0 },
+            zero,
+            imageAngle,
+            1.0)
+    end)
+    if not conversionOk
+        or convertedOrigin == nil
+        or convertedX == nil
+        or convertedY == nil then
+        log("CURSOR TRAVEL ERROR | native map conversion failed: " ..
+            tostring(conversionError))
+        return
+    end
+
+    local originX = tonumber(convertedOrigin.X)
+    local originY = tonumber(convertedOrigin.Y)
+    local basisXX = tonumber(convertedX.X)
+    local basisXY = tonumber(convertedX.Y)
+    local basisYX = tonumber(convertedY.X)
+    local basisYY = tonumber(convertedY.Y)
+    if originX == nil or originY == nil
+        or basisXX == nil or basisXY == nil
+        or basisYX == nil or basisYY == nil then
+        log("CURSOR TRAVEL ERROR | native map conversion is non-numeric")
+        return
+    end
+    local m11 = (basisXX - originX) / distancePerPixel
+    local m21 = (basisXY - originY) / distancePerPixel
+    local m12 = (basisYX - originX) / distancePerPixel
+    local m22 = (basisYY - originY) / distancePerPixel
+    local determinant = m11 * m22 - m12 * m21
+    if determinant ~= determinant or math.abs(determinant) < 0.000000001 then
+        log("CURSOR TRAVEL ERROR | native map transform is singular")
+        return
+    end
+
+    local screenDeltaX = playerAt.X - cursorAt.X
+    local screenDeltaY = playerAt.Y - cursorAt.Y
+    local playerMinusCursorX =
+        (screenDeltaX * m22 - m12 * screenDeltaY) / determinant
+    local playerMinusCursorY =
+        (m11 * screenDeltaY - screenDeltaX * m21) / determinant
+    local destination = {
+        X = heroPosition.X - playerMinusCursorX,
+        Y = heroPosition.Y - playerMinusCursorY,
+    }
+    local worldDx = destination.X - heroPosition.X
+    local worldDy = destination.Y - heroPosition.Y
+    local worldDistance = math.sqrt(worldDx * worldDx + worldDy * worldDy)
+    local mapWorldDiameter = mapImageSize * distancePerPixel
+    if destination.X ~= destination.X
+        or destination.Y ~= destination.Y
+        or worldDistance > mapWorldDiameter * 1.5 then
+        log(string.format(
+            "CURSOR TRAVEL ERROR | converted cursor is outside the field map | distance=%.0f limit=%.0f",
+            worldDistance,
+            mapWorldDiameter * 1.5))
+        return
+    end
 
     log(string.format(
-        "PIN TRAVEL | pin %d | EMapPinKind=%s | timestamp=%s",
-        chosen.index, tostring(chosen.kind), tostring(chosen.timestamp)))
-    performPinTeleport(chosen, function()
-        dismissFastTravelScreen()
-    end)
+        "CURSOR TRAVEL | cursor=(%.1f, %.1f) | playerIcon=(%.1f, %.1f) | worldXY=(%.1f, %.1f) | cmPerPixel=%.3f | angle=%.3f",
+        cursorAt.X,
+        cursorAt.Y,
+        playerAt.X,
+        playerAt.Y,
+        destination.X,
+        destination.Y,
+        distancePerPixel,
+        imageAngle))
+
+    cursorTravelBusy = true
+    local cursorTransactionSerial = openSerial
+    local started = performMapCoordinateTeleport(
+        destination,
+        "map cursor",
+        function()
+            dismissFastTravelScreen()
+        end,
+        function(success)
+            -- A successful operation stays latched until the map's own close
+            -- lifecycle resets it. This prevents the physical F9 press that
+            -- initiated the teleport from repeating into a second destination
+            -- during the close animation.
+            if success == true then return end
+            ExecuteInGameThreadWithDelay(500, function()
+                if openSerial == cursorTransactionSerial then
+                    cursorTravelBusy = false
+                end
+            end)
+        end)
+    if not started then
+        dbg("cursor travel request rejected before asynchronous loading")
+    end
 end)
 
 do
@@ -4592,6 +4489,7 @@ do
                 openBusy = false
                 teleportMapModeActive = false
                 mapTeleportBusy = false
+                cursorTravelBusy = false
                 mapIconDestinations = {}
                 teleportMapWidgetKey = nil
                 teleportMapWidget = nil
@@ -4621,6 +4519,7 @@ do
             openBusy = false
             teleportMapModeActive = false
             mapTeleportBusy = false
+            cursorTravelBusy = false
             mapIconDestinations = {}
             teleportMapWidgetKey = nil
             teleportMapWidget = nil
@@ -4640,16 +4539,14 @@ do
 end
 
 local startupCleanupOk, startupCleanupError = pcall(function()
-    ExecuteWithDelay(500, function()
-        ExecuteInGameThread(function()
-            local cleanupOk, cleanupError = xpcall(function()
-                recoverCompletedNativeTravel("mod startup")
-            end, debug.traceback)
-            if not cleanupOk then
-                dbg("startup native travel cleanup skipped: " ..
-                    tostring(cleanupError))
-            end
-        end)
+    ExecuteInGameThreadWithDelay(500, function()
+        local cleanupOk, cleanupError = xpcall(function()
+            recoverCompletedNativeTravel("mod startup")
+        end, debug.traceback)
+        if not cleanupOk then
+            dbg("startup native travel cleanup skipped: " ..
+                tostring(cleanupError))
+        end
     end)
 end)
 if not startupCleanupOk then

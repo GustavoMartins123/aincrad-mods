@@ -1,4 +1,4 @@
--- ModMenu v1.5.5
+-- ModMenu v1.5.6
 -- Adds a native-styled "Mods" entry to Echoes of Aincrad's start menu, opening a
 -- panel that enables/disables the other mods and retunes their values in-game.
 --
@@ -12,7 +12,7 @@
 -- mod's Lua state, because UE4SS gives each mod its own.
 
 local MOD_NAME = "ModMenu"
-local MOD_VERSION = "v1.5.5"
+local MOD_VERSION = "v1.5.6"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -736,16 +736,6 @@ local function injectModsEntry(mainMenu)
     -- Another mod may have injected between the count above and the attach.
     pcall(refreshRailPosition, activeContext)
 
-    -- The native open animation can repaint the final authored row, so reapply
-    -- the Mods brush once it settles.
-    local function guardIcon()
-        ExecuteInGameThread(function()
-            if activeContext == nil or activeContext.icon ~= icon then return end
-            enforceIconLetter(activeContext)
-        end)
-    end
-    ExecuteWithDelay(250, guardIcon)
-    ExecuteWithDelay(850, guardIcon)
 end
 
 --========================================================--
@@ -1263,9 +1253,19 @@ local notifyOk, notifyError = pcall(function()
             ) then
                 return
             end
+            local menuKey = objectName(mainMenu)
+            if activeContext ~= nil
+                and activeContext.mainMenuKey ~= menuKey then
+                -- A new widget tree is authoritative. Drop every reference to
+                -- the previous tree synchronously, before its first FocusEvent
+                -- can reach the hooks installed by an earlier menu.
+                activeContext = nil
+                listFocusIndexes = {}
+                pendingFocusRedirects = {}
+            end
             -- Do not capture the UObject in delayed work. Only its primitive
             -- identity crosses the readiness delay.
-            queueMenuInjection(objectName(mainMenu))
+            queueMenuInjection(menuKey)
         end
     )
 end)
@@ -1315,16 +1315,22 @@ ensureInputHooks = function()
         function(self, widgetParameter)
             local context = activeContext
             local listKey = objectName(unwrap(self))
+            if listKey == nil then return end
+
+            -- activeContext belongs to the exact list that received the Mods
+            -- row. A newly constructed Start Menu can emit FocusEvent before
+            -- the delayed acquisition cycle replaces the previous context.
+            -- Touching that previous widget tree is a native use-after-free;
+            -- reject the foreign list before dereferencing any stored UObject.
+            if context == nil or listKey ~= context.listKey then
+                pendingFocusRedirects[listKey] = nil
+                return
+            end
 
             -- Cheap: a walk over a handful of children. Catches a mod that
             -- injected its row after this one did.
-            if context ~= nil and not panel.isOpen() then
+            if not panel.isOpen() then
                 pcall(refreshRailPosition, context)
-            end
-
-            if context == nil then
-                pendingFocusRedirects[listKey] = nil
-                return
             end
 
             -- While the panel is up, watch and report — never correct.

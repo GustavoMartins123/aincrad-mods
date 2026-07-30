@@ -46,34 +46,26 @@ extras are destroyed when a live configuration is rejected.
 
 The director listens for `RODEnemyCharacter` construction and pool reuse. For
 each eligible natural enemy, it creates up to `SPAWN_MULTIPLIER - 1` actors
-through the game's own `RODGameState.RODSpawnActor` population path. The exact
-`FRODSpawnActorOption` enables the Behavior Tree, keeps perception active, sets
-the source enemy's level, selects the ordinary `Prowl` initial state, and uses
-the chosen NavMesh point as `InitialStateLoc`.
+through `GameplayStatics::BeginDeferredActorSpawnFromClass` and
+`FinishSpawningActor`. The destination is first accepted by the live navigation
+system and lifted above the surface for capsule placement. Creation is deferred
+while World Partition reports incomplete streaming.
 
-Before that call, the director tests up to 12 points distributed in a
-golden-angle spiral through
-`NavigationSystemV1.FindPathToLocationSynchronously`. Exactly one candidate is
-tested per director cycle, bounding synchronous NavMesh work even when the
-multiplier and active-extra cap are high. Only a valid, non-partial
-`UNavigationPath` is accepted; the UE4SS bridge's zero path-length value is not
-used as a second reachability contract. The point must also remain at least 50-150 cm from
-natural and already issued enemies, depending on the configured radius. A
-request returns to the queue while untested candidates remain. The source
-enemy is resolved by exact object identity and supplied as both the native
-owner and instigator. The director calls the exact `RODSpawnActor` declaration
-from the supplied game header through
-`RODGameState:CallFunction(RODGameState.RODSpawnActor, ...)`. The UFunction is
-obtained from and bound to the current `RODGameState`, then released with that
-world reference during travel. Direct invocation through the UFunction Lua
-`__call` metamethod is not used: on UE4SS build `c838a8ac` it leaves the
-callable table in the parameter stack and shifts native object properties.
-Creation uses
-`AdjustIfPossibleButDontSpawnIfColliding`, so an occupied point is rejected
-instead of stacking actors. The returned
-`FRODSpawnActorResult.ServerSpawnActor` weak pointer is the sole ownership
-contract; proximity is never used to claim an actor. Natural actors remain
-unowned and are never destroyed by this mod.
+Extra enemies retain the collision profiles authored by their Blueprints. The
+director does not replace channel responses. After initialization it verifies
+that the actor has collision enabled and that its capsule has query collision,
+a named profile, and a blocking Pawn response. The same exact contract is
+audited on every director tick, every 500 ms with the shipped configuration, for
+every live owned extra. An extra that fails initially or loses collision later
+is destroyed instead of remaining in the world without working collision.
+
+After `OnFinishedInitialize`, the director binds the automatically created AI
+controller, starts enemy AI and its behavior tree, and verifies collision before
+admitting the actor. Every extra receives the persistent
+`WorldEnemyDirectorOwned` actor tag. If a same-world teleport releases Lua
+references, the next scan removes tagged orphans instead of misclassifying them
+as natural enemies. Natural actors remain unowned and are never destroyed by
+this ownership cleanup.
 
 Random species are selected only from natural enemy classes already loaded in
 the active world. The mod does not synchronously load arbitrary Blueprint

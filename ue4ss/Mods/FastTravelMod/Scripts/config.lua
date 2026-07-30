@@ -11,7 +11,7 @@ return {
     -- injection stage" / "wrapper stage" breadcrumbs, and the last one written
     -- before the log stops names the native call that died. Set back to false
     -- once that crash is settled.
-    DEBUG_LOGS = true,
+    DEBUG_LOGS = false,
 
     -- Which map screen the Fast Travel row opens. They are different widgets and
     -- they accept different destinations:
@@ -21,9 +21,8 @@ return {
     --                   fast travel presentation and confirming a checkpoint on
     --                   it is measured working. It states its own scope in its
     --                   banner -- "Escolha para qual Area Segura ou Terminal de
-    --                   Teletransporte voce vai" -- so map pins are drawn on it
-    --                   but cannot be confirmed. Use "fasttravel pin <index>"
-    --                   in the UE4SS console for those.
+    --                   Teletransporte voce vai". F9 is the mod's separate
+    --                   cursor-to-world action and works without a map pin.
     --
     --   "map"        -> WBP_Map_C (URODMapMenuWidgetBase), the reference map,
     --                   titled "Mapa". Its cursor stops on every icon, so it is
@@ -42,13 +41,11 @@ return {
     -- Any name from UE4SS's Key table; empty disables the binding.
     FORCE_CLOSE_KEY = "F8",
 
-    -- Travels to a map pin from the fast travel screen. This needs its own key
-    -- because "Confirmar" is greyed out over a pin: that screen accepts only
-    -- safe areas and teleport terminals, so the confirm never fires there and
-    -- there is nothing for the mod to intercept. With one pin placed the key
-    -- takes it; with several it takes the one nearest the cursor.
+    -- Travels to the exact world position under the fast travel map cursor.
+    -- No map pin is required. The destination is streamed until two consecutive
+    -- local probes agree on walkable navmesh plus blocking floor collision.
     -- Any name from UE4SS's Key table; empty disables the binding.
-    PIN_TRAVEL_KEY = "F9",
+    CURSOR_TRAVEL_KEY = "F9",
 
     -- Only used when MAP_TARGET is "map".
     -- The FName handed to ARODAvatarCharacter::ActivateFPCameraMenuAbility as

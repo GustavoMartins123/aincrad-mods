@@ -1,6 +1,6 @@
 # FastTravelMod
 
-FastTravelMod **v0.14.0** adds a native-styled **Fast Travel** entry to the
+FastTravelMod **v0.15.3** adds a native-styled **Fast Travel** entry to the
 Start Menu in **Echoes of Aincrad**. It opens the game's own fast-travel screen
 and lets the player travel from anywhere on a floor without standing beside a
 terminal.
@@ -76,17 +76,25 @@ This is a verified position change, not the complete native terminal transaction
 The terminal fade, arrival cutscene, and partner-warp sequence may therefore not
 play.
 
-## Map pins
+## Fast Travel Anywhere
 
-The fast-travel screen displays map pins for orientation, but its native
-**Confirm** action accepts only normal travel destinations. It does not confirm
-pins.
+Press **F9** on the fast-travel map to travel to the world position under its
+cursor. A map pin is not required.
 
-Press **F9** by default to travel to the selected or hovered map pin. Pin
-coordinates are projected onto the navigation mesh before the hero is moved; a
-pin that cannot be projected is rejected.
+The mod first creates a temporary World Partition streaming source at that
+position. The hero remains at the original location until two consecutive local
+probes agree on nine blocking `WorldStatic` samples spanning the hero's actual
+capsule footprint. The samples must form one coherent supporting surface. The
+final move must also be accepted by `K2_TeleportTo`, which rejects capsule
+encroachment. Navigation data is not required: navmesh is an AI pathfinding
+product and is not authoritative player collision. If the exact landing does
+not expose the complete physical contract, no teleport occurs.
 
-The key can be changed with `PIN_TRAVEL_KEY` in `Scripts/config.lua`. Set it to
+Streaming probes run through one cancellable, mod-owned game-thread action.
+Completing, aborting, or closing the map cancels that action explicitly. The
+legacy `ExecuteWithDelay`/`ExecuteInGameThread` callback chain is not used.
+
+The key can be changed with `CURSOR_TRAVEL_KEY` in `Scripts/config.lua`. Set it to
 an empty string to disable the binding.
 
 ## Recovery key
@@ -115,7 +123,7 @@ Edit `Scripts/config.lua` or use the optional in-game ModMenu.
 | `MAP_TARGET` | `"fasttravel"` | Chooses the native fast-travel screen or experimental reference map |
 | `MAP_MENU_KEY` | `""` | Optional exact menu-key override for the reference-map path |
 | `FORCE_CLOSE_KEY` | `"F8"` | Emergency map-close key |
-| `PIN_TRAVEL_KEY` | `"F9"` | Map-pin travel key |
+| `CURSOR_TRAVEL_KEY` | `"F9"` | Travel-to-map-cursor key |
 
 When ModMenu is installed, machine-local overrides are written to
 `Scripts/runtime.lua`. That file is optional and should not be included when

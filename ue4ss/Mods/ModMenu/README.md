@@ -1,6 +1,6 @@
 # ModMenu
 
-ModMenu **v1.5.2** adds a native-styled **Mods** entry to Echoes of Aincrad's
+ModMenu **v1.5.6** adds a native-styled **Mods** entry to Echoes of Aincrad's
 Start Menu. It enables or disables compatible UE4SS Lua mods and edits their
 supported settings without leaving the game.
 
