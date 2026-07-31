@@ -314,6 +314,25 @@ local function enemyOperational(enemy)
     return true, nil
 end
 
+-- Death belongs to the game, not to this mod.
+--
+-- ARODEnemyCharacter owns a whole death sequence: TriggerDeath, the dismember
+-- and gauge work, SetCollisonEnableCpp(false, Dead), OnEnemyDeadDelegate,
+-- OnEnemyConfirmedDeathDelegate, then EnemyDestroyCheck and the despawn
+-- delegate on the game's own schedule. Any owned extra that dies must run all
+-- of it exactly like a natural enemy, so it is retired from the contract
+-- regime rather than destroyed: the audit stops sampling it and nothing here
+-- calls K2_DestroyActor on it again. The corpse leaves `states` when the game
+-- finally destroys the actor and cleanupInvalidStates notices.
+local function enemyIsDead(enemy)
+    if not isValid(enemy) then return nil end
+    local ok, dead, healthZero = pcall(function()
+        return enemy:IsDead(), enemy:IsHealthZero()
+    end)
+    if not ok then return nil end
+    return dead == true or healthZero == true
+end
+
 local function objectKey(object)
     if not isValid(object) then return nil end
     local ok, name = pcall(function() return object:GetFullName() end)
@@ -407,19 +426,51 @@ end
 -- copied into the spawned actor: a mismatch is an explicit rejection.
 local enemyContracts = {}
 do
-    local PHYSICAL_COLLISION_CHANNELS = { 0, 1, 2 }
+    -- Every runtime collision channel except the deprecated sentinel. A profile
+    -- name is only a preset label: Unreal changes it to "Custom" as soon as one
+    -- response is authored directly. The effective response container is the
+    -- canonical contract.
+    local PHYSICAL_COLLISION_FIELDS = {
+        "WorldStatic",
+        "WorldDynamic",
+        "Pawn",
+        "Visibility",
+        "Camera",
+        "PhysicsBody",
+        "Vehicle",
+        "Destructible",
+    }
+    for channel = 1, 6 do
+        PHYSICAL_COLLISION_FIELDS[#PHYSICAL_COLLISION_FIELDS + 1] =
+            "EngineTraceChannel" .. tostring(channel)
+    end
+    for channel = 1, 18 do
+        PHYSICAL_COLLISION_FIELDS[#PHYSICAL_COLLISION_FIELDS + 1] =
+            "GameTraceChannel" .. tostring(channel)
+    end
     local SIZE_TOLERANCE_CM = 0.1
     local aiControllerBaseClass = nil
 
-    local function capsuleSnapshot(component, label, requirePawnBody)
+    local function capsuleSnapshot(
+        component, label, requirePawnBody, expectedOwnerKey
+    )
         if not isValid(component) then
             error(label .. " is unavailable")
+        end
+        local owner = component:GetOwner()
+        if not isValid(owner) or objectKey(owner) ~= expectedOwnerKey then
+            error(label .. " is not owned by this enemy")
         end
         local profile = component:GetCollisionProfileName():ToString()
         local enabled = tonumber(component:GetCollisionEnabled())
         local objectType = tonumber(component:GetCollisionObjectType())
         local radius = tonumber(component:GetScaledCapsuleRadius())
         local halfHeight = tonumber(component:GetScaledCapsuleHalfHeight())
+        local active = component:IsActive()
+        local collisionEnabled = component:K2_IsCollisionEnabled()
+        local queryEnabled = component:K2_IsQueryCollisionEnabled()
+        local physicsEnabled = component:K2_IsPhysicsCollisionEnabled()
+        local generateOverlapEvents = component:GetGenerateOverlapEvents()
         if type(profile) ~= "string" or profile == "" then
             error(label .. " collision profile is unavailable")
         end
@@ -431,32 +482,65 @@ do
             or halfHeight <= 0.0 then
             error(label .. " collision geometry is invalid")
         end
+        if type(active) ~= "boolean"
+            or type(collisionEnabled) ~= "boolean"
+            or type(queryEnabled) ~= "boolean"
+            or type(physicsEnabled) ~= "boolean"
+            or type(generateOverlapEvents) ~= "boolean" then
+            error(label .. " reflected collision state is unreadable")
+        end
         local responses = {}
-        for _, channel in ipairs(PHYSICAL_COLLISION_CHANNELS) do
-            local response =
-                tonumber(component:GetCollisionResponseToChannel(channel))
+        local responseContainer =
+            component.BodyInstance.CollisionResponses.ResponseToChannels
+        if responseContainer == nil then
+            error(label .. " collision response container is unavailable")
+        end
+        for _, field in ipairs(PHYSICAL_COLLISION_FIELDS) do
+            local response = tonumber(responseContainer[field])
             if response ~= 0 and response ~= 1 and response ~= 2 then
-                error(label .. " channel " .. tostring(channel) ..
+                error(label .. " channel " .. field ..
                     " response is invalid")
             end
-            responses[channel] = response
+            responses[field] = response
         end
         if requirePawnBody then
             if enabled ~= 1 and enabled ~= 3 and enabled ~= 5 then
                 error(label .. " has no query collision: " ..
                     tostring(enabled))
             end
+            if collisionEnabled ~= true or queryEnabled ~= true then
+                error(label .. " query collision is not operational")
+            end
             if objectType ~= 2 then
                 error(label .. " object type is not Pawn: " ..
                     tostring(objectType))
             end
-            if responses[2] ~= 2 then
+            if responses.Pawn ~= 2 then
                 error(label .. " does not block Pawn: " ..
-                    tostring(responses[2]))
+                    tostring(responses.Pawn))
             end
-            if profile == "None" then
-                error(label .. " has no authored collision profile")
+        end
+
+        -- Collision profiles and responses live in FBodyInstance and remain
+        -- readable even when the component has no shape registered in Chaos.
+        -- GetClosestPointOnCollision is the reflected operational test: Unreal
+        -- returns a negative distance when no collision body is available.
+        local bodyAvailable = false
+        if collisionEnabled then
+            local center = vector(component:K2_GetComponentLocation())
+            if center == nil then
+                error(label .. " component location is invalid")
             end
+            local closestPoint = { X = 0.0, Y = 0.0, Z = 0.0 }
+            local bodyDistance = tonumber(component:GetClosestPointOnCollision(
+                center,
+                closestPoint,
+                FName("None")
+            ))
+            if not finiteNumber(bodyDistance) or bodyDistance < 0.0 then
+                error(label .. " has no registered physics collision body")
+            end
+            bodyAvailable = true
         end
         return {
             profile = profile,
@@ -465,28 +549,49 @@ do
             radius = radius,
             halfHeight = halfHeight,
             responses = responses,
+            active = active,
+            collisionEnabled = collisionEnabled,
+            queryEnabled = queryEnabled,
+            physicsEnabled = physicsEnabled,
+            generateOverlapEvents = generateOverlapEvents,
+            bodyAvailable = bodyAvailable,
         }
     end
 
+    -- Every difference is reported rather than the first one found. A rejection
+    -- costs a whole play session to observe, and stopping at the first mismatch
+    -- hides the rest of them behind it one run at a time.
     local function compareCapsule(actual, expected, label, compareEnabled)
-        if actual.profile ~= expected.profile then
-            return nil, label .. " profile changed from " ..
-                expected.profile .. " to " .. actual.profile
+        local differences = {}
+        local function note(field, expectedValue, actualValue)
+            differences[#differences + 1] = label .. " " .. field ..
+                " changed from " .. tostring(expectedValue) .. " to " ..
+                tostring(actualValue)
         end
         if compareEnabled and actual.enabled ~= expected.enabled then
-            return nil, label .. " collision mode changed from " ..
-                tostring(expected.enabled) .. " to " ..
-                tostring(actual.enabled)
+            note("collision mode", expected.enabled, actual.enabled)
         end
         if actual.objectType ~= expected.objectType then
-            return nil, label .. " object type changed from " ..
-                tostring(expected.objectType) .. " to " ..
-                tostring(actual.objectType)
+            note("object type", expected.objectType, actual.objectType)
+        end
+        if compareEnabled then
+            for _, field in ipairs({
+                "active",
+                "collisionEnabled",
+                "queryEnabled",
+                "physicsEnabled",
+                "generateOverlapEvents",
+                "bodyAvailable",
+            }) do
+                if actual[field] ~= expected[field] then
+                    note(field, expected[field], actual[field])
+                end
+            end
         end
         if math.abs(actual.radius - expected.radius) > SIZE_TOLERANCE_CM
             or math.abs(actual.halfHeight - expected.halfHeight)
                 > SIZE_TOLERANCE_CM then
-            return nil, string.format(
+            differences[#differences + 1] = string.format(
                 "%s geometry changed from %.1fx%.1f to %.1fx%.1f",
                 label,
                 expected.radius,
@@ -494,15 +599,15 @@ do
                 actual.radius,
                 actual.halfHeight)
         end
-        for _, channel in ipairs(PHYSICAL_COLLISION_CHANNELS) do
-            if actual.responses[channel] ~= expected.responses[channel] then
-                return nil, label .. " channel " .. tostring(channel) ..
-                    " response changed from " ..
-                    tostring(expected.responses[channel]) .. " to " ..
-                    tostring(actual.responses[channel])
+        for _, field in ipairs(PHYSICAL_COLLISION_FIELDS) do
+            if actual.responses[field] ~= expected.responses[field] then
+                note("channel " .. field .. " response",
+                    expected.responses[field],
+                    actual.responses[field])
             end
         end
-        return true, nil
+        if #differences == 0 then return true, nil end
+        return nil, table.concat(differences, "; ")
     end
 
     function enemyContracts.capturePhysical(enemy)
@@ -511,6 +616,10 @@ do
         end
         local contract = nil
         local ok, captureError = pcall(function()
+            local enemyKey = objectKey(enemy)
+            if enemyKey == nil then
+                error("enemy identity is unavailable")
+            end
             if enemy:GetActorEnableCollision() ~= true then
                 error("actor collision is disabled")
             end
@@ -553,13 +662,15 @@ do
                 extraContracts[index] = capsuleSnapshot(
                     extras[index],
                     "ExtraCapsuleComponents[" .. tostring(index) .. "]",
-                    false)
+                    false,
+                    enemyKey)
             end
             contract = {
-                root = capsuleSnapshot(capsule, "CapsuleComponent", true),
+                root = capsuleSnapshot(
+                    capsule, "CapsuleComponent", true, enemyKey),
                 multiIsRoot = multiIsRoot,
                 multi = multiIsRoot and nil or capsuleSnapshot(
-                    multi, "MultiCapsuleComponent", false),
+                    multi, "MultiCapsuleComponent", false, enemyKey),
                 weldChildren = multi.bWeldChildColliders,
                 extras = extraContracts,
             }
@@ -608,12 +719,24 @@ do
                 false)
             if matches ~= true then return nil, compareError end
         end
+        local registeredBodies = actual.root.bodyAvailable and 1 or 0
+        if not actual.multiIsRoot and actual.multi.bodyAvailable then
+            registeredBodies = registeredBodies + 1
+        end
+        for _, extra in ipairs(actual.extras) do
+            if extra.bodyAvailable then
+                registeredBodies = registeredBodies + 1
+            end
+        end
         return true, string.format(
-            "profile=%s body=%.1fx%.1f extras=%d",
+            "profile=%s referenceProfile=%s body=%.1fx%.1f "
+                .. "extras=%d chaosBodies=%d",
             actual.root.profile,
+            expected.root.profile,
             actual.root.radius,
             actual.root.halfHeight,
-            #actual.extras)
+            #actual.extras,
+            registeredBodies)
     end
 
     function enemyContracts.controlOperational(enemy)
@@ -1533,7 +1656,11 @@ end
 local function activeExtraCount()
     local count = #spawnQueue + #pendingSpawns
     for _, state in pairs(states) do
-        if state.owned and isValid(state.object) then count = count + 1 end
+        -- A corpse waiting for the game to despawn it is no longer a live
+        -- extra, so it does not hold a slot under the cap.
+        if state.owned and isValid(state.object) and not state.retired then
+            count = count + 1
+        end
     end
     return count
 end
@@ -2143,6 +2270,7 @@ local function registerEnemy(enemy, reused, queued)
         spawnPosition = request and request.position or nil,
         expectedPhysical = request and request.physicalContract or nil,
         admitted = request == nil,
+        retired = false,
         admissionStableSamples = 0,
         admissionDeadlineMs =
             request and (elapsedMs + OWNED_ADMISSION_TIMEOUT_MS) or nil,
@@ -2340,6 +2468,72 @@ activateSpawnedEnemy = function(enemy, key, spawnPosition)
     return true
 end
 
+-- Both contracts are reported when both fail. The physical one used to win and
+-- the control one stayed invisible until the physical side was fixed, which
+-- costs a session per hidden failure.
+local function describeContractFailure(
+    physical, physicalDetail, controlled, controlDetail
+)
+    local parts = {}
+    if physical ~= true then
+        parts[#parts + 1] = "physical contract: " .. tostring(physicalDetail)
+    end
+    if controlled ~= true then
+        parts[#parts + 1] = "control contract: " .. tostring(controlDetail)
+    end
+    if #parts == 0 then return "contract state is unavailable" end
+    return table.concat(parts, " | ")
+end
+
+local registryProbeReported = false
+
+-- Read-only, once per session, on the first admitted extra.
+--
+-- ARODGameState carries the lists the game's own AI reads: RODEnemies, and
+-- ManagerEnemyGroup.EnemyList, which URODAIEnemyGroup uses to hand out attack
+-- slots (PartnerAttackEnemyTimesLimit, VisitorAttackEnemyTimesLimit,
+-- EnemyTargetingDatas). An actor created through UGameplayStatics is a
+-- well-formed enemy, but nothing adds it to those lists: the game registers a
+-- spawn inside its own entry point, ARODGameState:RODSpawnActor. If an
+-- admitted extra is absent from them while natural enemies are present, that
+-- is why a partner never engages it, and no collision channel or AI flag on
+-- the actor itself can change that.
+local function reportRegistryMembership(state)
+    if registryProbeReported then return end
+    registryProbeReported = true
+
+    local function describeList(array, ownedKey)
+        if array == nil then return "unavailable" end
+        local size = #array
+        local found = false
+        for index = 1, size do
+            local entry = array[index]
+            if isValid(entry) and objectKey(entry) == ownedKey then
+                found = true
+                break
+            end
+        end
+        return string.format("contains=%s entries=%d", tostring(found), size)
+    end
+
+    local ok, report = pcall(function()
+        local gameState = FindFirstOf("RODGameState")
+        if not isValid(gameState) then
+            return "RODGameState is unavailable"
+        end
+        local group = gameState.ManagerEnemyGroup
+        return "RODEnemies " ..
+            describeList(gameState.RODEnemies, state.key) ..
+            " | ManagerEnemyGroup.EnemyList " ..
+            (isValid(group)
+                and describeList(group.EnemyList, state.key)
+                or "unavailable")
+    end)
+    log("SPAWN REGISTRY | " .. tostring(state.key) .. " | " ..
+        (ok and tostring(report)
+            or ("probe failed: " .. firstErrorLine(report))))
+end
+
 -- Candidates remain unmutated until both their physical and AI contracts pass
 -- three consecutive samples. A timeout or any later contract loss destroys the
 -- owned actor; no profile, component or controller is repaired in place.
@@ -2347,9 +2541,23 @@ local function auditOwnedEnemyCollision()
     if elapsedMs < nextCollisionAuditMs then return end
     nextCollisionAuditMs = elapsedMs + COLLISION_AUDIT_MS
 
+    -- The dead are retired before anything is compared. A killed extra fails
+    -- both contracts by definition — the game turns its collision off and stops
+    -- its behaviour tree as part of dying — and reading that as a contract loss
+    -- is what made a killed extra pop out of existence on the next audit
+    -- instead of falling, dropping loot and fading on the game's own schedule.
+    for _, state in pairs(states) do
+        if state.owned and not state.retired and isValid(state.object)
+            and enemyIsDead(state.object) == true then
+            state.retired = true
+            dbg("EXTRA RETIRED | " .. tostring(state.key) ..
+                " | killed; the game owns its death and despawn")
+        end
+    end
+
     local rejected = {}
     for _, state in pairs(states) do
-        if state.owned and isValid(state.object) then
+        if state.owned and isValid(state.object) and not state.retired then
             local physical, physicalDetail =
                 enemyContracts.comparePhysical(
                     state.object,
@@ -2366,6 +2574,7 @@ local function auditOwnedEnemyCollision()
                         log("SPAWN ADMITTED | " .. tostring(state.key) ..
                             " | " .. tostring(physicalDetail) ..
                             " | controller=" .. tostring(controlDetail))
+                        reportRegistryMembership(state)
                         if configHealthy and CONFIG.ENABLED then
                             applyMutation(state)
                         end
@@ -2375,17 +2584,13 @@ local function auditOwnedEnemyCollision()
                 or elapsedMs >= state.admissionDeadlineMs then
                 rejected[#rejected + 1] = {
                     state = state,
-                    reason = physical ~= true
-                        and ("physical contract: " ..
-                            tostring(physicalDetail))
-                        or ("control contract: " ..
-                            tostring(controlDetail)),
+                    reason = describeContractFailure(
+                        physical, physicalDetail, controlled, controlDetail),
                 }
             else
                 state.admissionStableSamples = 0
-                state.lastAdmissionError = physical ~= true
-                    and ("physical contract: " .. tostring(physicalDetail))
-                    or ("control contract: " .. tostring(controlDetail))
+                state.lastAdmissionError = describeContractFailure(
+                    physical, physicalDetail, controlled, controlDetail)
             end
         end
     end
@@ -2809,7 +3014,8 @@ local function recycleDistantExtras()
     local limitSquared = CONFIG.DESPAWN_RADIUS * CONFIG.DESPAWN_RADIUS
     local distant = {}
     for _, state in pairs(states) do
-        if state.owned then
+        -- Retired extras are corpses mid-despawn; the game removes them.
+        if state.owned and not state.retired then
             local location = isValid(state.object) and actorLocation(state.object)
                 or state.spawnPosition
             if location ~= nil

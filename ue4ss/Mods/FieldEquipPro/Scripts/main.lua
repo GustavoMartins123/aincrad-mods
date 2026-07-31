@@ -428,7 +428,11 @@ end
 -- Any one alone leaves the screen worse than not touching the camera at all.
 local previousViewTarget = nil
 local suppressedHiddenKeys = {}
+local previousCameraRootLocation = nil
 local previousBoomTargetOffset = nil
+local previousBoomSocketOffset = nil
+local baseEquipmentTargetOffset = nil
+local baseEquipmentSocketOffset = nil
 
 local function describeCameraState(widget)
     local enabled = nil
@@ -497,72 +501,79 @@ local function restoreHeroHide(hero)
 end
 
 -- CAMERA_HEIGHT raises the boom's origin, which lowers the character in frame
--- and shows more above them. It is a live setting rather than a constant because
--- the right amount is a matter of taste and no amount of reading headers settles
+-- and shows more above them. Moving CameraRoot (USceneComponent) adjusts the
+-- base transform of the camera rig directly without being overwritten by native ticks.
 local function raiseEquipmentCamera(hero)
-    local boom = nil
-    pcall(function() boom = hero.CameraBoom end)
-    if not isValidObject(boom) then return end
+    if not isValidObject(hero) then return end
 
     pcall(function()
-        local target = boom.TargetOffset
-        local socket = boom.SocketOffset
-
-        if previousBoomTargetOffset == nil then
-            previousBoomTargetOffset = { X = target.X, Y = target.Y, Z = target.Z }
+        local root = hero.CameraRoot
+        if isValidObject(root) then
+            local relLoc = root.RelativeLocation
+            if previousCameraRootLocation == nil then
+                previousCameraRootLocation = { X = relLoc.X, Y = relLoc.Y, Z = relLoc.Z }
+            end
+            relLoc.Z = previousCameraRootLocation.Z + CONFIG.CAMERA_HEIGHT
+            root.RelativeLocation = relLoc
         end
-        if previousBoomSocketOffset == nil then
-            previousBoomSocketOffset = { X = socket.X, Y = socket.Y, Z = socket.Z }
-        end
+    end)
 
-        local desiredTargetZ = previousBoomTargetOffset.Z + CONFIG.CAMERA_HEIGHT
-        local desiredSocketZ = previousBoomSocketOffset.Z + CONFIG.CAMERA_HEIGHT
-
-        if target.Z ~= desiredTargetZ then
-            target.Z = desiredTargetZ
+    pcall(function()
+        local boom = hero.CameraBoom
+        if isValidObject(boom) then
+            local target = boom.TargetOffset
+            local socket = boom.SocketOffset
+            if previousBoomTargetOffset == nil then
+                previousBoomTargetOffset = { X = target.X, Y = target.Y, Z = target.Z }
+            end
+            if previousBoomSocketOffset == nil then
+                previousBoomSocketOffset = { X = socket.X, Y = socket.Y, Z = socket.Z }
+            end
+            target.Z = previousBoomTargetOffset.Z + CONFIG.CAMERA_HEIGHT
+            socket.Z = previousBoomSocketOffset.Z + CONFIG.CAMERA_HEIGHT
             boom.TargetOffset = target
-        end
-        if socket.Z ~= desiredSocketZ then
-            socket.Z = desiredSocketZ
             boom.SocketOffset = socket
         end
     end)
 end
 
 local function restoreEquipmentCamera(hero)
-    local boom = nil
-    pcall(function() boom = hero.CameraBoom end)
-    if isValidObject(boom) then
+    if isValidObject(hero) then
         pcall(function()
-            if previousBoomTargetOffset ~= nil then
-                local target = boom.TargetOffset
-                target.X = previousBoomTargetOffset.X
-                target.Y = previousBoomTargetOffset.Y
-                target.Z = previousBoomTargetOffset.Z
-                boom.TargetOffset = target
+            local root = hero.CameraRoot
+            if isValidObject(root) and previousCameraRootLocation ~= nil then
+                local relLoc = root.RelativeLocation
+                relLoc.X = previousCameraRootLocation.X
+                relLoc.Y = previousCameraRootLocation.Y
+                relLoc.Z = previousCameraRootLocation.Z
+                root.RelativeLocation = relLoc
             end
-            if previousBoomSocketOffset ~= nil then
-                local socket = boom.SocketOffset
-                socket.X = previousBoomSocketOffset.X
-                socket.Y = previousBoomSocketOffset.Y
-                socket.Z = previousBoomSocketOffset.Z
-                boom.SocketOffset = socket
+        end)
+        pcall(function()
+            local boom = hero.CameraBoom
+            if isValidObject(boom) then
+                if previousBoomTargetOffset ~= nil then
+                    local target = boom.TargetOffset
+                    target.X = previousBoomTargetOffset.X
+                    target.Y = previousBoomTargetOffset.Y
+                    target.Z = previousBoomTargetOffset.Z
+                    boom.TargetOffset = target
+                end
+                if previousBoomSocketOffset ~= nil then
+                    local socket = boom.SocketOffset
+                    socket.X = previousBoomSocketOffset.X
+                    socket.Y = previousBoomSocketOffset.Y
+                    socket.Z = previousBoomSocketOffset.Z
+                    boom.SocketOffset = socket
+                end
             end
         end)
     end
+    previousCameraRootLocation = nil
     previousBoomTargetOffset = nil
     previousBoomSocketOffset = nil
-end
-
-local function updateEquipmentCameraLoop()
-    if not equipmentSubmenuOpen then return end
-    local hero = resolveHero()
-    if isValidObject(hero) then
-        raiseEquipmentCamera(hero)
-    end
-    ExecuteWithDelay(50, function()
-        ExecuteInGameThread(updateEquipmentCameraLoop)
-    end)
+    baseEquipmentTargetOffset = nil
+    baseEquipmentSocketOffset = nil
 end
 
 local function takeViewTarget(controller, hero)
@@ -607,7 +618,6 @@ local function showCharacterForEquipment(widget)
     end)
 
     raiseEquipmentCamera(hero)
-    updateEquipmentCameraLoop()
 end
 
 -- Called on the way back. The start menu draws its own character panel and wants

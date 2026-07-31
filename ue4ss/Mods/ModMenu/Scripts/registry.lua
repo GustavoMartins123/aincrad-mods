@@ -1,8 +1,8 @@
--- Auto-discovered ModMenu registry.
+-- The set of mods the menu shows.
 --
--- registry_impl.lua remains the explicit compatibility allow-list. Only entries
--- whose target mod is installed and whose effective settings match that contract
--- are returned to the menu and its console diagnostics.
+-- There is no list here to maintain. Every folder under Mods/ is enumerated,
+-- and a mod appears by shipping Scripts/modmenu.lua inside its own folder --
+-- so installing, removing or renaming a mod needs no edit outside that mod.
 
 local sourceInfo = debug.getinfo(1, "S")
 if type(sourceInfo) ~= "table" or type(sourceInfo.source) ~= "string" then
@@ -16,11 +16,9 @@ if type(SCRIPT_DIR) ~= "string" or SCRIPT_DIR == "" then
     error("ModMenu registry could not resolve the Scripts directory")
 end
 
-local registry = dofile(SCRIPT_DIR .. "registry_impl.lua")
 local discovery = dofile(SCRIPT_DIR .. "discovery.lua")
 local bridge = dofile(SCRIPT_DIR .. "standalone/ModMenuBridge.lua")
 
-if type(registry) ~= "table" then error("registry_impl.lua must return a table") end
 if type(discovery) ~= "table" or type(discovery.discover) ~= "function" then
     error("discovery.lua did not return the discovery module")
 end
@@ -28,10 +26,11 @@ if type(bridge) ~= "table" then
     error("standalone ModMenuBridge.lua did not return a table")
 end
 
-local accepted, report = discovery.discover(SCRIPT_DIR, registry, bridge)
+local accepted, report = discovery.discover(SCRIPT_DIR, bridge)
 
 print(string.format(
-    "[ModMenu] auto-discovery | %d compatible | %d absent | %d invalid\n",
+    "[ModMenu] discovery | %d folder(s) | %d with a menu | %d without | %d invalid\n",
+    report.registered,
     #report.accepted,
     #report.absent,
     #report.invalid
@@ -46,7 +45,7 @@ for _, item in ipairs(report.invalid) do
 end
 
 if #accepted == 0 then
-    print("[ModMenu] no compatible installed mods were discovered\n")
+    print("[ModMenu] no installed mod ships a Scripts/modmenu.lua\n")
 end
 
 return accepted
