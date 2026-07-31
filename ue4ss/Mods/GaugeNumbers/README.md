@@ -1,165 +1,110 @@
 # Gauge Numbers
 
-Puts the real values on Echoes of Aincrad's cockpit gauges — `280 / 280` beside
-the HP, Stamina and SP bars — and adds an experience bar with the level and the
-`current / until next level` numbers that otherwise only exist on the status
-screen. The experience bar is drawn with a copy of the game's own gauge widget,
-so it matches the rest of the HUD.
+Gauge Numbers is a configurable HUD enhancement for Echoes of Aincrad.
+
+It adds live numeric readouts to the game's existing HP, Stamina and SP gauges and can also add an experience display with the current level, experience progress and an optional gauge-style bar.
+
+The mod does not change player attributes, regeneration, damage, stamina consumption or experience rewards. It only reads values already maintained by the game and presents them on the HUD.
+
+The default layout is only a starting point. Every readout can be enabled independently, reformatted and repositioned, and the experience display can be arranged separately from the three status gauges.
 
 ## Requirements
 
 - Echoes of Aincrad **1.0.3**.
 - The Echoes of Aincrad-compatible UE4SS build.
 
-The in-game ModMenu is optional. Gauge Numbers includes its own private settings
-bridge and works when installed by itself.
+The [Echoes of Aincrad Mod Menu](https://www.nexusmods.com/echoesofaincrad/mods/84) is optional.
+
+Gauge Numbers includes its own private settings bridge and works as a standalone installation.
 
 ## Installation
 
 Copy the complete `GaugeNumbers` folder to:
 
 ```text
-EchoesofAincrad\Binaries\Win64\ue4ss\Mods\GaugeNumbers
+[Your Game Folder]\EchoesofAincrad\Binaries\Win64\ue4ss\Mods\
 ```
 
-The installed layout must include:
+The final layout should include:
 
 ```text
 GaugeNumbers\
 ├── enabled.txt
 ├── README.md
 └── Scripts\
+    ├── config.lua
     ├── main.lua
     ├── main_impl.lua
-    ├── config.lua
+    ├── modmenu.lua
     └── standalone\
         └── ModMenuBridge.lua
 ```
 
-Restart the game after installing or enabling the mod.
-
-## How it works
-
-### The readouts follow the game's own events
-
-`URODCockpitWidgetBase` raises one event per gauge whenever its value changes,
-each carrying the new value and the maximum:
+Confirm that this file exists:
 
 ```text
-OnHealthChangedEvent  (NewHealth,    MaxHealth)
-OnStaminaChangedEvent (NewSp,        NewMaxSp)
-OnSoulChangedEvent    (NewSoulValue, MaxSoul)
+ue4ss\Mods\GaugeNumbers\Scripts\main.lua
 ```
 
-`WBP_Cockpit_C` does not override any of them, so the mod hooks the native class
-and every instance is covered. The handlers run synchronously inside the event
-on the game thread: the hook parameters point into the native call frame and are
-dead the instant it returns, so they are read there and never captured. The
-handlers resolve nothing and construct nothing — they only stamp a widget that
-already exists.
+Fully restart the game after installing or updating the mod.
 
-A 500 ms reconcile poll owns everything else: resolving the cockpit, injecting
-the widgets, refreshing the experience numbers, and re-reading
-`DefensiveAttributeSet.Health` / `AttributeSet.Stamina` / `AttributeSet.Soul` so
-a readout attached mid-fight is filled immediately and no missed event can leave
-a stale number on screen.
+Do not include `runtime.lua`, `runtime.lua.*` or `runtime.rev` when redistributing the mod.
 
-### Which layer it draws on
+## Main Features
 
-Each cockpit gauge assembly (`PlayerUnitGauge_HP`, `PlayerUnitGauge_Stamina`,
-`PlayerUnitGauge_Soul`) owns a CanvasPanel, but a readout parented *inside* one
-is painted with that assembly — and the assembly's canvas is painted before the
-gauge widget sitting next to it. No ZOrder inside that canvas can lift a number
-above art that is not in the canvas, which is why centring the readouts on the
-bars first put them behind the bars.
+- Displays live HP values.
+- Displays live Stamina values.
+- Displays live SP values.
+- Supports `current / maximum`, current-only and percentage formats.
+- Allows each status readout to be enabled independently.
+- Supports centred readouts or values placed beside the gauges.
+- Allows global offsets and individual design-space positions to be adjusted.
+- Can add the current level and experience progress to the HUD.
+- Can use a copy of the game's native gauge widget for the experience bar.
+- Falls back to a simple flat experience bar when the native gauge cannot be created safely.
+- Allows the experience display to be anchored to HP, Stamina or SP.
+- Supports live configuration through the optional in-game Mod Menu.
+- Works without the Mod Menu through `Scripts\config.lua`.
 
-`READOUT_LAYER = "front"` (the default) parents everything to the cockpit's own
-`UnitGauge` canvas instead. That canvas holds the three assemblies, so a child
-added there is painted after all of them. It needs the assembly's own rectangle
-in that canvas to position against; when that cannot be read, the mod falls back
-to `"gauge"` — living inside the assembly, where it fades with the bar it
-belongs to but is painted behind the art.
+## Usage
 
-`READOUT_PLACEMENT = "center"` (the default) puts each number on top of its own
-bar. It is expressed as a **normalised anchor** on that gauge's canvas — the
-middle of the canvas is the middle of the canvas at any resolution, whether or
-not the mod managed to measure anything — so it lands correctly on its own, and
-the bars being different lengths stops mattering.
+No manual activation is required.
 
-`READOUT_PLACEMENT = "right"` puts the numbers off the end of the bars instead.
-That one *does* need geometry, read from the gauge's own CanvasPanelSlot through
-`WidgetLayoutLibrary.SlotAsCanvasSlot`, and because the three HUD bars are
-different lengths it comes out as a staircase unless `ALIGN_READOUTS` (on by
-default) puts every readout on the column just past the longest bar.
+After loading into the game, the configured readouts are attached to the existing cockpit HUD. They follow the visibility and lifecycle of the game's own gauges.
 
-`TEXT_OFFSET_X` / `TEXT_OFFSET_Y` are corrections on top of either.
+The default format is:
 
-The typeface is borrowed from the partner name plate so it matches the rest of
-the HUD; without a partner mounted, the TextBlock's own default font is used.
+```text
+280 / 280
+```
 
-Every assembly wraps itself in an `InvalidationBox`. A cached subtree keeps
-repainting the text it was cached with, which would freeze each readout on its
-first value, so caching is turned off on the assemblies the mod writes into.
+The experience display can show:
 
-### The experience bar
+```text
+Lv.52   615 / 24000
+```
 
-With `EXP_STYLE = "native"` the bar is a real instance of the game's own gauge
-widget — same art, same frame, same shader as the HP/Stamina/SP bars, recoloured
-through `SetGaugeColor`. The class comes from `GetClass()` on a gauge already
-mounted in this cockpit, so there is no `LoadAsset` and no asset path that could
-stop resolving after a patch.
+The orange gauge is called Stamina in this mod and Vigor in some parts of the game's interface. SP is the cyan Soul gauge.
 
-The donor is deliberately `WBP_StaminaGauge_Player_C`: it is the only player
-gauge with **no blueprint graph at all** — no `UberGraphFrame`, no `Construct`,
-no `ExecuteUbergraph`. Copying the HP or SP gauge would run their construction
-logic against a widget that has no avatar behind it. The copy is driven with
-`ResetGaugeValue` / `ResetGaugeRate` rather than the `Set*` pair, because the
-`Set*` path is the animated one that drives blink animations and the widget's
-own timers; `Reset*` just states the value, which is all an experience bar
-wants. If the copy cannot be made for any reason, the mod logs why and draws
-`EXP_STYLE = "flat"` instead — two tinted rectangles, a backing and a fill
-driven by its own slot width.
+## Optional In-Game Configuration
 
-`EXP_ANCHOR` picks which gauge it is positioned against and parented to, so it
-shares that gauge's coordinate space and always lines up with it.
-`EXP_PLACEMENT` picks which edge it hangs off, again as a normalised anchor that
-needs no measurement: `"above"` puts the bar's bottom edge on the gauge's top
-edge, `"below"` puts its top edge on the gauge's bottom edge. `EXP_OFFSET_Y` is
-a nudge from there. Zero width or height copies the anchor bar's own, which is
-what keeps all four bars looking like one set — only the SIZE has a fallback if
-the anchor bar could not be measured.
+For easier tuning, install:
 
-`SHOW_EXP` switches the whole block; `SHOW_EXP_BAR`, `SHOW_EXP_TEXT` and
-`SHOW_EXP_LEVEL` switch the bar, the numbers and the `Lv.52` prefix
-individually.
+[Echoes of Aincrad Mod Menu](https://www.nexusmods.com/echoesofaincrad/mods/84)
 
-### Experience values
+Open the Start Menu, select **Mods**, and expand **Gauge Numbers**.
 
-`ARODPlayerState.ExperienceData` supplies the level and the experience, and
-`GetNextHeroExp(level)` the requirement, refreshed only when the level changes.
-The experience is read as progress *into* the current level, which is what the
-status screen shows (`615 / 24000` at Lv.52). Should a build ever report it as a
-running total instead, the previous level's requirement becomes the floor of the
-current span and both numbers are rebased onto it — the only signal that can
-distinguish the two without guessing is a current value that exceeds the
-requirement, so the simple reading is preferred otherwise. Turn on `DEBUG_LOGS`
-to see the raw level, requirement and floor in `UE4SS.log`.
+Changes are applied by rebuilding only the widgets created by this mod. The game's original HUD widgets are not replaced.
 
-### Lifecycle
+Without the Mod Menu, edit:
 
-The cockpit's own validity is the lifecycle. Its widgets die with it, so nothing
-is torn down on a map change: the references are dropped once `IsValid` stops
-answering, and the next poll rebuilds against the new cockpit. Reaching into
-those widgets after the world changed would be a stale dereference, and a stale
-dereference is an access violation that `pcall` cannot catch.
-
-The widgets *are* detached properly on a settings change, which runs on the game
-thread with the world live — geometry, styling and which widgets exist are baked
-in at injection time, so a settings change has to rebuild them to be seen.
+```text
+GaugeNumbers\Scripts\config.lua
+```
 
 ## Configuration
 
-Edit `Scripts/config.lua` or use the optional in-game ModMenu:
+The complete default configuration is:
 
 ```lua
 return {
@@ -168,63 +113,219 @@ return {
     SHOW_HP = true,
     SHOW_STAMINA = true,
     SHOW_SP = true,
-    READOUT_LAYER = "front",        -- "front" | "gauge"
-    READOUT_PLACEMENT = "center",   -- "center" | "right"
-    ALIGN_READOUTS = true,          -- only used by "right"
-    VALUE_FORMAT = "current_max",   -- "current_max" | "current" | "percent"
-    TEXT_OFFSET_X = 0.0,
-    TEXT_OFFSET_Y = 0.0,
-    FONT_SIZE = 13.0,
+
+    READOUT_LAYER = "front",
+
+    HP_X = 198.0,
+    HP_Y = 92.0,
+    STAMINA_X = 189.0,
+    STAMINA_Y = 126.0,
+    SP_X = 161.0,
+    SP_Y = 155.0,
+
+    READOUT_PLACEMENT = "center",
+    ALIGN_READOUTS = true,
+    VALUE_FORMAT = "current_max",
+
+    TEXT_OFFSET_X = -8.0,
+    TEXT_OFFSET_Y = -18.0,
+    FONT_SIZE = 11.0,
 
     SHOW_EXP = true,
     SHOW_EXP_BAR = true,
     SHOW_EXP_TEXT = true,
     SHOW_EXP_LEVEL = true,
-    EXP_STYLE = "native",           -- "native" | "flat"
-    EXP_ANCHOR = "hp",              -- "hp" | "stamina" | "sp"
-    EXP_PLACEMENT = "above",        -- "above" | "below"
+
+    EXP_STYLE = "native",
+    EXP_ANCHOR = "hp",
+    EXP_PLACEMENT = "above",
+
     EXP_OFFSET_X = 0.0,
     EXP_OFFSET_Y = -4.0,
-    EXP_BAR_WIDTH = 0.0,            -- 0 copies the anchor bar
-    EXP_BAR_HEIGHT = 0.0,           -- 0 copies the anchor bar
+    EXP_BAR_WIDTH = 0.0,
+    EXP_BAR_HEIGHT = 0.0,
 
     REFRESH_MS = 500,
     DEBUG_LOGS = false,
 }
 ```
 
-The Stamina bar is the orange one the HUD calls Vigor; SP is the cyan one.
+### Status Readouts
 
-When ModMenu is installed, machine-local overrides are written to
-`Scripts/runtime.lua`. That file is optional and should not be included when
-redistributing the mod.
-
-## Tuning and diagnosis
-
-Every injection writes one line per widget to `UE4SS.log`, with no debug flag
-needed — this is what a misplaced readout is diagnosed from:
+The following switches control which values are displayed:
 
 ```text
-READOUT | HP attached | layer=front | unit x=… y=… w=… h=… + gauge x=… | z=…
-EXPERIENCE | native bar above hp | layer=front | at …,… (…x…) | z=… | anchor …
+SHOW_HP
+SHOW_STAMINA
+SHOW_SP
 ```
 
-`layer=gauge` means the front layer could not be resolved, `unmeasured` means no
-rectangle could be read at all, and the `native`/`flat` word says whether the
-copy of the game's gauge was made. A settings change re-injects immediately, so
-tuning offsets is live through the ModMenu.
+`VALUE_FORMAT` accepts:
 
-For the layout itself, the UE4SS console command
+```text
+current_max   280 / 280
+current       280
+percent       100%
+```
+
+`READOUT_PLACEMENT` accepts:
+
+```text
+center   places the number over its gauge
+right    places the number beside the gauge
+```
+
+`ALIGN_READOUTS` aligns the three values into one column when `READOUT_PLACEMENT` is set to `right`.
+
+### Readout Layers
+
+`READOUT_LAYER` accepts:
+
+```text
+front    draws on the cockpit gauge canvas, in front of the gauge assemblies
+inside   attempts to attach inside the gauge widget
+ gauge   attaches to the gauge assembly canvas
+```
+
+`front` is the recommended default for centred text.
+
+The `inside` and `gauge` layers can be useful for alternative layouts, but the gauge artwork may draw over centred text. The mod falls back safely when a selected layer cannot accept the widget.
+
+### Positioning
+
+The individual positions are:
+
+```text
+HP_X / HP_Y
+STAMINA_X / STAMINA_Y
+SP_X / SP_Y
+```
+
+These values use the HUD's design-space coordinates rather than physical monitor pixels. The defaults match the current game HUD, but they remain configurable for custom layouts and future interface changes.
+
+Use these first for broad positioning:
+
+```text
+TEXT_OFFSET_X
+TEXT_OFFSET_Y
+```
+
+They move all three status readouts together without changing their relative spacing.
+
+`FONT_SIZE` controls the numeric text size.
+
+### Experience Display
+
+`SHOW_EXP` controls the complete experience block.
+
+Its individual parts can also be controlled through:
+
+```text
+SHOW_EXP_BAR
+SHOW_EXP_TEXT
+SHOW_EXP_LEVEL
+```
+
+`EXP_STYLE` accepts:
+
+```text
+native   uses a copy of the game's own gauge widget
+flat     uses a simple backing and fill drawn by the mod
+```
+
+The native style is preferred. If it cannot be created, the mod automatically uses the flat style instead.
+
+`EXP_ANCHOR` accepts:
+
+```text
+hp
+stamina
+sp
+```
+
+`EXP_PLACEMENT` accepts:
+
+```text
+above
+below
+```
+
+Use `EXP_OFFSET_X` and `EXP_OFFSET_Y` for fine positioning.
+
+When `EXP_BAR_WIDTH` or `EXP_BAR_HEIGHT` is `0`, the mod copies the dimensions of the selected anchor gauge. Non-zero values allow a custom size.
+
+### Refresh Interval
+
+The HP, Stamina and SP readouts are updated immediately through the game's own gauge-change events.
+
+`REFRESH_MS` controls a separate reconciliation pass that:
+
+- recovers after map or HUD reconstruction;
+- fills newly attached readouts immediately;
+- refreshes experience progress;
+- corrects a value if a native event was missed.
+
+The default is `500` milliseconds.
+
+## How It Works
+
+The mod hooks the native cockpit gauge events:
+
+```text
+OnHealthChangedEvent
+OnStaminaChangedEvent
+OnSoulChangedEvent
+```
+
+The hook parameters are read synchronously while the native call is active. They are not retained or used by delayed callbacks.
+
+The mod also reads the player's current attribute sets during reconciliation so newly created widgets do not remain empty until the next value change.
+
+Experience information is read from the local player state's experience data. The mod displays progress into the current level and uses the game's own next-level requirement when available.
+
+All added widgets are non-interactive and cannot consume mouse, keyboard or controller input.
+
+## Diagnostics
+
+Run the following command in the UE4SS console:
 
 ```text
 gaugenumbers probe
 ```
 
-walks the cockpit's real widget tree — `cockpit.UnitGauge` and each assembly —
-and logs every node with its slot type, ZOrder, position and size. Deducing that
-tree from the SDK headers got the draw order wrong twice: a header lists a
-class's members, not which of them parents which.
+The command writes the live cockpit gauge tree, slot types, positions, sizes and Z-order information to:
 
-If a gauge assembly or its canvas is absent, the mod reports the exact missing
-contract once and leaves the HUD untouched rather than drawing a substitute
-overlay.
+```text
+UE4SS.log
+```
+
+This is useful when tuning offsets or diagnosing a game update that changed the HUD layout.
+
+The UE4SS console requires:
+
+```text
+GuiConsoleEnabled = 1
+```
+
+under the `[Debug]` section of:
+
+```text
+UE4SS-settings.ini
+```
+
+Enable `DEBUG_LOGS` for additional resolution, experience and injection diagnostics.
+
+## Known Limitations
+
+- The default coordinates are based on the current Echoes of Aincrad HUD.
+- Large interface changes from future game updates may require new default positions.
+- Alternative HUD scaling, ultrawide layouts or other HUD mods may require offset adjustments.
+- The native experience bar depends on a compatible gauge widget being available in the mounted cockpit.
+- When the native bar cannot be created, the flat fallback is used.
+- The mod displays the values reported by the game and does not alter or correct gameplay calculations.
+
+## Credits
+
+Built for UE4SS.
+
+Echoes of Aincrad and all related game assets and trademarks belong to their respective owners.
