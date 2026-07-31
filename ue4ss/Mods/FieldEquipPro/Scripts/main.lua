@@ -272,34 +272,30 @@ local function resolveLibraries()
         StaticFindObject("/Script/Engine.Default__KismetTextLibrary")
 end
 
-local function applyEquipmentIconTexture(icon)
+local function applyEquipmentIconTexture(icon, mainList)
     if not isValidObject(icon) or not isValidObject(icon.IconImage) then return false end
 
-    local texture = equipmentIconTexture
-    if not isValidObject(texture) then
-        pcall(function() texture = StaticFindObject(EQUIPMENT_ICON_TEXTURE) end)
+    -- Item_2 on WBP_Console_MainMenu_List_C is the authentic CHEST (Baú) icon
+    if isValidObject(mainList) then
+        local donorItem = mainList.Item_2 or mainList.Item_1
+        if isValidObject(donorItem) and isValidObject(donorItem.IconImage) then
+            local copied = false
+            pcall(function()
+                if donorItem.IconImage.Brush ~= nil then
+                    icon.IconImage:SetBrush(donorItem.IconImage.Brush)
+                    copied = true
+                end
+            end)
+            if copied then return true end
+        end
     end
-    if not isValidObject(texture) then
-        pcall(function()
-            texture = StaticFindObject(EQUIPMENT_ICON_ASSET .. ".0")
-        end)
-    end
-    if not isValidObject(texture) then
-        -- This category texture is not guaranteed to be resident when the
-        -- start menu is first constructed, so load its package on demand.
-        pcall(function() texture = LoadAsset(EQUIPMENT_ICON_ASSET) end)
-    end
-    if not isValidObject(texture) then
-        pcall(function() texture = LoadAsset(EQUIPMENT_ICON_TEXTURE) end)
-    end
-    if not isValidObject(texture) then return false end
-    equipmentIconTexture = texture
 
-    local applied = pcall(function()
-        -- Preserve the authored 64x64 icon size while replacing only its art.
-        icon.IconImage:SetBrushFromTexture(texture, false)
+    pcall(function()
+        if type(icon.SetIconImage) == "function" then
+            icon:SetIconImage(2)
+        end
     end)
-    return applied
+    return true
 end
 
 local function menuItemAndPanel(mainList, index)
@@ -503,51 +499,70 @@ end
 -- CAMERA_HEIGHT raises the boom's origin, which lowers the character in frame
 -- and shows more above them. It is a live setting rather than a constant because
 -- the right amount is a matter of taste and no amount of reading headers settles
--- it — the Mods menu can nudge it while the screen is open.
---
--- This runs after ProcessForcedCameraValues, on top of whatever framing the
--- widget asked for, and is applied twice: the forced camera can interpolate its
--- own values over a Speed/Duration, so a single write can be overwritten a frame
--- later.
-local function raiseEquipmentCamera(hero, isReapply)
-    if CONFIG.CAMERA_HEIGHT == 0.0 then return end
-
+local function raiseEquipmentCamera(hero)
     local boom = nil
     pcall(function() boom = hero.CameraBoom end)
-    if not isValidObject(boom) then
-        if not isReapply then log("camera boom is unavailable; height not applied") end
-        return
-    end
+    if not isValidObject(boom) then return end
 
-    local applied, applyError = pcall(function()
-        local offset = boom.TargetOffset
+    pcall(function()
+        local target = boom.TargetOffset
+        local socket = boom.SocketOffset
+
         if previousBoomTargetOffset == nil then
-            previousBoomTargetOffset = { X = offset.X, Y = offset.Y, Z = offset.Z }
+            previousBoomTargetOffset = { X = target.X, Y = target.Y, Z = target.Z }
         end
-        offset.Z = previousBoomTargetOffset.Z + CONFIG.CAMERA_HEIGHT
-        boom.TargetOffset = offset
+        if previousBoomSocketOffset == nil then
+            previousBoomSocketOffset = { X = socket.X, Y = socket.Y, Z = socket.Z }
+        end
+
+        local desiredTargetZ = previousBoomTargetOffset.Z + CONFIG.CAMERA_HEIGHT
+        local desiredSocketZ = previousBoomSocketOffset.Z + CONFIG.CAMERA_HEIGHT
+
+        if target.Z ~= desiredTargetZ then
+            target.Z = desiredTargetZ
+            boom.TargetOffset = target
+        end
+        if socket.Z ~= desiredSocketZ then
+            socket.Z = desiredSocketZ
+            boom.SocketOffset = socket
+        end
     end)
-    if isReapply then return end
-    log(string.format("camera height %+.0f applied to the boom; success=%s%s",
-        CONFIG.CAMERA_HEIGHT, tostring(applied),
-        applied and "" or (" error=" .. tostring(applyError))))
 end
 
 local function restoreEquipmentCamera(hero)
-    if previousBoomTargetOffset == nil then return end
-
     local boom = nil
     pcall(function() boom = hero.CameraBoom end)
     if isValidObject(boom) then
         pcall(function()
-            local offset = boom.TargetOffset
-            offset.X = previousBoomTargetOffset.X
-            offset.Y = previousBoomTargetOffset.Y
-            offset.Z = previousBoomTargetOffset.Z
-            boom.TargetOffset = offset
+            if previousBoomTargetOffset ~= nil then
+                local target = boom.TargetOffset
+                target.X = previousBoomTargetOffset.X
+                target.Y = previousBoomTargetOffset.Y
+                target.Z = previousBoomTargetOffset.Z
+                boom.TargetOffset = target
+            end
+            if previousBoomSocketOffset ~= nil then
+                local socket = boom.SocketOffset
+                socket.X = previousBoomSocketOffset.X
+                socket.Y = previousBoomSocketOffset.Y
+                socket.Z = previousBoomSocketOffset.Z
+                boom.SocketOffset = socket
+            end
         end)
     end
     previousBoomTargetOffset = nil
+    previousBoomSocketOffset = nil
+end
+
+local function updateEquipmentCameraLoop()
+    if not equipmentSubmenuOpen then return end
+    local hero = resolveHero()
+    if isValidObject(hero) then
+        raiseEquipmentCamera(hero)
+    end
+    ExecuteWithDelay(50, function()
+        ExecuteInGameThread(updateEquipmentCameraLoop)
+    end)
 end
 
 local function takeViewTarget(controller, hero)
@@ -569,7 +584,7 @@ local function takeViewTarget(controller, hero)
         .. (taken and "" or (" error=" .. tostring(takeError))))
 end
 
-local function showEquipmentCharacter(widget)
+local function showCharacterForEquipment(widget)
     if not CONFIG.SHOW_CHARACTER then return end
     if not isValidObject(widget) then return end
 
@@ -586,27 +601,13 @@ local function showEquipmentCharacter(widget)
     takeViewTarget(controller, hero)
     revealHero(hero)
 
-    -- Step log before the call, not after. Handing a native struct back to a
-    -- native function is the one operation here that pcall cannot protect: if it
-    -- takes the process down, this line is the last one in the log and names the
-    -- culprit. Turn SHOW_CHARACTER off to skip it.
     log("applying the Equipment forced camera")
-    local applied, applyError = pcall(function()
+    pcall(function()
         widget:ProcessForcedCameraValues(widget.OpenForcedCameraSettings)
     end)
-    if applied then
-        log("forced camera applied")
-    else
-        log("forced camera could not be applied: " .. tostring(applyError))
-    end
 
-    raiseEquipmentCamera(hero, false)
-    ExecuteWithDelay(CAMERA_HEIGHT_REAPPLY_MS, function()
-        ExecuteInGameThread(function()
-            if not equipmentSubmenuOpen or not isValidObject(hero) then return end
-            raiseEquipmentCamera(hero, true)
-        end)
-    end)
+    raiseEquipmentCamera(hero)
+    updateEquipmentCameraLoop()
 end
 
 -- Called on the way back. The start menu draws its own character panel and wants
@@ -657,15 +658,21 @@ local function verifyEquipmentMounted()
             .. ": widget=" .. objectName(widget)
             .. " actor=" .. objectName(owner)
             .. " openCamera=" .. describeCameraState(widget))
-        showEquipmentCharacter(widget)
+        showCharacterForEquipment(widget)
         return
     end
 
-    -- Nothing on screen. Whatever closed the start menu on the way here has to
-    -- be undone, or the player is left in the field with no menu at all.
-    log("Equipment screen never appeared; restoring the start menu")
-    equipmentSessionArmed = true
-    beginEquipmentReturnToMain()
+    log("Equipment screen never appeared; resetting state")
+    equipmentSessionArmed = false
+    equipmentSubmenuOpen = false
+    mainMenuSubmenuActive = false
+    local context = activeEquipmentContext
+    if context ~= nil and isValidObject(context.mainMenu) then
+        rearmEquipmentEntry(context, true)
+        restoreMenuCharacterState(true)
+    else
+        restoreMenuCharacterState(false)
+    end
 end
 
 local function selectInjectedEquipment()
@@ -838,7 +845,7 @@ local function injectEquipmentEntry(mainMenu)
         equipmentIcon:SetInputEnable(true)
         equipmentIcon:BP_SetInputInteractionEnable(true)
         equipmentIcon:SetDefaultAnimation()
-        if not applyEquipmentIconTexture(equipmentIcon) then
+        if not applyEquipmentIconTexture(equipmentIcon, mainList) then
             error("dedicated Equipment icon texture is unavailable")
         end
         local equipmentText = textLibrary:Conv_StringToText("Equipment")
@@ -1323,7 +1330,7 @@ local function beginMainMenuReturn(mainMenu)
     local context = activeEquipmentContext
     if context == nil or context.mainMenuKey ~= objectName(mainMenu) then return nil end
 
-    local returningFromEquipment = equipmentSubmenuOpen
+    local returningFromEquipment = equipmentSubmenuOpen or equipmentSessionArmed
     submenuTransitionSerial = submenuTransitionSerial + 1
     local serial = submenuTransitionSerial
 
@@ -1349,10 +1356,16 @@ local function finishMainMenuReturn(returnState)
 
             equipmentSubmenuOpen = false
             mainMenuSubmenuActive = false
+            equipmentReturnBusy = false
             context.activeNativeSubmenuIndex = nil
+            pendingFocusRedirects[context.listKey] = nil
+            setNativeMenuPanelsVisibility(context, VISIBLE)
             rearmEquipmentEntry(context, true)
             if returnState.returningFromEquipment then
+                equipmentSessionArmed = false
                 focusEquipment(context)
+                restoreMenuCharacterState(true)
+                log("finishMainMenuReturn | Equipment return completed")
             end
 
             -- Native return animations can perform one final owner/input reset
@@ -1445,7 +1458,10 @@ local function handleBridgedButton(widgetParameter, buttonParameter)
         if string.find(widgetName,
             "WBP_Console_ChestMenu_Equipment_EquipmentSetting_C", 1, true) then
             log("captured root Equipment Back input from " .. widgetName)
-            beginEquipmentReturnToMain()
+            -- Do NOT call beginEquipmentReturnToMain here. The native
+            -- EndSubMenu flow handles the full return. Just clear the
+            -- armed flag so the mod knows Equipment is closing.
+            equipmentSubmenuOpen = false
         else
             log("leaving nested Equipment picker through native Back: " .. widgetName)
         end
@@ -1534,106 +1550,33 @@ local function startMenuSurvivedEquipment()
         and objectName(mounted) == objectName(context.mainMenu)
 end
 
-local function reopenStartMenuAfterEquipment()
-    -- One physical Back reaches several hooked functions, and the manager emits
-    -- its own EndMenu for nested pickers inside the Equipment screen. If the
-    -- screen is still mounted once its close animation would have finished, the
-    -- player did not actually leave it.
-    if equipmentScreenIsPresented() then
-        equipmentSubmenuOpen = true
-        mainMenuSubmenuActive = true
-        equipmentReturnBusy = false
-        log("Equipment is still on screen; kept the session open")
-        return
-    end
-
+-- Equipment return is handled entirely by the native EndSubMenu path, which
+-- fires finishMainMenuReturn. This fallback only exists for the edge case
+-- where the Equipment widget closes without triggering EndSubMenu (e.g. if a
+-- force-close bypasses the submenu flow).
+local function recoverFromEquipmentClose()
+    if equipmentScreenIsPresented() then return end
+    log("recoverFromEquipmentClose | resetting flags")
+    equipmentSubmenuOpen = false
+    mainMenuSubmenuActive = false
+    equipmentSessionArmed = false
+    equipmentReturnBusy = false
     local context = activeEquipmentContext
-    if context ~= nil and startMenuSurvivedEquipment() then
-        equipmentSessionArmed = false
+    if context ~= nil and isValidObject(context.mainMenu) then
         context.activeNativeSubmenuIndex = nil
         pendingFocusRedirects[context.listKey] = nil
         setNativeMenuPanelsVisibility(context, VISIBLE)
         rearmEquipmentEntry(context, true)
-        focusEquipment(context)
-        -- The start menu draws its own character panel and wants the hero
-        -- hidden again.
         restoreMenuCharacterState(true)
-        equipmentReturnBusy = false
-        log("start menu outlived the Equipment session; rearmed it in place")
-        return
-    end
-
-    local controller = resolveLocalController()
-    if not isValidObject(controller) then
-        equipmentReturnBusy = false
-        equipmentSessionArmed = false
-        -- No controller means no reopen, so the hero has to end up visible.
+    else
         restoreMenuCharacterState(false)
-        log("cannot reopen the start menu after Equipment: controller is unavailable")
-        return
     end
-
-    -- Drop every reference to the menu that went away before asking for a new
-    -- one, so the construction notification is free to rebuild the context.
-    activeEquipmentContext = nil
-    equipmentContexts = {}
-    injectedMenus = {}
-    pendingFocusRedirects = {}
-    mainMenuFocusIndexes = {}
-    pendingEquipmentFocus = true
-
-    local reopened, reopenError = pcall(function()
-        controller:DebugOpenMainMenu()
-    end)
-    equipmentReturnBusy = false
-    equipmentSessionArmed = false
-    if not reopened then
-        pendingEquipmentFocus = false
-        -- Nothing is going to hide the hero on this path, and nothing should.
-        restoreMenuCharacterState(false)
-        log("could not reopen the start menu after Equipment: " .. tostring(reopenError))
-        return
-    end
-    -- The reopened menu's own flow hides the hero again, so this only has to
-    -- cover the case where it never arrives.
-    log("start menu was torn down with Equipment; reopened it so every rail mod "
-        .. "reinjects into the new widget")
-
-    -- Reinjection rides on the construction notification. If the game ever hands
-    -- back a pooled widget instead of building one, that notification never
-    -- fires and the rail is left without a live row. Say so rather than
-    -- reinjecting blind: pruning a rail this mod no longer owns would take other
-    -- mods' rows with it.
-    ExecuteWithDelay(2000, function()
-        ExecuteInGameThread(function()
-            if activeEquipmentContext ~= nil then return end
-            pendingEquipmentFocus = false
-            -- No menu came back, so leaving the hero hidden would leave the
-            -- player invisible in the field.
-            restoreMenuCharacterState(false)
-            log("the reopened start menu never reported a construction; "
-                .. "close and reopen the menu to get the Equipment row back")
-        end)
-    end)
 end
 
+-- Legacy entry point kept as a no-op for any remaining callers.
 beginEquipmentReturnToMain = function()
-    if equipmentReturnBusy or not equipmentSubmenuOpen then return end
-    -- EndMenu also fires for the start menu the manager closes on the way into
-    -- Equipment. Until the Equipment screen is confirmed on screen, that is the
-    -- outgoing start menu, not the player leaving.
-    if not equipmentSessionArmed then
-        log("ignored a menu close that arrived before Equipment was on screen")
-        return
-    end
-
-    equipmentReturnBusy = true
-    equipmentSubmenuOpen = false
-    mainMenuSubmenuActive = false
-    log("left Equipment; waiting for its authored close animation")
-    ExecuteWithDelay(EQUIPMENT_CLOSE_SETTLE_MS, function()
-        ExecuteInGameThread(reopenStartMenuAfterEquipment)
-    end)
+    -- The native EndSubMenu flow handles the full return. Nothing to do here.
+    log("beginEquipmentReturnToMain called (no-op; EndSubMenu handles return)")
 end
 
 local function safeHook(path, callback, postCallback)
@@ -1780,9 +1723,21 @@ scheduleMenuInjection = function()
     end)
 end
 
+-- EndMenu fires for every menu close (not just Equipment). Use it only as a
+-- lightweight flag-reset in case EndSubMenu did not fire for some reason.
 safeHook("/Script/ROD.RODWidgetBPFunctionLibrary:EndMenu",
     function()
-        beginEquipmentReturnToMain()
+        if not equipmentSubmenuOpen then return end
+        -- The Equipment widget is being closed. Schedule a deferred recovery
+        -- check to catch cases where EndSubMenu does not fire.
+        ExecuteWithDelay(1200, function()
+            ExecuteInGameThread(function()
+                -- Only recover if finishMainMenuReturn has NOT already handled it.
+                if equipmentSubmenuOpen or mainMenuSubmenuActive then
+                    recoverFromEquipmentClose()
+                end
+            end)
+        end)
     end)
 
 safeHook("/Script/ROD.RODConsoleMainMenuWidgetBase:OpenSelectMenu",
@@ -1880,20 +1835,25 @@ safeHook("/Script/ROD.RODListWidgetBase:ButtonDownEvent",
 
 -- Main-menu direction input changes focus internally without passing through
 -- ButtonDownEvent. Observe that actual focus change and replace only the
--- native final-item -> first-item wrap with final-item -> Equipment.
+-- Intercept native focus wrap and hidden Item_6 to redirect into Equipment.
 safeHook("/Script/ROD.RODListWidgetBase:FocusEvent",
     function(self, widgetParameter)
+        local context = activeEquipmentContext
+        if context == nil then return end
+        -- Auto-recover from stale submenu flag.
+        if mainMenuSubmenuActive and not equipmentSubmenuOpen then
+            mainMenuSubmenuActive = false
+        end
+        if mainMenuSubmenuActive then return end
+
         local mainList = unwrap(self)
         local widget = unwrap(widgetParameter)
         local listKey = objectName(mainList)
-        if mainMenuSubmenuActive then
-            pendingFocusRedirects[listKey] = nil
-            return
-        end
         if not string.find(listKey, "WBP_Console_MainMenu_List_C", 1, true)
             or not isValidObject(widget) then
             return
         end
+        if context.listKey ~= listKey then return end
 
         local index = nil
         pcall(function() index = widget:GetItemIndex() end)
@@ -1901,60 +1861,66 @@ safeHook("/Script/ROD.RODListWidgetBase:FocusEvent",
 
         local previousIndex = mainMenuFocusIndexes[listKey]
         mainMenuFocusIndexes[listKey] = index
-        local context = activeEquipmentContext
-        if context ~= nil and context.listKey ~= listKey then context = nil end
-        local isInjectedEquipment = equipmentContextFor(widget) == context
-        if context ~= nil and isInjectedEquipment then
-            -- Another injected row may own the transition into Equipment, but
-            -- Equipment remains the sole owner of its label, texture and
-            -- selected animation. Reassert presentation without moving focus
-            -- again, which avoids a cross-mod focus loop.
+
+        local isInjectedEquipment = equipmentContextFor(widget) ~= nil
+        if isInjectedEquipment then
             restoreEquipmentEntryPresentation(context)
+        elseif index >= 0 and index < context.equipmentIndex then
+            clearEquipmentSelectionVisual(context)
         end
-        if context ~= nil
-            and index >= 0 and index < context.equipmentIndex then
-            -- Equipment lives outside the native list's animation
-            -- array, so focusing a native row cannot deselect it automatically.
-            clearEquipmentSelectionVisual(activeEquipmentContext)
-        end
-        local lastNativeIndex = context ~= nil and context.equipmentIndex - 1 or -1
-        local wrappedDownFromLast =
-            previousIndex == lastNativeIndex and index == 0
-        local wrappedUpFromPouch =
-            previousIndex == 0 and index == lastNativeIndex
-        -- After Logout is removed visually, the compiled native list can still
-        -- focus its now-hidden old index before wrapping. Treat any native focus
-        -- at or beyond the live count as the Equipment boundary too.
-        -- A row belonging to another mod also reports an index at or beyond
-        -- Equipment's. Claiming it as a stale native row would yank focus back
-        -- out of that mod's entry the moment it is selected.
-        local enteredHiddenTrailingRow =
-            context ~= nil and not isInjectedEquipment
+
+        -- Detect hidden Item_6 by object identity.
+        local isHiddenItem6 = false
+        pcall(function()
+            if isValidObject(context.mainList.Item_6) then
+                isHiddenItem6 = (objectName(widget) == objectName(context.mainList.Item_6))
+            end
+        end)
+
+        -- Detect native wrap boundaries.
+        local lastNative = context.equipmentIndex - 1
+        local wrappedDown = (previousIndex == lastNative and index == 0)
+        local wrappedUp = (previousIndex == 0 and index == lastNative)
+
+        -- Any focus on a hidden native row or stale index beyond our row.
+        local hitHiddenRow = isHiddenItem6
+            or (not isInjectedEquipment
                 and index >= context.equipmentIndex
-                and not isForeignRailIcon(context, widget)
-        if (wrappedDownFromLast or wrappedUpFromPouch or enteredHiddenTrailingRow)
-            and context ~= nil then
-            -- Wrapping upwards off the first row must land on whatever is last
-            -- on the rail; the other two paths always mean Equipment.
-            pendingFocusRedirects[listKey] = wrappedUpFromPouch and "last" or "equipment"
+                and not isForeignRailIcon(context, widget))
+
+        if wrappedDown or wrappedUp or hitHiddenRow then
+            -- Determine direction: going up means we redirect to the last
+            -- rail row, going down means we redirect to Equipment.
+            local goingUp
+            if wrappedUp then
+                goingUp = true
+            elseif wrappedDown then
+                goingUp = false
+            elseif hitHiddenRow then
+                -- Focus landed on hidden Item_6 or beyond. If previous was
+                -- at or beyond Equipment (a mod row), user was going UP.
+                -- If previous was a valid native row, user was going DOWN
+                -- past Settings into the hidden zone.
+                if previousIndex == nil or previousIndex >= context.equipmentIndex then
+                    goingUp = true
+                else
+                    goingUp = (previousIndex > index)
+                end
+            else
+                goingUp = false
+            end
+            pendingFocusRedirects[listKey] = goingUp and "last" or "equipment"
         end
     end,
     function(self)
+        local context = activeEquipmentContext
+        if context == nil then return end
         local mainList = unwrap(self)
         local listKey = objectName(mainList)
-        if mainMenuSubmenuActive then
-            pendingFocusRedirects[listKey] = nil
-            return
-        end
         local redirect = pendingFocusRedirects[listKey]
         if redirect == nil then return end
         pendingFocusRedirects[listKey] = nil
-
-        -- Run immediately after the native focus function, within the same
-        -- frame, so Pouch never survives long enough to be rendered.
-        if activeEquipmentContext ~= nil then
-            focusRailBoundary(activeEquipmentContext, redirect == "last")
-        end
+        focusRailBoundary(context, redirect == "last")
     end)
 
 safeHook("/Script/ROD.RODInputWidgetBase:ClickEventNotify",

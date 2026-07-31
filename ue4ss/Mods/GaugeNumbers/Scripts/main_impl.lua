@@ -1,5 +1,5 @@
 local MOD_NAME = "GaugeNumbers"
-local MOD_VERSION = "1.1.0"
+local MOD_VERSION = "1.0.0"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -81,6 +81,12 @@ local BOOLEAN_KEYS = {
 }
 
 local NUMBER_KEYS = {
+    HP_X           = { min = 0.0, max = 1920.0 },
+    HP_Y           = { min = 0.0, max = 1080.0 },
+    STAMINA_X      = { min = 0.0, max = 1920.0 },
+    STAMINA_Y      = { min = 0.0, max = 1080.0 },
+    SP_X           = { min = 0.0, max = 1920.0 },
+    SP_Y           = { min = 0.0, max = 1080.0 },
     TEXT_OFFSET_X  = { min = -400.0, max = 400.0 },
     TEXT_OFFSET_Y  = { min = -400.0, max = 400.0 },
     FONT_SIZE      = { min = 6.0, max = 48.0 },
@@ -92,9 +98,12 @@ local NUMBER_KEYS = {
 }
 
 local CHOICE_KEYS = {
-    VALUE_FORMAT = { current_max = true, current = true, percent = true },
-    EXP_STYLE    = { native = true, flat = true },
-    EXP_ANCHOR   = { hp = true, stamina = true, sp = true },
+    VALUE_FORMAT      = { current_max = true, current = true, percent = true },
+    READOUT_PLACEMENT = { center = true, right = true },
+    READOUT_LAYER     = { inside = true, gauge = true, front = true },
+    EXP_STYLE         = { native = true, flat = true },
+    EXP_ANCHOR        = { hp = true, stamina = true, sp = true },
+    EXP_PLACEMENT     = { above = true, below = true },
 }
 
 local function readSettings(settings)
@@ -167,6 +176,8 @@ end
 -- HitTestInvisible: it can never swallow a click or become a focus target
 -- belonging to the HUD underneath.
 local HIT_TEST_INVISIBLE = 3
+local COLLAPSED = 1
+local HIDDEN = 2
 
 local TEXT_BLOCK_CLASS = "/Script/UMG.TextBlock"
 local IMAGE_CLASS = "/Script/UMG.Image"
@@ -177,9 +188,10 @@ local WHITE = { R = 1.0, G = 1.0, B = 1.0, A = 1.0 }
 local EXP_FILL_COLOR = { R = 1.0, G = 0.78, B = 0.28, A = 1.0 }
 local EXP_BACK_COLOR = { R = 0.02, G = 0.03, B = 0.05, A = 0.55 }
 
--- unit    the cockpit member holding the whole bar assembly.
--- canvas  the CanvasPanel inside it that owns the bar's coordinate space.
--- gauge   the gauge widget itself, measured to place things against it.
+-- unit     the cockpit member holding the whole bar assembly.
+-- canvas   the CanvasPanel inside it that owns the bar's coordinate space.
+-- gauge    the gauge widget itself.
+-- posX/Y   settings naming this bar's point on the cockpit gauge canvas.
 local BARS = {
     {
         key = "HP",
@@ -188,6 +200,8 @@ local BARS = {
         unit = "PlayerUnitGauge_HP",
         canvas = "HPGauge",
         gauge = "HP",
+        posX = "HP_X",
+        posY = "HP_Y",
     },
     {
         key = "STAMINA",
@@ -196,6 +210,8 @@ local BARS = {
         unit = "PlayerUnitGauge_Stamina",
         canvas = "StaminaGauge",
         gauge = "Stamina",
+        posX = "STAMINA_X",
+        posY = "STAMINA_Y",
     },
     {
         key = "SP",
@@ -204,6 +220,8 @@ local BARS = {
         unit = "PlayerUnitGauge_Soul",
         canvas = "SoulGauge",
         gauge = "Soul",
+        posX = "SP_X",
+        posY = "SP_Y",
     },
 }
 
@@ -221,9 +239,9 @@ end
 -- behind it.
 local NATIVE_DONOR = { unit = "PlayerUnitGauge_Stamina", gauge = "Stamina" }
 
--- Used only when no bar could be measured, so the experience bar still lands
--- somewhere sane instead of on top of a gauge. Designer pixels at 1080p.
-local FALLBACK_ANCHOR = { x = 35.0, y = 88.0, width = 320.0, height = 12.0 }
+-- Only used when nothing could be measured at all.
+local FALLBACK_BAR_WIDTH = 320.0
+local FALLBACK_BAR_HEIGHT = 12.0
 
 --========================================================--
 --                        STATE                           --
@@ -244,19 +262,23 @@ local state = {
 local function releaseWidgets(destroy, reason)
     if destroy then
         local doomed = {}
-        for _, entry in pairs(state.labels) do
-            doomed[#doomed + 1] = entry.widget
+        -- Appended through a guard, never by index: the experience block
+        -- leaves nil in whichever of native/back/fill its style did not build,
+        -- and a nil written at #doomed+1 both fails to grow the list and makes
+        -- ipairs stop early, silently sparing every widget after it.
+        local function condemn(widget)
+            if isValid(widget) then doomed[#doomed + 1] = widget end
         end
+
+        for _, entry in pairs(state.labels) do condemn(entry.widget) end
         if state.exp ~= nil then
-            doomed[#doomed + 1] = state.exp.native
-            doomed[#doomed + 1] = state.exp.back
-            doomed[#doomed + 1] = state.exp.fill
-            doomed[#doomed + 1] = state.exp.label
+            condemn(state.exp.native)
+            condemn(state.exp.back)
+            condemn(state.exp.fill)
+            condemn(state.exp.label)
         end
         for _, widget in ipairs(doomed) do
-            if isValid(widget) then
-                pcall(function() widget:RemoveFromParent() end)
-            end
+            pcall(function() widget:RemoveFromParent() end)
         end
     end
     state.cockpit = nil
@@ -284,6 +306,11 @@ local function objectName(object)
     local ok, name = pcall(function() return object:GetFullName() end)
     if ok and type(name) == "string" then return name end
     return "<unnamed>"
+end
+
+local function shortName(object)
+    local name = objectName(object)
+    return name:match("([^%.%s/]+)$") or name
 end
 
 local function findInstance(className)
@@ -329,29 +356,13 @@ local function resolvePlayerState(cockpit)
 end
 
 --========================================================--
---                  WIDGET CONSTRUCTION                   --
+--                      GEOMETRY                          --
 --========================================================--
-
-local function constructWidget(classPath, outer)
-    local class = nil
-    local ok = pcall(function() class = StaticFindObject(classPath) end)
-    if not ok or not isValid(class) then
-        return nil, "widget class is unavailable: " .. classPath
-    end
-    local widget = nil
-    local built, buildError = pcall(function()
-        widget = StaticConstructObject(class, outer)
-    end)
-    if not built then return nil, tostring(buildError) end
-    if not isValid(widget) then
-        return nil, "construction returned no widget: " .. classPath
-    end
-    return widget, nil
-end
 
 -- A CanvasPanelSlot is the only slot type carrying a position, and
 -- SlotAsCanvasSlot is the sanctioned way to ask for one: reading .Slot directly
--- would hand back whatever slot type the parent happens to use.
+-- would hand back whatever slot type the parent happens to use. It returns nil
+-- whenever the parent is not a CanvasPanel, which is information in itself.
 local function measure(widget)
     local layout = library(LAYOUT_LIBRARY)
     if layout == nil or not isValid(widget) then return nil end
@@ -376,32 +387,239 @@ local function measure(widget)
         return nil
     end
     if geometry.width <= 1.0 then return nil end
+    geometry.note = string.format("x=%.0f y=%.0f w=%.0f h=%.0f",
+        geometry.x, geometry.y, geometry.width, geometry.height)
     return geometry
 end
 
--- One measuring pass over all three bars. The readout column and the
--- experience bar are both derived from it, so they agree with each other.
-local function measureBars(cockpit)
-    local layout = { bars = {}, rightMost = nil }
-    for _, definition in ipairs(BARS) do
-        local unit = cockpit[definition.unit]
-        if isValid(unit) then
-            local geometry = measure(unit[definition.gauge])
-            if geometry ~= nil then
-                layout.bars[definition.key] = geometry
-                local right = geometry.x + geometry.width
-                if layout.rightMost == nil or right > layout.rightMost then
-                    layout.rightMost = right
+-- Drawing ON a bar means out-ranking everything already in that canvas, and a
+-- fixed ZOrder is a guess about a layout the mod does not own.
+--
+-- The floor matters as much as the survey: SlotAsCanvasSlot returns nothing
+-- for a child whose parent is not a CanvasPanel, and on this build it returns
+-- nothing for the gauges. A survey that reads no slot at all reports 0 and
+-- would put the readout on layer 10 -- under anything the HUD placed higher.
+local MINIMUM_Z_ORDER = 500
+
+local function topZOrder(canvas)
+    local layout = library(LAYOUT_LIBRARY)
+    local highest = 0
+    if layout == nil then return highest end
+
+    local count = nil
+    pcall(function() count = canvas:GetChildrenCount() end)
+    if type(count) ~= "number" then return highest end
+
+    for index = 0, count - 1 do
+        local child = nil
+        pcall(function() child = canvas:GetChildAt(index) end)
+        if isValid(child) then
+            local slot = nil
+            pcall(function() slot = layout:SlotAsCanvasSlot(child) end)
+            if isValid(slot) then
+                local order = nil
+                pcall(function() order = tonumber(slot:GetZOrder()) end)
+                if finiteNumber(order) and order > highest then
+                    highest = order
                 end
-                dbg(string.format("%s measured | x=%.1f y=%.1f w=%.1f h=%.1f",
-                    definition.key, geometry.x, geometry.y,
-                    geometry.width, geometry.height))
-            else
-                dbg(definition.key .. " unmeasured")
             end
         end
     end
-    return layout
+    return highest
+end
+
+-- Every gauge assembly caches its own drawing. A cached subtree keeps
+-- repainting what it was cached with, which would freeze anything the mod adds
+-- under it on its first value.
+local function stopCaching(widget, member)
+    pcall(function() widget[member]:SetCanCache(false) end)
+end
+
+-- The experience block's surface, and it is deliberately NOT the readouts'.
+-- Hanging it off the gauge assembly's own canvas by a normalised edge anchor
+-- is the arrangement that landed it correctly above the HUD; the readouts have
+-- a different problem (draw order) and chasing it must not move this.
+local function experienceSurface(cockpit, definition)
+    local unit = cockpit[definition.unit]
+    if not isValid(unit) then return nil end
+    local canvas = unit[definition.canvas]
+    if not isValid(canvas) then return nil end
+    stopCaching(unit, "InvalidationBox_root")
+    return { canvas = canvas, size = measure(unit[definition.gauge]) }
+end
+
+-- WHERE a readout draws, in order of preference, because a readout centred ON
+-- its bar has to be painted AFTER the gauge art and no ZOrder can achieve that
+-- from a canvas that is painted first. Attaching is the only honest test that
+-- a candidate is a usable canvas, so ensureLabel walks this list and keeps the
+-- first one that accepts the widget.
+--
+--   inside  the gauge widget's own root panel -- the innermost surface there
+--           is, painted last within the bar.
+--   gauge   the assembly canvas the gauge sits in. Painted before the gauge
+--           art, so a centred readout lands behind it, but an off-the-end one
+--           is clear of the art and shows fine.
+--   front   the cockpit's UnitGauge canvas. Painted after every assembly, but
+--           it only works if the assemblies report a rectangle in it -- and on
+--           this build they all report the origin, which stacks every readout
+--           in the corner.
+local function readoutCandidates(cockpit, definition)
+    local unit = cockpit[definition.unit]
+    if not isValid(unit) then return {} end
+    stopCaching(unit, "InvalidationBox_root")
+
+    local candidates = {}
+    local gauge = unit[definition.gauge]
+    -- Everything between the assembly and the gauge art. Any of these is a
+    -- plausible place for the HUD to apply its fade.
+    local chain = { unit, unit[definition.canvas], gauge }
+
+    if CONFIG.READOUT_LAYER == "inside" and isValid(gauge) then
+        local root = nil
+        pcall(function() root = gauge.WidgetTree.RootWidget end)
+        if isValid(root) then
+            candidates[#candidates + 1] =
+                { canvas = root, layer = "inside", chain = chain,
+                  normalised = true }
+        end
+    elseif CONFIG.READOUT_LAYER == "front" then
+        local front = cockpit.UnitGauge
+        if isValid(front) then
+            stopCaching(cockpit, "InvalidationBox_61")
+            -- No measuring here. Asking this canvas where each assembly sits
+            -- returns the origin for all three -- that is what stacked every
+            -- readout in the corner. The point comes from settings instead,
+            -- in the canvas's own design-space pixels, which the HUD's own
+            -- layout is authored in and which do not change with resolution.
+            candidates[#candidates + 1] = {
+                canvas = front,
+                layer = "front",
+                chain = chain,
+                point = {
+                    x = CONFIG[definition.posX],
+                    y = CONFIG[definition.posY],
+                },
+            }
+        end
+    end
+
+    local assembly = unit[definition.canvas]
+    if isValid(assembly) then
+        candidates[#candidates + 1] = {
+            canvas = assembly,
+            layer = "gauge",
+            chain = chain,
+            rectangle = measure(gauge),
+        }
+    end
+    return candidates
+end
+
+--========================================================--
+--                  WIDGET CONSTRUCTION                   --
+--========================================================--
+
+-- Every widget the mod builds is named with this prefix, which is the only
+-- thing that makes a leftover recognisable later. See sweepOrphans.
+local WIDGET_PREFIX = "GaugeNumbers_"
+local widgetSerial = 0
+
+local function constructWidget(classPath, outer)
+    local class = nil
+    local ok = pcall(function() class = StaticFindObject(classPath) end)
+    if not ok or not isValid(class) then
+        return nil, "widget class is unavailable: " .. classPath
+    end
+
+    widgetSerial = widgetSerial + 1
+    local widget = nil
+    local built, buildError = pcall(function()
+        widget = StaticConstructObject(class, outer,
+            FName(WIDGET_PREFIX .. tostring(widgetSerial)))
+    end)
+    if not isValid(widget) then
+        -- A named construction is preferred but not required; an unnamed
+        -- widget still works, it just cannot be swept up later.
+        pcall(function() widget = StaticConstructObject(class, outer) end)
+    end
+    if not isValid(widget) then
+        if not built then return nil, tostring(buildError) end
+        return nil, "construction returned no widget: " .. classPath
+    end
+    return widget, nil
+end
+
+-- UE4SS restarting the Lua mods builds a fresh Lua state, but the widgets from
+-- the previous run belong to the cockpit, not to Lua: they stay in the tree,
+-- still parented, with the old run's poll no longer touching them but the new
+-- run's widgets stacked on top. That is what put two of every number on screen.
+--
+-- Nothing in the Lua state can survive to clean that up, so the evidence has to
+-- be read off the tree itself -- hence the name prefix. This runs before any
+-- construction, so a restart lands on a clean canvas.
+local function sweepCanvas(canvas, extraMatch)
+    if not isValid(canvas) then return 0 end
+    local count = nil
+    pcall(function() count = canvas:GetChildrenCount() end)
+    if type(count) ~= "number" then return 0 end
+
+    local doomed = {}
+    for index = 0, count - 1 do
+        local child = nil
+        pcall(function() child = canvas:GetChildAt(index) end)
+        if isValid(child) then
+            local name = objectName(child)
+            if string.find(name, WIDGET_PREFIX, 1, true) ~= nil
+                or (extraMatch ~= nil
+                    and string.find(name, extraMatch, 1, true) ~= nil) then
+                doomed[#doomed + 1] = child
+            end
+        end
+    end
+    for _, child in ipairs(doomed) do
+        pcall(function() child:RemoveFromParent() end)
+    end
+    return #doomed
+end
+
+-- Once per cockpit: every surface the mod has ever attached anything to, in
+-- any layer setting, because the previous run may have been configured
+-- differently from this one.
+local sweptCockpit = nil
+
+local function sweepOrphans(cockpit)
+    local identity = objectName(cockpit)
+    if sweptCockpit == identity then return end
+    sweptCockpit = identity
+
+    local removed = sweepCanvas(cockpit.UnitGauge)
+    for _, definition in ipairs(BARS) do
+        local unit = cockpit[definition.unit]
+        if isValid(unit) then
+            -- The experience bar is a copy of the stamina gauge. The real one
+            -- lives in the stamina assembly, so that class turning up in any
+            -- other assembly is a leftover copy -- and it is the one widget
+            -- the mod cannot name, because the engine creates it.
+            local extra = nil
+            if definition.unit ~= NATIVE_DONOR.unit then
+                extra = "StaminaGauge_Player"
+            end
+            removed = removed + sweepCanvas(unit[definition.canvas], extra)
+
+            local gauge = unit[definition.gauge]
+            if isValid(gauge) then
+                local root = nil
+                pcall(function() root = gauge.WidgetTree.RootWidget end)
+                removed = removed + sweepCanvas(root)
+            end
+        end
+    end
+
+    if removed > 0 then
+        log(string.format(
+            "SWEEP | removed %d widget(s) left behind by a previous run",
+            removed))
+    end
 end
 
 local function resolveFontDonor(cockpit)
@@ -430,35 +648,35 @@ local function styleLabel(label, cockpit)
     pcall(function()
         label:SetColorAndOpacity({ SpecifiedColor = WHITE, ColorUseRule = 0 })
     end)
-    -- The gauges sit over open world, so the readout needs its own contrast.
+    -- The readouts sit over gauge art and open world alike, so they need their
+    -- own contrast.
     pcall(function() label:SetShadowOffset({ X = 1.0, Y = 1.0 }) end)
     pcall(function()
         label:SetShadowColorAndOpacity({ R = 0.0, G = 0.0, B = 0.0, A = 0.9 })
     end)
 end
 
--- Every gauge assembly caches its own drawing. A cached subtree keeps
--- repainting what it was cached with, which would freeze anything the mod adds
--- under it on its first value.
-local function stopCaching(unit)
-    pcall(function() unit.InvalidationBox_root:SetCanCache(false) end)
-end
-
-local function placeLabel(canvas, label, x, y, zOrder)
+-- placement fields:
+--   anchor   normalised point on the canvas the widget hangs off
+--   align    which point of the widget lands on it
+--   position pixel offset from the anchor
+--   size     nil for auto-sized text, { X, Y } for a box
+local function place(canvas, widget, placement, zOrder)
     local slot = nil
-    local ok = pcall(function() slot = canvas:AddChildToCanvas(label) end)
+    local ok = pcall(function() slot = canvas:AddChildToCanvas(widget) end)
     if not ok or not isValid(slot) then return nil end
     pcall(function()
-        slot:SetAutoSize(true)
-        slot:SetMinimum({ X = 0.0, Y = 0.0 })
-        slot:SetMaximum({ X = 0.0, Y = 0.0 })
-        slot:SetAlignment({ X = 0.0, Y = 0.5 })
-        slot:SetPosition({ X = x, Y = y })
+        slot:SetAutoSize(placement.size == nil)
+        slot:SetMinimum(placement.anchor)
+        slot:SetMaximum(placement.anchor)
+        slot:SetAlignment(placement.align)
+        slot:SetPosition(placement.position)
+        if placement.size ~= nil then slot:SetSize(placement.size) end
         slot:SetZOrder(zOrder)
     end)
     pcall(function()
-        label:SetVisibility(HIT_TEST_INVISIBLE)
-        label:SetRenderOpacity(1.0)
+        widget:SetVisibility(HIT_TEST_INVISIBLE)
+        widget:SetRenderOpacity(1.0)
     end)
     return slot
 end
@@ -467,70 +685,118 @@ end
 --                     BAR READOUTS                       --
 --========================================================--
 
-local function ensureLabel(cockpit, definition, layout)
+local function readoutPlacement(candidate, rightMost)
+    local rectangle = candidate.rectangle
+    local centred = CONFIG.READOUT_PLACEMENT == "center"
+
+    -- An explicit point on the canvas: the readout's centre when centred, its
+    -- left edge when not.
+    if candidate.point ~= nil then
+        return {
+            anchor = { X = 0.0, Y = 0.0 },
+            align = { X = centred and 0.5 or 0.0, Y = 0.5 },
+            position = {
+                X = candidate.point.x + CONFIG.TEXT_OFFSET_X,
+                Y = candidate.point.y + CONFIG.TEXT_OFFSET_Y,
+            },
+        }
+    end
+
+    if rectangle == nil then
+        -- Normalised anchors need no measurement: the middle of the canvas is
+        -- the middle of the canvas whatever the bar turns out to be, and its
+        -- right edge is its right edge.
+        if centred then
+            return {
+                anchor = { X = 0.5, Y = 0.5 },
+                align = { X = 0.5, Y = 0.5 },
+                position = { X = CONFIG.TEXT_OFFSET_X, Y = CONFIG.TEXT_OFFSET_Y },
+            }
+        end
+        return {
+            anchor = { X = 1.0, Y = 0.5 },
+            align = { X = 0.0, Y = 0.5 },
+            position = { X = CONFIG.TEXT_OFFSET_X, Y = CONFIG.TEXT_OFFSET_Y },
+        }
+    end
+
+    if centred then
+        return {
+            anchor = { X = 0.0, Y = 0.0 },
+            align = { X = 0.5, Y = 0.5 },
+            position = {
+                X = rectangle.x + rectangle.width * 0.5 + CONFIG.TEXT_OFFSET_X,
+                Y = rectangle.y + rectangle.height * 0.5 + CONFIG.TEXT_OFFSET_Y,
+            },
+        }
+    end
+
+    -- The three bars are different lengths, so ending each readout at its own
+    -- bar produces a staircase. Aligning them is only meaningful when every
+    -- readout shares one coordinate space.
+    local right = rectangle.x + rectangle.width
+    if CONFIG.ALIGN_READOUTS and rightMost ~= nil
+        and candidate.layer == "front" then
+        right = rightMost
+    end
+    return {
+        anchor = { X = 0.0, Y = 0.0 },
+        align = { X = 0.0, Y = 0.5 },
+        position = {
+            X = right + CONFIG.TEXT_OFFSET_X,
+            Y = rectangle.y + rectangle.height * 0.5 + CONFIG.TEXT_OFFSET_Y,
+        },
+    }
+end
+
+local function ensureLabel(cockpit, definition, surfaces)
     local entry = state.labels[definition.key]
     if entry ~= nil and isValid(entry.widget) then return entry end
     state.labels[definition.key] = nil
 
-    local unit = cockpit[definition.unit]
-    if not isValid(unit) then
+    local candidates = surfaces.bars[definition.key]
+    if candidates == nil or #candidates == 0 then
         return nil, definition.key .. " gauge assembly is unavailable"
     end
-    local canvas = unit[definition.canvas]
-    if not isValid(canvas) then
-        return nil, definition.key .. " gauge canvas is unavailable"
-    end
-    stopCaching(unit)
 
-    local label, buildError = constructWidget(TEXT_BLOCK_CLASS, unit)
-    if label == nil then return nil, buildError end
-    styleLabel(label, cockpit)
+    for _, candidate in ipairs(candidates) do
+        local label, buildError = constructWidget(TEXT_BLOCK_CLASS,
+            candidate.canvas)
+        if label == nil then return nil, buildError end
+        styleLabel(label, cockpit)
 
-    local geometry = layout.bars[definition.key]
-    local slot
-    if geometry ~= nil then
-        -- The three bars are different lengths, so ending each readout at its
-        -- own bar produces a staircase. Aligning them means every readout uses
-        -- the longest bar's right edge, in its own canvas's coordinates.
-        local right = geometry.x + geometry.width
-        if CONFIG.ALIGN_READOUTS and layout.rightMost ~= nil then
-            right = layout.rightMost
-        end
-        slot = placeLabel(canvas, label,
-            right + CONFIG.TEXT_OFFSET_X,
-            geometry.y + geometry.height * 0.5 + CONFIG.TEXT_OFFSET_Y,
-            40)
-    else
-        -- Unmeasured: anchor to the canvas's own right edge instead.
-        local ok = pcall(function() slot = canvas:AddChildToCanvas(label) end)
-        if ok and isValid(slot) then
-            pcall(function()
-                slot:SetAutoSize(true)
-                slot:SetMinimum({ X = 1.0, Y = 0.5 })
-                slot:SetMaximum({ X = 1.0, Y = 0.5 })
-                slot:SetAlignment({ X = 0.0, Y = 0.5 })
-                slot:SetPosition({
-                    X = CONFIG.TEXT_OFFSET_X,
-                    Y = CONFIG.TEXT_OFFSET_Y,
-                })
-                slot:SetZOrder(40)
-            end)
-            pcall(function()
-                label:SetVisibility(HIT_TEST_INVISIBLE)
-                label:SetRenderOpacity(1.0)
-            end)
-        else
-            slot = nil
+        local zOrder = math.max(topZOrder(candidate.canvas) + 10,
+            MINIMUM_Z_ORDER)
+        local placement = readoutPlacement(candidate, surfaces.rightMost)
+        if place(candidate.canvas, label, placement, zOrder) ~= nil then
+            entry = {
+                widget = label,
+                current = nil,
+                maximum = nil,
+                -- Only the front layer needs this: there the readout is a
+                -- sibling of the assemblies rather than a child, so it does
+                -- not inherit the HUD's fade and has to be told.
+                sources = (candidate.layer == "front") and candidate.chain
+                    or nil,
+            }
+            state.labels[definition.key] = entry
+            -- Logged unconditionally: this one line is what a misplaced
+            -- readout is diagnosed from, and needing debug logging on first
+            -- only means asking for the screenshot twice.
+            local where = "unmeasured"
+            if candidate.point ~= nil then
+                where = string.format("point %.0f,%.0f",
+                    candidate.point.x, candidate.point.y)
+            elseif candidate.rectangle ~= nil then
+                where = candidate.rectangle.note
+            end
+            log(string.format("READOUT | %s attached | layer=%s | %s | z=%d",
+                definition.key, candidate.layer, where, zOrder))
+            return entry
         end
     end
-    if not isValid(slot) then
-        return nil, definition.key .. " canvas rejected the readout"
-    end
 
-    entry = { widget = label, current = nil, maximum = nil }
-    state.labels[definition.key] = entry
-    log("READOUT | " .. definition.key .. " attached")
-    return entry
+    return nil, definition.key .. " no canvas accepted the readout"
 end
 
 local function formatValue(current, maximum)
@@ -542,6 +808,55 @@ local function formatValue(current, maximum)
         return string.format("%d%%", round((current / maximum) * 100.0))
     end
     return string.format("%d / %d", current, maximum)
+end
+
+-- The HUD hides and fades its gauges on its own schedule -- out of combat, in
+-- cutscenes, during quest transitions. A readout drawn in front of the bars is
+-- not inside the thing being faded, so it would keep hanging in an empty
+-- corner.
+--
+-- Which widget the game actually fades is not knowable from the headers, and
+-- reading only the assembly missed it, so the whole chain down to the gauge is
+-- sampled: the readout hides if ANY link is hidden and takes the LOWEST
+-- opacity found. That follows a fade applied at any depth without having to
+-- know which depth the game chose. IsVisible answers for the live Slate
+-- widget, which is what a play-only animation actually changes.
+local function mirrorVisibility(entry)
+    if entry == nil or entry.sources == nil then return end
+    if not isValid(entry.widget) then return end
+
+    local shown = true
+    local opacity = 1.0
+    local sampled = false
+
+    for _, source in ipairs(entry.sources) do
+        if isValid(source) then
+            local visible, alpha
+            local ok = pcall(function()
+                visible = source:IsVisible()
+                alpha = source:GetRenderOpacity()
+            end)
+            if ok then
+                sampled = true
+                if visible == false then shown = false end
+                if finiteNumber(alpha) and alpha < opacity then
+                    opacity = alpha
+                end
+            end
+        end
+    end
+    if not sampled then return end
+
+    if entry.shown ~= shown then
+        entry.shown = shown
+        pcall(function()
+            entry.widget:SetVisibility(shown and HIT_TEST_INVISIBLE or COLLAPSED)
+        end)
+    end
+    if entry.opacity ~= opacity then
+        entry.opacity = opacity
+        pcall(function() entry.widget:SetRenderOpacity(opacity) end)
+    end
 end
 
 local function stampLabel(entry, current, maximum)
@@ -621,26 +936,6 @@ local function driveNativeGauge(widget, current, span)
     pcall(function() widget:ResetGaugeRate(ratio, 1.0) end)
 end
 
-local function placeBox(canvas, widget, x, y, w, h, zOrder)
-    local slot = nil
-    local ok = pcall(function() slot = canvas:AddChildToCanvas(widget) end)
-    if not ok or not isValid(slot) then return nil end
-    pcall(function()
-        slot:SetAutoSize(false)
-        slot:SetMinimum({ X = 0.0, Y = 0.0 })
-        slot:SetMaximum({ X = 0.0, Y = 0.0 })
-        slot:SetAlignment({ X = 0.0, Y = 0.0 })
-        slot:SetPosition({ X = x, Y = y })
-        slot:SetSize({ X = w, Y = h })
-        slot:SetZOrder(zOrder)
-    end)
-    pcall(function()
-        widget:SetVisibility(HIT_TEST_INVISIBLE)
-        widget:SetRenderOpacity(1.0)
-    end)
-    return slot
-end
-
 local function experienceIntact(exp)
     if exp == nil then return false end
     if exp.wantBar then
@@ -655,7 +950,7 @@ local function experienceIntact(exp)
     return true
 end
 
-local function ensureExperience(cockpit, layout)
+local function ensureExperience(cockpit, surfaces)
     if experienceIntact(state.exp) then return state.exp end
     state.exp = nil
 
@@ -664,29 +959,41 @@ local function ensureExperience(cockpit, layout)
     if not wantBar and not wantText then return nil, nil end
 
     local definition = BAR_BY_ANCHOR[CONFIG.EXP_ANCHOR]
-    local unit = cockpit[definition.unit]
-    if not isValid(unit) then
+    local surface = experienceSurface(cockpit, definition)
+    if surface == nil then
         return nil, "experience anchor assembly is unavailable"
     end
-    local canvas = unit[definition.canvas]
-    if not isValid(canvas) then
-        return nil, "experience anchor canvas is unavailable"
-    end
-    stopCaching(unit)
+    local canvas = surface.canvas
 
-    local anchor = layout.bars[definition.key] or FALLBACK_ANCHOR
-    if layout.bars[definition.key] == nil then
-        dbg("experience anchor unmeasured | using fallback placement")
-    end
-
-    local originX = anchor.x + CONFIG.EXP_OFFSET_X
-    local originY = anchor.y + CONFIG.EXP_OFFSET_Y
-    local width = anchor.width
+    local width = (surface.size ~= nil and surface.size.width)
+        or FALLBACK_BAR_WIDTH
     if CONFIG.EXP_BAR_WIDTH > 0.0 then width = CONFIG.EXP_BAR_WIDTH end
-    local height = anchor.height
+    local height = (surface.size ~= nil and surface.size.height)
+        or FALLBACK_BAR_HEIGHT
     if CONFIG.EXP_BAR_HEIGHT > 0.0 then height = CONFIG.EXP_BAR_HEIGHT end
 
+    -- Always the normalised edge anchor, never a measured rectangle. This is
+    -- the arrangement that put the bar where it belongs, and a measurement
+    -- that starts resolving on some future build must not silently move it.
+    local above = CONFIG.EXP_PLACEMENT ~= "below"
+    local anchor = { X = 0.0, Y = above and 0.0 or 1.0 }
+    local boxAlign = { X = 0.0, Y = above and 1.0 or 0.0 }
+    local originX = CONFIG.EXP_OFFSET_X
+    local originY = CONFIG.EXP_OFFSET_Y
+    local centreY = originY + (above and -height * 0.5 or height * 0.5)
+
+    local zOrder = math.max(topZOrder(canvas) + 10, MINIMUM_Z_ORDER)
     local built = {}
+
+    local function boxPlacement(x, w)
+        return {
+            anchor = anchor,
+            align = boxAlign,
+            position = { X = x, Y = originY },
+            size = { X = w, Y = height },
+        }
+    end
+
     local function unwind(message)
         for _, widget in ipairs(built) do
             if isValid(widget) then
@@ -706,11 +1013,11 @@ local function ensureExperience(cockpit, layout)
 
     if wantBar then
         if CONFIG.EXP_STYLE == "native" then
-            local native, cloneError = cloneNativeGauge(cockpit, unit)
+            local native, cloneError = cloneNativeGauge(cockpit, canvas)
             if native ~= nil then
                 built[#built + 1] = native
-                if placeBox(canvas, native, originX, originY,
-                    width, height, 38) == nil then
+                if place(canvas, native,
+                    boxPlacement(originX, width), zOrder) == nil then
                     return unwind("experience gauge copy was rejected")
                 end
                 exp.style = "native"
@@ -724,21 +1031,21 @@ local function ensureExperience(cockpit, layout)
         end
 
         if exp.style == "flat" then
-            local back, backError = constructWidget(IMAGE_CLASS, unit)
+            local back, backError = constructWidget(IMAGE_CLASS, canvas)
             if back == nil then return unwind(backError) end
             built[#built + 1] = back
             pcall(function() back:SetColorAndOpacity(EXP_BACK_COLOR) end)
-            if placeBox(canvas, back, originX, originY,
-                width, height, 38) == nil then
+            if place(canvas, back,
+                boxPlacement(originX, width), zOrder) == nil then
                 return unwind("experience bar backing was rejected")
             end
 
-            local fill, fillError = constructWidget(IMAGE_CLASS, unit)
+            local fill, fillError = constructWidget(IMAGE_CLASS, canvas)
             if fill == nil then return unwind(fillError) end
             built[#built + 1] = fill
             pcall(function() fill:SetColorAndOpacity(EXP_FILL_COLOR) end)
-            local fillSlot = placeBox(canvas, fill, originX, originY,
-                0.0, height, 39)
+            local fillSlot = place(canvas, fill,
+                boxPlacement(originX, 0.0), zOrder + 1)
             if fillSlot == nil then
                 return unwind("experience bar fill was rejected")
             end
@@ -749,26 +1056,44 @@ local function ensureExperience(cockpit, layout)
     end
 
     if wantText then
-        local label, labelError = constructWidget(TEXT_BLOCK_CLASS, unit)
+        local label, labelError = constructWidget(TEXT_BLOCK_CLASS, canvas)
         if label == nil then return unwind(labelError) end
         built[#built + 1] = label
         styleLabel(label, cockpit)
 
-        local right = originX + width
-        if CONFIG.ALIGN_READOUTS and layout.rightMost ~= nil then
-            right = layout.rightMost
+        local placement
+        if CONFIG.READOUT_PLACEMENT == "center" then
+            placement = {
+                anchor = anchor,
+                align = { X = 0.5, Y = 0.5 },
+                position = {
+                    X = originX + width * 0.5 + CONFIG.TEXT_OFFSET_X,
+                    Y = centreY + CONFIG.TEXT_OFFSET_Y,
+                },
+            }
+        else
+            placement = {
+                anchor = anchor,
+                align = { X = 0.0, Y = 0.5 },
+                position = {
+                    X = originX + width + CONFIG.TEXT_OFFSET_X,
+                    Y = centreY + CONFIG.TEXT_OFFSET_Y,
+                },
+            }
         end
-        if placeLabel(canvas, label,
-            right + CONFIG.TEXT_OFFSET_X,
-            originY + height * 0.5, 40) == nil then
+        if place(canvas, label, placement, zOrder + 2) == nil then
             return unwind("experience readout was rejected")
         end
         exp.label = label
     end
 
     state.exp = exp
-    log(string.format("EXPERIENCE | %s bar at %.1f,%.1f (%.0fx%.0f)",
-        exp.style, originX, originY, width, height))
+    log(string.format(
+        "EXPERIENCE | %s bar %s %s | at %+.0f,%+.0f (%.0fx%.0f) | z=%d | " ..
+        "size from %s",
+        exp.style, CONFIG.EXP_PLACEMENT, CONFIG.EXP_ANCHOR,
+        originX, originY, width, height, zOrder,
+        (surface.size ~= nil and surface.size.note) or "fallback"))
     return exp
 end
 
@@ -917,14 +1242,33 @@ local function tick()
     local cockpit = resolveCockpit()
     if cockpit == nil then return end
 
-    -- Measuring is only worth its native calls when something has to be built.
-    local layout = { bars = {}, rightMost = nil }
-    if needsInjection() then layout = measureBars(cockpit) end
+    -- Resolving costs native calls, and is only worth them when something has
+    -- to be built.
+    local surfaces = { bars = {}, rightMost = nil }
+    if needsInjection() then
+        -- Before anything is built, never after: a sweep that ran later would
+        -- delete the widgets this run just attached.
+        sweepOrphans(cockpit)
+        for _, definition in ipairs(BARS) do
+            local candidates = readoutCandidates(cockpit, definition)
+            surfaces.bars[definition.key] = candidates
+            for _, candidate in ipairs(candidates) do
+                local rectangle = candidate.rectangle
+                if rectangle ~= nil and candidate.layer == "front" then
+                    local right = rectangle.x + rectangle.width
+                    if surfaces.rightMost == nil
+                        or right > surfaces.rightMost then
+                        surfaces.rightMost = right
+                    end
+                end
+            end
+        end
+    end
 
     for _, definition in ipairs(BARS) do
         if CONFIG[definition.setting] then
             local tag = "INJECT-" .. definition.key
-            local entry, injectError = ensureLabel(cockpit, definition, layout)
+            local entry, injectError = ensureLabel(cockpit, definition, surfaces)
             if entry == nil then
                 reportOnce(tag, "INJECT ERROR | " .. tostring(injectError))
             else
@@ -946,9 +1290,10 @@ local function tick()
             end
         end
     end
+    for _, entry in pairs(state.labels) do mirrorVisibility(entry) end
 
     if not CONFIG.SHOW_EXP then return end
-    local exp, expError = ensureExperience(cockpit, layout)
+    local exp, expError = ensureExperience(cockpit, surfaces)
     if exp == nil then
         if expError ~= nil then
             reportOnce("INJECT-EXP", "INJECT ERROR | " .. tostring(expError))
@@ -980,6 +1325,105 @@ local function poll()
     end)
     ExecuteWithDelay(interval, poll)
 end
+
+--========================================================--
+--                         PROBE                          --
+--========================================================--
+
+-- Dumps the real widget tree of the cockpit's gauge area. Deducing this layout
+-- from the SDK headers got the draw order wrong twice: a header lists a class's
+-- members, not which of them parents which.
+local PROBE_DEPTH = 8
+
+local function probeTree(root, label)
+    local layout = library(LAYOUT_LIBRARY)
+    log("PROBE | " .. label)
+
+    local function walk(widget, depth)
+        if not isValid(widget) or depth > PROBE_DEPTH then return end
+        local detail = ""
+        if layout ~= nil then
+            local slot = nil
+            pcall(function() slot = layout:SlotAsCanvasSlot(widget) end)
+            if isValid(slot) then
+                pcall(function()
+                    local position = slot:GetPosition()
+                    local size = slot:GetSize()
+                    detail = string.format(
+                        " [canvasslot z=%d x=%.0f y=%.0f w=%.0f h=%.0f]",
+                        slot:GetZOrder(), position.X, position.Y,
+                        size.X, size.Y)
+                end)
+            else
+                detail = " [not a canvas slot]"
+            end
+        end
+
+        local count = nil
+        pcall(function() count = widget:GetChildrenCount() end)
+        log(string.format("PROBE | %s%s%s children=%s",
+            string.rep("  ", depth), shortName(widget), detail,
+            tostring(count)))
+
+        if type(count) ~= "number" then return end
+        for index = 0, count - 1 do
+            local child = nil
+            pcall(function() child = widget:GetChildAt(index) end)
+            walk(child, depth + 1)
+        end
+    end
+
+    walk(root, 0)
+end
+
+local function probe()
+    local cockpit = resolveCockpit()
+    if cockpit == nil then
+        log("PROBE | no cockpit is mounted")
+        return
+    end
+    log("PROBE | cockpit " .. objectName(cockpit))
+
+    local unitGauge = cockpit.UnitGauge
+    if isValid(unitGauge) then
+        probeTree(unitGauge, "cockpit.UnitGauge")
+    else
+        log("PROBE | cockpit.UnitGauge is unavailable")
+    end
+
+    for _, definition in ipairs(BARS) do
+        local unit = cockpit[definition.unit]
+        if isValid(unit) then
+            local root = nil
+            pcall(function() root = unit.WidgetTree.RootWidget end)
+            if isValid(root) then
+                probeTree(root, definition.unit .. " widget tree")
+            else
+                log("PROBE | " .. definition.unit .. " has no widget tree root")
+            end
+        else
+            log("PROBE | " .. definition.unit .. " is unavailable")
+        end
+    end
+    log("PROBE | done")
+end
+
+-- The console output device is only valid for the duration of this synchronous
+-- call; using it from a deferred callback is a use-after-free. Reply first,
+-- then defer the walk without capturing it.
+RegisterConsoleCommandHandler("gaugenumbers", function(_, parameters)
+    local action = type(parameters) == "table" and parameters[1] or nil
+    if action ~= "probe" then
+        log("usage: gaugenumbers probe")
+        return true
+    end
+    log("PROBE | walking the cockpit gauge tree, see UE4SS.log")
+    ExecuteInGameThread(function()
+        local ok, probeError = xpcall(probe, debug.traceback)
+        if not ok then log("PROBE ERROR | " .. tostring(probeError)) end
+    end)
+    return true
+end)
 
 --========================================================--
 --                         HOOKS                          --

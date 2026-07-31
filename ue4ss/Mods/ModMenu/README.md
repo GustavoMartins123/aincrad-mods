@@ -31,7 +31,6 @@ ModMenu\
     ├── main_impl.lua
     ├── config.lua
     ├── registry.lua
-    ├── registry_impl.lua
     ├── discovery.lua
     ├── store.lua
     ├── panel.lua
@@ -70,34 +69,33 @@ independent of the expanded list's length.
 
 ## Automatic discovery and compatibility validation
 
-`Scripts/registry_impl.lua` is the explicit compatibility allow-list. It defines
-the supported mod folder names, labels, setting keys, types, choices, numeric
-bounds, and when each change takes effect.
+There is no central list of supported mods. Every mod is self-contained: it
+appears in this menu by shipping `Scripts/modmenu.lua` inside its own folder,
+declaring its own label, settings, types, choices, numeric bounds, and when a
+change takes effect -- next to the `config.lua` those settings live in.
 
-At startup, `Scripts/registry.lua` automatically checks every registered
-integration and returns only mods that are both installed and compatible.
-A compatible mod must have:
+At startup, `Scripts/registry.lua` enumerates every folder under `Mods/` through
+`IterateGameDirectories` and validates each mod that opted in. A mod is shown
+only if it has:
 
 - `Scripts/main.lua`;
 - `Scripts/config.lua`;
+- `Scripts/modmenu.lua` declaring its contract;
 - a readable and valid effective configuration;
-- an `ENABLED` boolean setting registered with ModMenu;
-- every exposed setting present with the expected type;
-- numeric values inside the registered bounds;
-- choice values present in the registered option list;
+- an `ENABLED` boolean setting;
+- every declared setting present with the expected type;
+- numeric values inside the declared bounds;
+- choice values present in the declared option list;
 - valid cross-setting floor and ceiling relationships.
 
-Registered mods that are not installed are ignored silently. A partially
-installed or incompatible mod is skipped and receives one concise reason in
-`UE4SS.log`. It cannot make the entire panel fail to open.
+Opting in is not the same as being accepted. The manifest is checked against the
+mod's real effective settings, so a contract that has drifted from the config it
+describes is skipped with one concise reason in `UE4SS.log` rather than shown.
+It cannot make the entire panel fail to open. A folder without a
+`Scripts/modmenu.lua` simply has nothing to show and is passed over silently.
 
 Discovery runs when ModMenu starts. Restart the game after adding, removing, or
-updating a compatible mod.
-
-ModMenu intentionally does not scan arbitrary folders and guess configuration
-contracts. A mod becomes compatible only after an explicit entry is added to
-`registry_impl.lua`; startup discovery then decides whether that registered
-integration is actually present and valid.
+updating a mod.
 
 ## How changes reach another mod
 
@@ -145,21 +143,25 @@ The console requires `GuiConsoleEnabled = 1` under `[Debug]` in
 Startup also reports a discovery summary:
 
 ```text
-[ModMenu] auto-discovery | 3 compatible | 5 absent | 0 invalid
+[ModMenu] discovery | 10 folder(s) | 5 with a menu | 5 without | 0 invalid
 ```
 
 ## Adding support for another mod
 
-1. Add one entry to `Scripts/registry_impl.lua`.
-2. Match the target folder and setting keys exactly.
-3. Match numeric bounds and choices to the target mod's validator.
-4. Ensure the target mod reads its exact `Scripts/runtime.lua`, overlays it over
-   `config.lua`, and validates the complete result before applying values.
-5. Restart the game and check the auto-discovery summary in `UE4SS.log`.
+Nothing here changes. The work happens in that mod's own folder:
 
-A malformed or unsupported target configuration must fail closed in the target
-mod. ModMenu also refuses to expose a registry integration whose startup
-contract does not validate.
+1. Add `Scripts/modmenu.lua` to the mod, returning `label`, `summary`, `apply`
+   and `settings`. The folder name is the identity, so the manifest does not
+   repeat it.
+2. Use the exact setting keys the mod's `config.lua` defines.
+3. Match numeric bounds and choices to that mod's own validator.
+4. Ensure the mod reads its exact `Scripts/runtime.lua`, overlays it over
+   `config.lua`, and validates the complete result before applying values.
+5. Restart the game and check the discovery summary in `UE4SS.log`.
+
+A malformed or unsupported configuration must fail closed in the mod itself.
+ModMenu also refuses to expose a mod whose declared contract does not validate
+against its actual settings.
 
 ## Coexisting with other Start Menu mods
 

@@ -1,9 +1,14 @@
--- Registry-driven discovery for ModMenu.
+-- Folder-driven discovery for ModMenu.
 --
--- Lua in this UE4SS build has no portable directory enumeration contract. The
--- registry remains the explicit compatibility allow-list, while this module
--- discovers which registered integrations are actually installed and accepts
--- only mods whose files, settings, value types, and bounds match that contract.
+-- There is no central allow-list. Every folder under Mods/ is enumerated
+-- through IterateGameDirectories, and a mod appears in the menu by shipping
+-- Scripts/modmenu.lua inside its own folder, declaring its own settings next
+-- to the config.lua those settings live in. Nothing outside a mod's folder
+-- has to be edited to add it, remove it, or move it.
+--
+-- Opting in is not the same as being accepted: a manifest is still validated
+-- against the mod's real effective settings, so a contract that has drifted
+-- from the config it describes is reported and skipped rather than shown.
 
 local Discovery = {}
 
@@ -198,68 +203,170 @@ local function readPresence(bridge, path)
     return contents ~= nil, nil
 end
 
-function Discovery.discover(scriptDir, registry, bridge)
+-- Directory keys that are metadata rather than a subdirectory.
+local RESERVED_KEYS = {
+    __name = true,
+    __absolute_path = true,
+    __files = true,
+}
+
+-- IterateGameDirectories keys directories by their real name, so the walk has
+-- to be case-tolerant: the loader folder is "ue4ss" on some installs and
+-- "UE4SS" on others, and neither spelling is ours to assume.
+local function childDirectory(parent, name)
+    if type(parent) ~= "table" then return nil end
+    local direct = parent[name]
+    if type(direct) == "table" then return direct end
+    local wanted = name:lower()
+    for key, value in pairs(parent) do
+        if not RESERVED_KEYS[key] and type(key) == "string"
+            and type(value) == "table" and key:lower() == wanted then
+            return value
+        end
+    end
+    return nil
+end
+
+-- Every folder under Mods/, by name. This is what makes a central allow-list
+-- unnecessary: the installed set is read off disk instead of declared.
+local function installedModNames()
+    if type(IterateGameDirectories) ~= "function" then
+        return nil, "this UE4SS build does not expose IterateGameDirectories"
+    end
+
+    local ok, directories = pcall(IterateGameDirectories)
+    if not ok or type(directories) ~= "table" then
+        return nil, "IterateGameDirectories returned no directory tree"
+    end
+
+    -- .Game.Binaries.<platform>.ue4ss.Mods -- the platform folder is whatever
+    -- this build ships (Win64, WinGDK, ...), so it is taken as the single
+    -- child rather than named.
+    local binaries = childDirectory(childDirectory(directories, "Game"),
+        "Binaries")
+    local platform = nil
+    if type(binaries) == "table" then
+        for key, value in pairs(binaries) do
+            if not RESERVED_KEYS[key] and type(value) == "table" then
+                platform = value
+                break
+            end
+        end
+    end
+    local mods = childDirectory(childDirectory(platform, "ue4ss"), "Mods")
+    if type(mods) ~= "table" then
+        return nil, "the Mods directory was not found in the game tree"
+    end
+
+    local names = {}
+    for key, value in pairs(mods) do
+        if not RESERVED_KEYS[key] and type(value) == "table"
+            and type(key) == "string" and key:match("^[%w_.-]+$") then
+            names[#names + 1] = key
+        end
+    end
+    table.sort(names)
+    return names, nil
+end
+
+Discovery.installedModNames = installedModNames
+
+-- A mod declares its own menu contract in Scripts/modmenu.lua, inside its own
+-- folder, next to the config.lua that contract describes. Nothing outside the
+-- mod has to know it exists.
+local function readManifest(bridge, targetDir, modName)
+    local contents, readError = bridge.readFile(targetDir .. "modmenu.lua")
+    if readError ~= nil then
+        return nil, "modmenu.lua could not be read: " .. tostring(readError)
+    end
+    if contents == nil then return nil, nil end
+
+    local manifest, parseError =
+        bridge.evaluateTable(contents, "@" .. modName .. "/modmenu.lua")
+    if manifest == nil then
+        return nil, "modmenu.lua is invalid: " .. tostring(parseError)
+    end
+    if manifest.mod ~= nil and manifest.mod ~= modName then
+        return nil, "modmenu.lua names a different mod: " ..
+            tostring(manifest.mod)
+    end
+    -- The folder is the identity. A manifest that had to repeat it could
+    -- disagree with it, and copying a mod to a new folder would break it.
+    manifest.mod = modName
+    return manifest, nil
+end
+
+function Discovery.discover(scriptDir, bridge)
     if not nonEmptyString(scriptDir) then
         error("canonical ModMenu Scripts directory is unavailable")
     end
-    if type(registry) ~= "table" then error("ModMenu registry must return a table") end
     if type(bridge) ~= "table"
         or type(bridge.readFile) ~= "function"
-        or type(bridge.readSettings) ~= "function" then
+        or type(bridge.readSettings) ~= "function"
+        or type(bridge.evaluateTable) ~= "function" then
         error("canonical ModMenuBridge discovery primitives are unavailable")
     end
 
     local accepted = {}
     local report = {
-        registered = #registry,
+        registered = 0,
         accepted = {},
         absent = {},
         invalid = {},
     }
 
-    local seenMods = {}
-    for index, entry in ipairs(registry) do
-        local modName = type(entry) == "table" and entry.mod or nil
-        if not nonEmptyString(modName) then
-            report.invalid[#report.invalid + 1] = {
-                mod = "registry[" .. tostring(index) .. "]",
-                reason = "registered mod folder is unavailable",
-            }
-        elseif seenMods[modName] then
+    local names, enumerationError = installedModNames()
+    if names == nil then
+        report.invalid[#report.invalid + 1] = {
+            mod = "<Mods directory>",
+            reason = tostring(enumerationError),
+        }
+        return accepted, report
+    end
+    report.registered = #names
+
+    for _, modName in ipairs(names) do
+        local targetDir = scriptDir .. "../../" .. modName .. "/Scripts/"
+        local mainPresent, mainError =
+            readPresence(bridge, targetDir .. "main.lua")
+        local configPresent, configError =
+            readPresence(bridge, targetDir .. "config.lua")
+
+        if mainError ~= nil or configError ~= nil then
             report.invalid[#report.invalid + 1] = {
                 mod = modName,
-                reason = "duplicate registry entry",
+                reason = "installation probe failed: " ..
+                    tostring(mainError or configError),
             }
+        elseif not mainPresent or not configPresent then
+            -- Not every folder under Mods/ is a settings-bearing Lua mod, and
+            -- one that is not simply has nothing to show here.
+            report.absent[#report.absent + 1] = modName
         else
-            seenMods[modName] = true
-            local targetDir = scriptDir .. "../../" .. modName .. "/Scripts/"
-            local mainPresent, mainError = readPresence(bridge, targetDir .. "main.lua")
-            local configPresent, configError = readPresence(bridge, targetDir .. "config.lua")
-
-            if mainError ~= nil or configError ~= nil then
+            local manifest, manifestError =
+                readManifest(bridge, targetDir, modName)
+            if manifestError ~= nil then
                 report.invalid[#report.invalid + 1] = {
                     mod = modName,
-                    reason = "installation probe failed: " .. tostring(mainError or configError),
+                    reason = manifestError,
                 }
-            elseif not mainPresent and not configPresent then
+            elseif manifest == nil then
+                -- Installed, but has not opted into the menu.
                 report.absent[#report.absent + 1] = modName
-            elseif not mainPresent or not configPresent then
-                report.invalid[#report.invalid + 1] = {
-                    mod = modName,
-                    reason = not mainPresent and "Scripts/main.lua is missing"
-                        or "Scripts/config.lua is missing",
-                }
             else
-                local settings, _, info = bridge.readSettings(modName, targetDir)
+                local settings, _, info =
+                    bridge.readSettings(modName, targetDir)
                 if settings == nil then
                     report.invalid[#report.invalid + 1] = {
                         mod = modName,
-                        reason = tostring(info and info.error or "settings are unavailable"),
+                        reason = tostring(info and info.error
+                            or "settings are unavailable"),
                     }
                 else
-                    local valid, validationError = validateEntry(entry, settings)
+                    local valid, validationError =
+                        validateEntry(manifest, settings)
                     if valid then
-                        accepted[#accepted + 1] = entry
+                        accepted[#accepted + 1] = manifest
                         report.accepted[#report.accepted + 1] = modName
                     else
                         report.invalid[#report.invalid + 1] = {

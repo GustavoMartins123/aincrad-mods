@@ -64,17 +64,35 @@ the widgets, refreshing the experience numbers, and re-reading
 a readout attached mid-fight is filled immediately and no missed event can leave
 a stale number on screen.
 
-### Placement is measured, not guessed
+### Which layer it draws on
 
 Each cockpit gauge assembly (`PlayerUnitGauge_HP`, `PlayerUnitGauge_Stamina`,
-`PlayerUnitGauge_Soul`) owns a CanvasPanel. A `UTextBlock` is constructed into
-that canvas, and its position comes from reading the gauge's own
-CanvasPanelSlot through `WidgetLayoutLibrary.SlotAsCanvasSlot`.
+`PlayerUnitGauge_Soul`) owns a CanvasPanel, but a readout parented *inside* one
+is painted with that assembly — and the assembly's canvas is painted before the
+gauge widget sitting next to it. No ZOrder inside that canvas can lift a number
+above art that is not in the canvas, which is why centring the readouts on the
+bars first put them behind the bars.
 
-The three HUD bars are different lengths, so a readout parked at the end of each
-one comes out as a staircase. `ALIGN_READOUTS` (on by default) measures all
-three in one pass and puts every readout on the column just past the longest
-bar. `TEXT_OFFSET_X` / `TEXT_OFFSET_Y` are corrections on top of that.
+`READOUT_LAYER = "front"` (the default) parents everything to the cockpit's own
+`UnitGauge` canvas instead. That canvas holds the three assemblies, so a child
+added there is painted after all of them. It needs the assembly's own rectangle
+in that canvas to position against; when that cannot be read, the mod falls back
+to `"gauge"` — living inside the assembly, where it fades with the bar it
+belongs to but is painted behind the art.
+
+`READOUT_PLACEMENT = "center"` (the default) puts each number on top of its own
+bar. It is expressed as a **normalised anchor** on that gauge's canvas — the
+middle of the canvas is the middle of the canvas at any resolution, whether or
+not the mod managed to measure anything — so it lands correctly on its own, and
+the bars being different lengths stops mattering.
+
+`READOUT_PLACEMENT = "right"` puts the numbers off the end of the bars instead.
+That one *does* need geometry, read from the gauge's own CanvasPanelSlot through
+`WidgetLayoutLibrary.SlotAsCanvasSlot`, and because the three HUD bars are
+different lengths it comes out as a staircase unless `ALIGN_READOUTS` (on by
+default) puts every readout on the column just past the longest bar.
+
+`TEXT_OFFSET_X` / `TEXT_OFFSET_Y` are corrections on top of either.
 
 The typeface is borrowed from the partner name plate so it matches the rest of
 the HUD; without a partner mounted, the TextBlock's own default font is used.
@@ -102,12 +120,14 @@ wants. If the copy cannot be made for any reason, the mod logs why and draws
 `EXP_STYLE = "flat"` instead — two tinted rectangles, a backing and a fill
 driven by its own slot width.
 
-`EXP_ANCHOR` picks which bar it is positioned against and parented to, so it
-shares that bar's coordinate space and always lines up with it. `EXP_OFFSET_Y`
-is measured from the **top-left corner** of that bar: negative puts the
-experience bar above the gauges (the default, `-26`), positive puts it below.
-Zero width or height copies the anchor bar's own, which is what keeps all four
-bars looking like one set.
+`EXP_ANCHOR` picks which gauge it is positioned against and parented to, so it
+shares that gauge's coordinate space and always lines up with it.
+`EXP_PLACEMENT` picks which edge it hangs off, again as a normalised anchor that
+needs no measurement: `"above"` puts the bar's bottom edge on the gauge's top
+edge, `"below"` puts its top edge on the gauge's bottom edge. `EXP_OFFSET_Y` is
+a nudge from there. Zero width or height copies the anchor bar's own, which is
+what keeps all four bars looking like one set — only the SIZE has a fallback if
+the anchor bar could not be measured.
 
 `SHOW_EXP` switches the whole block; `SHOW_EXP_BAR`, `SHOW_EXP_TEXT` and
 `SHOW_EXP_LEVEL` switch the bar, the numbers and the `Lv.52` prefix
@@ -148,9 +168,11 @@ return {
     SHOW_HP = true,
     SHOW_STAMINA = true,
     SHOW_SP = true,
-    ALIGN_READOUTS = true,
+    READOUT_LAYER = "front",        -- "front" | "gauge"
+    READOUT_PLACEMENT = "center",   -- "center" | "right"
+    ALIGN_READOUTS = true,          -- only used by "right"
     VALUE_FORMAT = "current_max",   -- "current_max" | "current" | "percent"
-    TEXT_OFFSET_X = 14.0,
+    TEXT_OFFSET_X = 0.0,
     TEXT_OFFSET_Y = 0.0,
     FONT_SIZE = 13.0,
 
@@ -160,8 +182,9 @@ return {
     SHOW_EXP_LEVEL = true,
     EXP_STYLE = "native",           -- "native" | "flat"
     EXP_ANCHOR = "hp",              -- "hp" | "stamina" | "sp"
+    EXP_PLACEMENT = "above",        -- "above" | "below"
     EXP_OFFSET_X = 0.0,
-    EXP_OFFSET_Y = -26.0,           -- negative is above the gauges
+    EXP_OFFSET_Y = -4.0,
     EXP_BAR_WIDTH = 0.0,            -- 0 copies the anchor bar
     EXP_BAR_HEIGHT = 0.0,           -- 0 copies the anchor bar
 
@@ -176,14 +199,31 @@ When ModMenu is installed, machine-local overrides are written to
 `Scripts/runtime.lua`. That file is optional and should not be included when
 redistributing the mod.
 
-## Tuning placement
+## Tuning and diagnosis
 
-The defaults are measured from the game's own layout, so nothing should need
-tuning. If something lands in the wrong place, turn on `DEBUG_LOGS` and read the
-`measured | x= y= w= h=` line each bar writes when the widgets are built. An
-`unmeasured` line means that bar's slot could not be read and the mod fell back
-to the canvas edge — that is when the offsets are worth changing. A settings
-change re-injects immediately, so tuning is live through the ModMenu.
+Every injection writes one line per widget to `UE4SS.log`, with no debug flag
+needed — this is what a misplaced readout is diagnosed from:
+
+```text
+READOUT | HP attached | layer=front | unit x=… y=… w=… h=… + gauge x=… | z=…
+EXPERIENCE | native bar above hp | layer=front | at …,… (…x…) | z=… | anchor …
+```
+
+`layer=gauge` means the front layer could not be resolved, `unmeasured` means no
+rectangle could be read at all, and the `native`/`flat` word says whether the
+copy of the game's gauge was made. A settings change re-injects immediately, so
+tuning offsets is live through the ModMenu.
+
+For the layout itself, the UE4SS console command
+
+```text
+gaugenumbers probe
+```
+
+walks the cockpit's real widget tree — `cockpit.UnitGauge` and each assembly —
+and logs every node with its slot type, ZOrder, position and size. Deducing that
+tree from the SDK headers got the draw order wrong twice: a header lists a
+class's members, not which of them parents which.
 
 If a gauge assembly or its canvas is absent, the mod reports the exact missing
 contract once and leaves the HUD untouched rather than drawing a substitute

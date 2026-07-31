@@ -1,5 +1,5 @@
 local MOD_NAME = "WorldEnemyDirector"
-local MOD_VERSION = "1.7.7"
+local MOD_VERSION = "1.8.1"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -43,7 +43,6 @@ local SPAWN_INITIALIZE_MS = 8000
 -- collision check; this was in the mod originally and its removal is what
 -- silently stopped multiplication.
 local SPAWN_Z_OFFSET_CM = 40.0
-local SPAWN_COLLISION_ALWAYS = 1
 local SPAWN_SCALE_MULTIPLY_ROOT = 1
 local OWNED_ACTOR_TAG = "WorldEnemyDirectorOwned"
 -- Requests allowed to expire unmatched, in a row, before multiplication is
@@ -55,6 +54,8 @@ local ORIGIN_SWEEP_MS = 3000
 -- check. Re-validate every owned actor after activation so an actor cannot stay
 -- in the world after losing its physical Pawn collision.
 local COLLISION_AUDIT_MS = 500
+local OWNED_ADMISSION_SAMPLES_REQUIRED = 3
+local OWNED_ADMISSION_TIMEOUT_MS = 4000
 local NAV_ATTEMPTS_PER_PASS = 1
 local NAV_MAX_ATTEMPTS = 12
 local NAV_MIN_SEPARATION_CM = 150.0
@@ -64,11 +65,11 @@ local MAX_DISCOVERY_PER_TICK = 2
 local SNAPSHOT_RETRY_LIMIT = 32
 local SNAPSHOT_RETRY_BACKOFF_MS = 250
 local GAMEPLAY_MOD_ADDITIVE = 0
-local SPAWN_ON_SERVER = 0
-local INITIAL_STATE_PROWL = 0
 local SPAWN_COLLISION_ADJUST_OR_REJECT = 3
 local GAS_VALUE_EPSILON = 0.01
 local ENEMY_ROLE_NONE = 0
+local ENEMY_ROLE_MOB = 1
+local ENEMY_ROLE_ELITE = 2
 local ENEMY_ROLE_BOSS = 3
 
 local GAS_ATTRIBUTE_NAMES = {
@@ -105,11 +106,36 @@ local SCHEMA = {
     COLOR_MODE = { kind = "choice", values = { off = true, fixed = true, random = true } },
     COLOR_PRESET = { kind = "choice", values = PALETTE },
     COLOR_PARAMETER_NAME = { kind = "string" },
-    HEALTH_MULTIPLIER = { kind = "number", minimum = 0.10, maximum = 10.0 },
-    ATTACK_MULTIPLIER = { kind = "number", minimum = 0.10, maximum = 10.0 },
-    DEFENCE_MULTIPLIER = { kind = "number", minimum = 0.10, maximum = 10.0 },
-    MOVE_SPEED_MULTIPLIER = { kind = "number", minimum = 0.25, maximum = 3.0 },
-    XP_MULTIPLIER = { kind = "number", minimum = 0.0, maximum = 10.0 },
+    COMMON_HEALTH_MULTIPLIER =
+        { kind = "number", minimum = 0.10, maximum = 10.0 },
+    COMMON_ATTACK_MULTIPLIER =
+        { kind = "number", minimum = 0.10, maximum = 10.0 },
+    COMMON_DEFENCE_MULTIPLIER =
+        { kind = "number", minimum = 0.10, maximum = 10.0 },
+    COMMON_MOVE_SPEED_MULTIPLIER =
+        { kind = "number", minimum = 0.25, maximum = 3.0 },
+    COMMON_XP_MULTIPLIER =
+        { kind = "number", minimum = 0.0, maximum = 10.0 },
+    ELITE_HEALTH_MULTIPLIER =
+        { kind = "number", minimum = 0.10, maximum = 10.0 },
+    ELITE_ATTACK_MULTIPLIER =
+        { kind = "number", minimum = 0.10, maximum = 10.0 },
+    ELITE_DEFENCE_MULTIPLIER =
+        { kind = "number", minimum = 0.10, maximum = 10.0 },
+    ELITE_MOVE_SPEED_MULTIPLIER =
+        { kind = "number", minimum = 0.25, maximum = 3.0 },
+    ELITE_XP_MULTIPLIER =
+        { kind = "number", minimum = 0.0, maximum = 10.0 },
+    BOSS_HEALTH_MULTIPLIER =
+        { kind = "number", minimum = 0.10, maximum = 10.0 },
+    BOSS_ATTACK_MULTIPLIER =
+        { kind = "number", minimum = 0.10, maximum = 10.0 },
+    BOSS_DEFENCE_MULTIPLIER =
+        { kind = "number", minimum = 0.10, maximum = 10.0 },
+    BOSS_MOVE_SPEED_MULTIPLIER =
+        { kind = "number", minimum = 0.25, maximum = 3.0 },
+    BOSS_XP_MULTIPLIER =
+        { kind = "number", minimum = 0.0, maximum = 10.0 },
     POLL_MS = { kind = "number", minimum = 100, maximum = 2000, integer = true },
     DESPAWN_RADIUS = { kind = "number", minimum = 1500.0, maximum = 30000.0 },
     SPAWN_IN_EMPTY_AREAS = { kind = "boolean" },
@@ -376,6 +402,274 @@ local function actorLocation(actor)
     return parsed, nil
 end
 
+-- An owned enemy is admitted only if its physical shape matches a naturally
+-- initialized enemy of the exact same generated class. Nothing is repaired or
+-- copied into the spawned actor: a mismatch is an explicit rejection.
+local enemyContracts = {}
+do
+    local PHYSICAL_COLLISION_CHANNELS = { 0, 1, 2 }
+    local SIZE_TOLERANCE_CM = 0.1
+    local aiControllerBaseClass = nil
+
+    local function capsuleSnapshot(component, label, requirePawnBody)
+        if not isValid(component) then
+            error(label .. " is unavailable")
+        end
+        local profile = component:GetCollisionProfileName():ToString()
+        local enabled = tonumber(component:GetCollisionEnabled())
+        local objectType = tonumber(component:GetCollisionObjectType())
+        local radius = tonumber(component:GetScaledCapsuleRadius())
+        local halfHeight = tonumber(component:GetScaledCapsuleHalfHeight())
+        if type(profile) ~= "string" or profile == "" then
+            error(label .. " collision profile is unavailable")
+        end
+        if not finiteNumber(enabled)
+            or not finiteNumber(objectType)
+            or not finiteNumber(radius)
+            or not finiteNumber(halfHeight)
+            or radius <= 0.0
+            or halfHeight <= 0.0 then
+            error(label .. " collision geometry is invalid")
+        end
+        local responses = {}
+        for _, channel in ipairs(PHYSICAL_COLLISION_CHANNELS) do
+            local response =
+                tonumber(component:GetCollisionResponseToChannel(channel))
+            if response ~= 0 and response ~= 1 and response ~= 2 then
+                error(label .. " channel " .. tostring(channel) ..
+                    " response is invalid")
+            end
+            responses[channel] = response
+        end
+        if requirePawnBody then
+            if enabled ~= 1 and enabled ~= 3 and enabled ~= 5 then
+                error(label .. " has no query collision: " ..
+                    tostring(enabled))
+            end
+            if objectType ~= 2 then
+                error(label .. " object type is not Pawn: " ..
+                    tostring(objectType))
+            end
+            if responses[2] ~= 2 then
+                error(label .. " does not block Pawn: " ..
+                    tostring(responses[2]))
+            end
+            if profile == "None" then
+                error(label .. " has no authored collision profile")
+            end
+        end
+        return {
+            profile = profile,
+            enabled = enabled,
+            objectType = objectType,
+            radius = radius,
+            halfHeight = halfHeight,
+            responses = responses,
+        }
+    end
+
+    local function compareCapsule(actual, expected, label, compareEnabled)
+        if actual.profile ~= expected.profile then
+            return nil, label .. " profile changed from " ..
+                expected.profile .. " to " .. actual.profile
+        end
+        if compareEnabled and actual.enabled ~= expected.enabled then
+            return nil, label .. " collision mode changed from " ..
+                tostring(expected.enabled) .. " to " ..
+                tostring(actual.enabled)
+        end
+        if actual.objectType ~= expected.objectType then
+            return nil, label .. " object type changed from " ..
+                tostring(expected.objectType) .. " to " ..
+                tostring(actual.objectType)
+        end
+        if math.abs(actual.radius - expected.radius) > SIZE_TOLERANCE_CM
+            or math.abs(actual.halfHeight - expected.halfHeight)
+                > SIZE_TOLERANCE_CM then
+            return nil, string.format(
+                "%s geometry changed from %.1fx%.1f to %.1fx%.1f",
+                label,
+                expected.radius,
+                expected.halfHeight,
+                actual.radius,
+                actual.halfHeight)
+        end
+        for _, channel in ipairs(PHYSICAL_COLLISION_CHANNELS) do
+            if actual.responses[channel] ~= expected.responses[channel] then
+                return nil, label .. " channel " .. tostring(channel) ..
+                    " response changed from " ..
+                    tostring(expected.responses[channel]) .. " to " ..
+                    tostring(actual.responses[channel])
+            end
+        end
+        return true, nil
+    end
+
+    function enemyContracts.capturePhysical(enemy)
+        if not isValid(enemy) then
+            return nil, "enemy object is invalid"
+        end
+        local contract = nil
+        local ok, captureError = pcall(function()
+            if enemy:GetActorEnableCollision() ~= true then
+                error("actor collision is disabled")
+            end
+            if enemy.bCanBeDamaged ~= true then
+                error("actor damage reception is disabled")
+            end
+
+            local root = enemy.RootComponent
+            local capsule = enemy.CapsuleComponent
+            local multi = enemy.MultiCapsuleComponent
+            local movement = enemy.EnemyMovementComponent
+            local characterMovement = enemy.CharacterMovement
+            if not isValid(root) or not isValid(capsule) then
+                error("root capsule hierarchy is unavailable")
+            end
+            if objectKey(root) ~= objectKey(capsule) then
+                error("CapsuleComponent is not the actor root")
+            end
+            if not isValid(multi) then
+                error("MultiCapsuleComponent is unavailable")
+            end
+            if not isValid(movement)
+                or objectKey(movement) ~= objectKey(characterMovement) then
+                error("EnemyMovementComponent is not CharacterMovement")
+            end
+            if movement:IsActive() ~= true then
+                error("EnemyMovementComponent is inactive")
+            end
+            if objectKey(movement.UpdatedComponent) ~= objectKey(capsule) then
+                error("EnemyMovementComponent is not bound to the root capsule")
+            end
+
+            local multiIsRoot = objectKey(multi) == objectKey(capsule)
+            local extras = multi.ExtraCapsuleComponents
+            if extras == nil then
+                error("ExtraCapsuleComponents is unavailable")
+            end
+            local extraContracts = {}
+            for index = 1, #extras do
+                extraContracts[index] = capsuleSnapshot(
+                    extras[index],
+                    "ExtraCapsuleComponents[" .. tostring(index) .. "]",
+                    false)
+            end
+            contract = {
+                root = capsuleSnapshot(capsule, "CapsuleComponent", true),
+                multiIsRoot = multiIsRoot,
+                multi = multiIsRoot and nil or capsuleSnapshot(
+                    multi, "MultiCapsuleComponent", false),
+                weldChildren = multi.bWeldChildColliders,
+                extras = extraContracts,
+            }
+            if type(contract.weldChildren) ~= "boolean" then
+                error("bWeldChildColliders is not boolean")
+            end
+        end)
+        if not ok then return nil, tostring(captureError) end
+        return contract, nil
+    end
+
+    function enemyContracts.comparePhysical(enemy, expected)
+        if type(expected) ~= "table" then
+            return nil, "same-class natural collision contract is unavailable"
+        end
+        local actual, captureError = enemyContracts.capturePhysical(enemy)
+        if actual == nil then return nil, captureError end
+        if actual.multiIsRoot ~= expected.multiIsRoot then
+            return nil, "MultiCapsuleComponent/root identity changed"
+        end
+        if actual.weldChildren ~= expected.weldChildren then
+            return nil, "bWeldChildColliders changed"
+        end
+        local rootMatches, rootError =
+            compareCapsule(actual.root, expected.root, "CapsuleComponent", true)
+        if rootMatches ~= true then return nil, rootError end
+        if not actual.multiIsRoot then
+            local multiMatches, multiError = compareCapsule(
+                actual.multi,
+                expected.multi,
+                "MultiCapsuleComponent",
+                false)
+            if multiMatches ~= true then return nil, multiError end
+        end
+        if #actual.extras ~= #expected.extras then
+            return nil, string.format(
+                "ExtraCapsuleComponents count changed from %d to %d",
+                #expected.extras,
+                #actual.extras)
+        end
+        for index = 1, #actual.extras do
+            local matches, compareError = compareCapsule(
+                actual.extras[index],
+                expected.extras[index],
+                "ExtraCapsuleComponents[" .. tostring(index) .. "]",
+                false)
+            if matches ~= true then return nil, compareError end
+        end
+        return true, string.format(
+            "profile=%s body=%.1fx%.1f extras=%d",
+            actual.root.profile,
+            actual.root.radius,
+            actual.root.halfHeight,
+            #actual.extras)
+    end
+
+    function enemyContracts.controlOperational(enemy)
+        local operational, lifecycleError = enemyOperational(enemy)
+        if not operational then return nil, lifecycleError end
+        local detail = nil
+        local ok, controlError = pcall(function()
+            if enemy.bAbilitiesInitialized ~= true then
+                error("enemy abilities are not initialized")
+            end
+            if enemy.DisableDetectFlag ~= false then
+                error("enemy detection is disabled")
+            end
+            local controller = enemy:GetController()
+            if not isValid(controller) then
+                error("AI controller is unavailable")
+            end
+            if not isValid(aiControllerBaseClass) then
+                aiControllerBaseClass =
+                    StaticFindObject("/Script/ROD.RODAIControllerBase")
+            end
+            if not isValid(aiControllerBaseClass)
+                or controller:IsA(aiControllerBaseClass) ~= true then
+                error("controller is not RODAIControllerBase")
+            end
+            local pawn = controller:K2_GetPawn()
+            if not isValid(pawn)
+                or objectKey(pawn) ~= objectKey(enemy) then
+                error("controller does not possess this enemy")
+            end
+            local brain = controller.BrainComponent
+            if not isValid(brain) then
+                error("controller BrainComponent is unavailable")
+            end
+            if brain:IsRunning() ~= true then
+                error("behavior tree is not running")
+            end
+            if brain:IsPaused() == true then
+                error("behavior tree is paused")
+            end
+            if not isValid(controller.PathFollowingComponent) then
+                error("PathFollowingComponent is unavailable")
+            end
+            if not isValid(controller:GetAIPerceptionComponent()) then
+                error("PerceptionComponent is unavailable")
+            end
+            if not isValid(controller.Blackboard) then
+                error("Blackboard is unavailable")
+            end
+            detail = objectKey(controller)
+        end)
+        if not ok then return nil, tostring(controlError) end
+        return true, detail
+    end
+end
+
 local states = {}
 local origins = {}
 local classCatalog = {}
@@ -567,9 +861,7 @@ local function resolveHeroLocation()
     return actorLocation(hero)
 end
 
--- The local host controller, which owns ServerDebugEnemySpawn. Resolved fresh
--- each time rather than cached: it is replaced across travel, and a stale one
--- would send the RPC into a dead world.
+-- The local host controller is resolved fresh because it is replaced on travel.
 local function resolveLocalController()
     local ok, controller = pcall(FindFirstOf, "RODInGamePlayerController")
     if not ok or not isValid(controller) then return nil end
@@ -592,21 +884,8 @@ local function resolveSpawnApi()
         navigationSystem = nav
     end
 
-    -- Spawning goes through the engine's deferred pair,
-    -- BeginDeferredActorSpawnFromClass + FinishSpawningActor. That is what this
-    -- mod used before the spawn path was rewritten, and it is the only one of
-    -- the three that works here:
-    --
-    --   * ARODGameState:RODSpawnActor cannot be called from Lua on this build.
-    --     Every argument was verified correct and in order and the rejection
-    --     never moved off "[push_objectproperty] ... :InInstigator". The
-    --     FRODSpawnActorOption table is the only thing left between the two
-    --     calls, and no readable property in the game holds a real one to borrow.
-    --   * ARODInGamePlayerController:ServerDebugEnemySpawn returns without error
-    --     and creates nothing, despite having a real native symbol.
-    --
-    -- The deferred pair also returns the actor it created, so ownership is exact
-    -- and nothing has to be matched by guesswork afterwards.
+    -- The sole spawn path is the engine's deferred pair. It returns the exact
+    -- actor it created, so ownership is canonical and identity-based.
     if not isValid(gameplayStatics) then
         gameplayStatics = nil
         local ok, library = pcall(
@@ -722,8 +1001,7 @@ end
 local function snapshotEnemy(enemy)
     local classObj, className = classData(enemy)
     local ok, mesh, meshScale, maxHealth, attack, defence, experience,
-        movingSpeed, goldenGateBoss, enemyRole,
-        bossEventSequence, bossFinisherSequence =
+        movingSpeed, enemyRole =
         pcall(function()
             local enemyMesh = enemy.Mesh
             return enemyMesh,
@@ -733,10 +1011,7 @@ local function snapshotEnemy(enemy)
                 enemy.DefencePower,
                 enemy.ExperiencePoint,
                 enemy.MovingSpeed,
-                enemy.GoldenGateBoss,
-                enemy.EnemyRole,
-                enemy.BossEventSequence,
-                enemy.BossFinisherLevelSequence
+                enemy.EnemyRole
         end)
     if not ok then return nil, "required enemy fields are unreadable" end
     if not isValid(mesh) then return nil, "required skeletal mesh is unavailable" end
@@ -753,9 +1028,6 @@ local function snapshotEnemy(enemy)
     }) do
         if not finiteNumber(value) then return nil, key .. " is not numeric" end
     end
-    if type(goldenGateBoss) ~= "boolean" then
-        return nil, "GoldenGateBoss is not boolean"
-    end
     if not finiteNumber(enemyRole)
         or enemyRole % 1 ~= 0
         or enemyRole < ENEMY_ROLE_NONE
@@ -765,19 +1037,17 @@ local function snapshotEnemy(enemy)
     local gas, gasError = snapshotGas(enemy, className)
     if gas == nil then return nil, gasError end
 
-    -- Protection is for the mission's own boss, not for anything the data
-    -- happens to label EnemyRole_Boss.
-    --
-    -- That role is worn by field elites too — BP_E001004, a big boar, carries it
-    -- — and treating it as "boss" pulled ordinary elites out of the spawn
-    -- catalog entirely and left them unmutated. What separates a real boss is
-    -- its staging: BossEventSequence and BossFinisherLevelSequence are the
-    -- cinematics a mission boss owns and an elite does not, and GoldenGateBoss
-    -- marks the floor boss outright. The role is kept in the snapshot for
-    -- diagnostics, but it no longer decides anything on its own.
-    local hasBossStaging = isValid(bossEventSequence)
-        or isValid(bossFinisherSequence)
-    local isBoss = goldenGateBoss or hasBossStaging
+    -- SDK 1.0.3 defines the categories directly. Encounter flags and cinematic
+    -- sequences are not used as substitute classification data.
+    local tier = "common"
+    if enemyRole == ENEMY_ROLE_ELITE then
+        tier = "elite"
+    elseif enemyRole == ENEMY_ROLE_BOSS then
+        tier = "boss"
+    elseif enemyRole ~= ENEMY_ROLE_NONE
+        and enemyRole ~= ENEMY_ROLE_MOB then
+        return nil, "EnemyRole has no canonical mutation category"
+    end
     return {
         mesh = mesh,
         meshScale = parsedMeshScale,
@@ -787,9 +1057,8 @@ local function snapshotEnemy(enemy)
         ExperiencePoint = experience,
         MovingSpeed = movingSpeed,
         enemyRole = enemyRole,
-        goldenGateBoss = goldenGateBoss,
-        hasBossStaging = hasBossStaging,
-        isBoss = isBoss,
+        tier = tier,
+        isBoss = tier == "boss",
         gas = gas,
     }, nil
 end
@@ -1067,15 +1336,35 @@ local function restoreState(state)
     return true
 end
 
-local function mutationIsIdentity()
+local function mutationProfile(baseline)
+    local prefix = nil
+    if baseline.tier == "common" then
+        prefix = "COMMON_"
+    elseif baseline.tier == "elite" then
+        prefix = "ELITE_"
+    elseif baseline.tier == "boss" then
+        prefix = "BOSS_"
+    else
+        return nil, "enemy has no canonical mutation tier"
+    end
+    return {
+        health = CONFIG[prefix .. "HEALTH_MULTIPLIER"],
+        attack = CONFIG[prefix .. "ATTACK_MULTIPLIER"],
+        defence = CONFIG[prefix .. "DEFENCE_MULTIPLIER"],
+        moveSpeed = CONFIG[prefix .. "MOVE_SPEED_MULTIPLIER"],
+        xp = CONFIG[prefix .. "XP_MULTIPLIER"],
+    }, nil
+end
+
+local function mutationIsIdentity(profile)
     return CONFIG.SCALE_MIN == 1.0
         and CONFIG.SCALE_MAX == 1.0
         and CONFIG.COLOR_MODE == "off"
-        and CONFIG.HEALTH_MULTIPLIER == 1.0
-        and CONFIG.ATTACK_MULTIPLIER == 1.0
-        and CONFIG.DEFENCE_MULTIPLIER == 1.0
-        and CONFIG.MOVE_SPEED_MULTIPLIER == 1.0
-        and CONFIG.XP_MULTIPLIER == 1.0
+        and profile.health == 1.0
+        and profile.attack == 1.0
+        and profile.defence == 1.0
+        and profile.moveSpeed == 1.0
+        and profile.xp == 1.0
 end
 
 local function applyMutation(state)
@@ -1088,7 +1377,13 @@ local function applyMutation(state)
         end
         return false
     end
-    if mutationIsIdentity() then return restoreState(state) end
+    if state.owned and state.admitted ~= true then return false end
+    local profile, profileError = mutationProfile(state.baseline)
+    if profile == nil then
+        log("MUTATION ERROR | " .. state.key .. " | " .. profileError)
+        return false
+    end
+    if mutationIsIdentity(profile) then return restoreState(state) end
     if state.baseline.isBoss and not CONFIG.INCLUDE_BOSSES then
         restoreState(state)
         return true
@@ -1128,25 +1423,25 @@ local function applyMutation(state)
         Y = base.meshScale.Y * scaleFactor,
         Z = base.meshScale.Z * scaleFactor,
     }
-    local movingSpeed = base.MovingSpeed * CONFIG.MOVE_SPEED_MULTIPLIER
+    local movingSpeed = base.MovingSpeed * profile.moveSpeed
     local actualGas
 
     local ok, mutationError = pcall(function()
         retargetGas(
             state,
-            CONFIG.HEALTH_MULTIPLIER,
-            CONFIG.ATTACK_MULTIPLIER,
-            CONFIG.DEFENCE_MULTIPLIER
+            profile.health,
+            profile.attack,
+            profile.defence
         )
         if not isValid(base.mesh) then
             error("baseline skeletal mesh is unavailable")
         end
         base.mesh:SetRelativeScale3D(newScale)
-        state.object.MaxHelth = roundedProduct(base.MaxHelth, CONFIG.HEALTH_MULTIPLIER)
-        state.object.AttackPower = roundedProduct(base.AttackPower, CONFIG.ATTACK_MULTIPLIER)
-        state.object.DefencePower = roundedProduct(base.DefencePower, CONFIG.DEFENCE_MULTIPLIER)
+        state.object.MaxHelth = roundedProduct(base.MaxHelth, profile.health)
+        state.object.AttackPower = roundedProduct(base.AttackPower, profile.attack)
+        state.object.DefencePower = roundedProduct(base.DefencePower, profile.defence)
         state.object.ExperiencePoint =
-            roundedProduct(base.ExperiencePoint, CONFIG.XP_MULTIPLIER)
+            roundedProduct(base.ExperiencePoint, profile.xp)
         state.object.MovingSpeed = movingSpeed
         state.object:SetMovingSpeed(movingSpeed)
         if state.colorParameter ~= nil then
@@ -1173,15 +1468,16 @@ local function applyMutation(state)
 
     state.applied = true
     dbg(string.format(
-        "MUTATED | %s | scale=%.2fx gas_hp=%.1f/%.1f gas_atk=%.1f gas_def=%.1f speed=%.2fx xp=%.2fx",
+        "MUTATED | %s | tier=%s scale=%.2fx gas_hp=%.1f/%.1f gas_atk=%.1f gas_def=%.1f speed=%.2fx xp=%.2fx",
         state.key,
+        state.baseline.tier,
         scaleFactor,
         actualGas.health,
         actualGas.maxHealth,
         actualGas.attack,
         actualGas.defence,
-        CONFIG.MOVE_SPEED_MULTIPLIER,
-        CONFIG.XP_MULTIPLIER
+        profile.moveSpeed,
+        profile.xp
     ))
     return true
 end
@@ -1199,9 +1495,7 @@ local function destroyOwned(state, reason)
     return true
 end
 
--- A pending request is a ticket, not an actor: ServerDebugEnemySpawn has not
--- reported anything back yet, so there is usually nothing to destroy. Only a
--- request reconstructed from an already-owned enemy carries an object.
+-- A pending request owns the exact actor returned by deferred spawn.
 local function destroyPending(request, reason)
     local label = request.actorKey or (request.classKey or "unclaimed ticket")
     if isValid(request.object) then
@@ -1275,38 +1569,35 @@ local function enforceGlobalCap()
     end
 end
 
--- With RANDOMIZE_EXTRA_SPECIES on, one draw landing on an entry that has since
--- become ineligible is not the same thing as having no species to spawn. The
--- draw is retried across the catalog before giving up, because the caller treats
--- a nil result as "nothing can be spawned here" and permanently consumes the
--- slot — an unlucky single draw used to silently cost an extra and report the
--- catalog as empty.
+-- Spawn selection operates only on the currently valid catalog.
 local function classEntryIsSpawnable(entry)
     return entry ~= nil
         and entry.spawnEligible == true
+        and type(entry.physicalContract) == "table"
         and protectedBossClasses[entry.classKey] ~= true
         and isValid(entry.classObject)
 end
 
 local function selectSpawnClass(origin)
-    if protectedBossClasses[origin.classKey] == true then return nil, nil end
+    if protectedBossClasses[origin.classKey] == true then
+        return nil, nil, nil
+    end
     if not CONFIG.RANDOMIZE_EXTRA_SPECIES then
-        if origin.spawnEligible ~= true then return nil, nil end
-        return origin.classObject, origin.classKey
+        if origin.spawnEligible ~= true then return nil, nil, nil end
+        return origin.classObject, origin.classKey, origin.physicalContract
     end
 
-    local count = #classOrder
-    if count == 0 then return nil, nil end
-    -- Start at a random position and walk the catalog once, so the pick stays
-    -- uniform-ish without ever scanning it more than a single time.
-    local start = math.random(1, count)
-    for step = 0, count - 1 do
-        local entry = classCatalog[classOrder[((start + step - 1) % count) + 1]]
+    -- Randomisation makes one selection from the currently valid domain.
+    local eligible = {}
+    for _, classKey in ipairs(classOrder) do
+        local entry = classCatalog[classKey]
         if classEntryIsSpawnable(entry) then
-            return entry.classObject, entry.classKey
+            eligible[#eligible + 1] = entry
         end
     end
-    return nil, nil
+    if #eligible == 0 then return nil, nil, nil end
+    local entry = eligible[math.random(1, #eligible)]
+    return entry.classObject, entry.classKey, entry.physicalContract
 end
 
 local function planarDistanceSquared(a, b)
@@ -1524,7 +1815,7 @@ local function queueExtra(origin, slot)
         return false
     end
 
-    local classObject, classKey = selectSpawnClass(origin)
+    local classObject, classKey, physicalContract = selectSpawnClass(origin)
     if not isValid(classObject) then
         origin.issued = slot
         if CONFIG.RANDOMIZE_EXTRA_SPECIES then
@@ -1543,6 +1834,7 @@ local function queueExtra(origin, slot)
         slot = slot,
         classObject = classObject,
         classKey = classKey,
+        physicalContract = physicalContract,
         level = origin.level,
         originLocation = {
             X = origin.location.X,
@@ -1594,12 +1886,16 @@ local function reconcileOrigin(origin)
     origin.completed = true
 end
 
-local function addClass(classObject, classKey)
+local function addClass(classObject, classKey, physicalContract)
     if protectedBossClasses[classKey] == true then return end
     if classCatalog[classKey] ~= nil then return end
+    if type(physicalContract) ~= "table" then
+        error("same-class natural collision contract is unavailable")
+    end
     classCatalog[classKey] = {
         classObject = classObject,
         classKey = classKey,
+        physicalContract = physicalContract,
         spawnEligible = true,
     }
     classOrder[#classOrder + 1] = classKey
@@ -1759,6 +2055,7 @@ local function registerEnemy(enemy, reused, queued)
                     originKey = previous.originKey,
                     slot = previous.slot,
                     classKey = previous.classKey,
+                    physicalContract = previous.expectedPhysical,
                     actorKey = previous.key,
                     object = previous.object,
                 }
@@ -1844,6 +2141,11 @@ local function registerEnemy(enemy, reused, queued)
         originKey = request and request.originKey or nil,
         slot = request and request.slot or nil,
         spawnPosition = request and request.position or nil,
+        expectedPhysical = request and request.physicalContract or nil,
+        admitted = request == nil,
+        admissionStableSamples = 0,
+        admissionDeadlineMs =
+            request and (elapsedMs + OWNED_ADMISSION_TIMEOUT_MS) or nil,
         applied = false,
     }
     states[key] = state
@@ -1853,7 +2155,7 @@ local function registerEnemy(enemy, reused, queued)
     if state.owned then
         if activateSpawnedEnemy(enemy, key, state.spawnPosition) ~= true then
             states[key] = nil
-            destroyPending(request, "native collision contract was rejected")
+            destroyPending(request, "canonical activation contract was rejected")
             return
         end
     end
@@ -1864,7 +2166,15 @@ local function registerEnemy(enemy, reused, queued)
     if not state.owned
         and not baseline.isBoss
         and protectedBossClasses[classKey] ~= true then
-        addClass(classObject, classKey)
+        local physicalContract, physicalError =
+            enemyContracts.capturePhysical(enemy)
+        if physicalContract == nil then
+            log("CLASS REJECTED | " .. classKey ..
+                " | natural collision contract failed: " ..
+                tostring(physicalError))
+            return
+        end
+        addClass(classObject, classKey, physicalContract)
         local okLevel, level = pcall(function() return enemy:GetEnemyLevel() end)
         if not okLevel or not finiteNumber(level) then
             log("ENEMY ERROR | " .. key .. " | GetEnemyLevel failed")
@@ -1873,6 +2183,7 @@ local function registerEnemy(enemy, reused, queued)
                 key = key,
                 classObject = classObject,
                 classKey = classKey,
+                physicalContract = physicalContract,
                 level = math.max(1, math.floor(level)),
                 location = location,
                 issued = 0,
@@ -1884,7 +2195,10 @@ local function registerEnemy(enemy, reused, queued)
         dbg("BOSS PROTECTED | excluded from spawn catalog: " .. key)
     end
 
-    if configHealthy and CONFIG.ENABLED then applyMutation(state) end
+    if configHealthy and CONFIG.ENABLED
+        and (not state.owned or state.admitted) then
+        applyMutation(state)
+    end
     local origin = origins[key]
     if origin ~= nil and configHealthy and CONFIG.ENABLED and not discoveryBatch then
         reconcileOrigin(origin)
@@ -1962,107 +2276,43 @@ end
 -- nothing for a behaviour tree to run yet.
 local activationReported = false
 
-local function spawnedEnemyCollisionContract(enemy)
-    if not isValid(enemy) then
-        return false, "enemy object is invalid"
-    end
-    local detail = nil
-    local collisionOk, collisionError = pcall(function()
-        if enemy:GetActorEnableCollision() ~= true then
-            error("actor collision is disabled")
-        end
-        local capsule = enemy.CapsuleComponent
-        if not isValid(capsule) then
-            error("capsule component is unavailable")
-        end
-        local enabled = tonumber(capsule:GetCollisionEnabled())
-        if enabled ~= 1 and enabled ~= 3 and enabled ~= 5 then
-            error("capsule has no query collision: " .. tostring(enabled))
-        end
-        local pawnResponse =
-            tonumber(capsule:GetCollisionResponseToChannel(2))
-        if pawnResponse ~= 2 then
-            error("capsule does not block Pawn: " .. tostring(pawnResponse))
-        end
-        local profile = capsule:GetCollisionProfileName():ToString()
-        if type(profile) ~= "string" or profile == ""
-            or profile == "None" then
-            error("capsule collision profile is unavailable")
-        end
-        detail = string.format(
-            "profile=%s enabled=%d Pawn=%d",
-            profile, enabled, pawnResponse)
-    end)
-    if not collisionOk then
-        return false, tostring(collisionError)
-    end
-    return true, detail
-end
-
 activateSpawnedEnemy = function(enemy, key, spawnPosition)
     if not isValid(enemy) then return false end
-
-    -- Collision responses belong to the enemy Blueprint. The previous code
-    -- replaced every capsule and mesh channel with Block, destroying the
-    -- custom attack/overlap responses used by this game. Preserve the authored
-    -- profiles and reject the extra if its native pawn collision did not
-    -- initialize.
-    pcall(function()
-        enemy:SetCanBeDamaged(true)
-        enemy.bCanBeDamaged = true
-    end)
-
-    if spawnPosition ~= nil then
-        pcall(function()
-            enemy.ProwlFirstPosition = spawnPosition
-            enemy.ProwlGoalPosition = spawnPosition
-            enemy.ProwlGoalPositionFlag = false
-        end)
+    local state = states[key]
+    if state == nil or type(state.expectedPhysical) ~= "table" then
+        log("SPAWN ACTIVATION ERROR | " .. tostring(key) ..
+            " | same-class natural collision contract is unavailable")
+        return false
     end
 
     local controller = nil
-    pcall(function() controller = enemy.Controller end)
+    local treeResult = nil
+    local activated, activationError = pcall(function()
+        if spawnPosition == nil then
+            error("canonical spawn position is unavailable")
+        end
+        controller = enemy:GetController()
+        if not isValid(controller) then
+            error("AI controller is unavailable")
+        end
+        local pawn = controller:K2_GetPawn()
+        if not isValid(pawn) or objectKey(pawn) ~= objectKey(enemy) then
+            error("AI controller does not possess the spawned enemy")
+        end
 
-    -- Two StartAI functions exist and they are not the same thing.
-    --
-    -- ARODEnemyCharacter:StartAI(DetectFlag) is the one that was being called,
-    -- and it is enough to get the enemy idling and patrolling. But the extras
-    -- never noticed the player — invisible until hit — because perception lives
-    -- on the controller side: ARODAIControllerBase:StartAI(ProcessedPawn) is
-    -- what binds the possessed pawn into the perception system, and
-    -- ApplyBindFunction wires its delegates. The engine auto-possesses the pawn
-    -- but nothing calls those, since the game's own path reaches them through
-    -- RODSpawnActor.
-    --
-    -- The controller is set up first, then the character, then the tree: binding
-    -- perception after the tree is already running is what leaves an enemy
-    -- walking its idle loop with nothing feeding it targets.
-    local boundController, controllerError = true, nil
-    if isValid(controller) then
-        boundController, controllerError = pcall(function()
-            controller:StartAI(enemy)
-            controller:ApplyBindFunction()
-        end)
+        enemy.ProwlFirstPosition = spawnPosition
+        enemy.ProwlGoalPosition = spawnPosition
+        enemy.ProwlGoalPositionFlag = false
+        controller:StartAI(enemy)
+        controller:ApplyBindFunction()
+        enemy:StartAI(false)
+        treeResult = enemy:StartBehaviorTree()
+    end)
+    if not activated then
+        log("SPAWN ACTIVATION ERROR | " .. tostring(key) .. " | " ..
+            tostring(activationError))
+        return false
     end
-
-    -- StartAI's argument is inverted from what its name suggests.
-    --
-    -- It was being called as StartAI(true), reading "DetectFlag = yes, please
-    -- detect". Clearing DisableDetectFlag beforehand and reading it back
-    -- afterwards showed the write not surviving: the flag was false going in and
-    -- true coming out, with nothing between the two but this call. So the
-    -- parameter is the option struct's IsNodetect, not its opposite — passing
-    -- true is what was making every extra blind.
-    local startedAI, aiError = pcall(function() enemy:StartAI(false) end)
-    local startedTree, treeResult = pcall(function()
-        return enemy:StartBehaviorTree()
-    end)
-
-    -- Cleared last, after everything that is known to write it. Belt and braces:
-    -- the readback in the log is what says whether it stuck this time.
-    local clearedDetect = pcall(function()
-        enemy.DisableDetectFlag = false
-    end)
 
     if not activationReported then
         activationReported = true
@@ -2071,9 +2321,8 @@ activateSpawnedEnemy = function(enemy, key, spawnPosition)
         pcall(function() disableDetect = enemy.DisableDetectFlag end)
         pcall(function() prowlAnchor = vector(enemy.ProwlFirstPosition) end)
         log(string.format(
-            "SPAWN ACTIVATION | detect cleared=%s DisableDetectFlag=%s "
-                .. "DetectStartFlagN=%s | prowl anchor=%s",
-            tostring(clearedDetect),
+            "SPAWN ACTIVATION | DisableDetectFlag=%s DetectStartFlagN=%s "
+                .. "| prowl anchor=%s",
             tostring(disableDetect),
             tostring(detectStart),
             prowlAnchor
@@ -2082,37 +2331,18 @@ activateSpawnedEnemy = function(enemy, key, spawnPosition)
                 or "unreadable"
         ))
         log(string.format(
-            "SPAWN ACTIVATION | controller=%s | controller:StartAI ok=%s%s | "
-                .. "enemy:StartAI ok=%s%s | StartBehaviorTree ok=%s returned=%s",
-            isValid(controller) and objectKey(controller) or "none",
-            tostring(boundController),
-            boundController and "" or (" error=" .. tostring(controllerError)),
-            tostring(startedAI),
-            startedAI and "" or (" error=" .. tostring(aiError)),
-            tostring(startedTree),
+            "SPAWN ACTIVATION | controller=%s | initialization calls completed "
+                .. "| StartBehaviorTree returned=%s | awaiting stable admission",
+            objectKey(controller),
             tostring(treeResult)
         ))
-    elseif not startedAI or not startedTree then
-        dbg("SPAWN ACTIVATION | " .. tostring(key) .. " | StartAI ok="
-            .. tostring(startedAI) .. " StartBehaviorTree ok="
-            .. tostring(startedTree))
-    end
-
-    local collisionOk, collisionError =
-        spawnedEnemyCollisionContract(enemy)
-    if not collisionOk then
-        log("SPAWN COLLISION ERROR | " .. tostring(key) .. " | " ..
-            tostring(collisionError))
-        return false
     end
     return true
 end
 
--- The activation check above proves only that instant. StartAI, the behavior
--- tree, pooling callbacks, and Blueprint state changes can still alter
--- collision afterward. This audit is deliberately fail-closed: a live owned
--- extra that no longer satisfies the exact capsule contract is destroyed. It
--- is not repaired by writing guessed collision responses over the Blueprint.
+-- Candidates remain unmutated until both their physical and AI contracts pass
+-- three consecutive samples. A timeout or any later contract loss destroys the
+-- owned actor; no profile, component or controller is repaired in place.
 local function auditOwnedEnemyCollision()
     if elapsedMs < nextCollisionAuditMs then return end
     nextCollisionAuditMs = elapsedMs + COLLISION_AUDIT_MS
@@ -2120,32 +2350,54 @@ local function auditOwnedEnemyCollision()
     local rejected = {}
     for _, state in pairs(states) do
         if state.owned and isValid(state.object) then
-            local operational, lifecycleError =
-                enemyOperational(state.object)
-            if operational then
-                local valid, collisionError =
-                    spawnedEnemyCollisionContract(state.object)
-                if not valid then
-                    rejected[#rejected + 1] = {
-                        state = state,
-                        reason = collisionError,
-                    }
+            local physical, physicalDetail =
+                enemyContracts.comparePhysical(
+                    state.object,
+                    state.expectedPhysical)
+            local controlled, controlDetail =
+                enemyContracts.controlOperational(state.object)
+            if physical == true and controlled == true then
+                if state.admitted ~= true then
+                    state.admissionStableSamples =
+                        state.admissionStableSamples + 1
+                    if state.admissionStableSamples
+                        >= OWNED_ADMISSION_SAMPLES_REQUIRED then
+                        state.admitted = true
+                        log("SPAWN ADMITTED | " .. tostring(state.key) ..
+                            " | " .. tostring(physicalDetail) ..
+                            " | controller=" .. tostring(controlDetail))
+                        if configHealthy and CONFIG.ENABLED then
+                            applyMutation(state)
+                        end
+                    end
                 end
-            elseif lifecycleError ~= "enemy is dead" then
+            elseif state.admitted == true
+                or elapsedMs >= state.admissionDeadlineMs then
                 rejected[#rejected + 1] = {
                     state = state,
-                    reason = "lifecycle contract lost: " ..
-                        tostring(lifecycleError),
+                    reason = physical ~= true
+                        and ("physical contract: " ..
+                            tostring(physicalDetail))
+                        or ("control contract: " ..
+                            tostring(controlDetail)),
                 }
+            else
+                state.admissionStableSamples = 0
+                state.lastAdmissionError = physical ~= true
+                    and ("physical contract: " .. tostring(physicalDetail))
+                    or ("control contract: " .. tostring(controlDetail))
             end
         end
     end
 
     for _, rejection in ipairs(rejected) do
         local state = rejection.state
-        log("SPAWN COLLISION LOST | " .. tostring(state.key) .. " | " ..
+        local label = state.admitted == true
+            and "SPAWN CONTRACT LOST"
+            or "SPAWN ADMISSION REJECTED"
+        log(label .. " | " .. tostring(state.key) .. " | " ..
             tostring(rejection.reason) .. " | removing owned extra")
-        destroyOwned(state, "collision contract lost after activation")
+        destroyOwned(state, "owned enemy contract rejected")
     end
 end
 
@@ -2319,7 +2571,7 @@ local function processSpawnRequest()
             owner,
             spawnClass,
             transform,
-            SPAWN_COLLISION_ALWAYS,
+            SPAWN_COLLISION_ADJUST_OR_REJECT,
             nil,
             SPAWN_SCALE_MULTIPLY_ROOT
         )
@@ -2337,6 +2589,21 @@ local function processSpawnRequest()
         pendingSpawns[#pendingSpawns + 1] = request
         insertedPending = true
 
+        -- FinishSpawningActor can synchronously fire OnFinishedInitialize.
+        -- Ownership must therefore exist before that call; otherwise the
+        -- initialization hook correctly rejects and destroys an actor which
+        -- this creator has not identified yet.
+        local tags = spawned.Tags
+        if tags == nil then
+            error("deferred actor Tags array is unavailable")
+        end
+        if spawned:ActorHasTag(FName(OWNED_ACTOR_TAG)) ~= true then
+            tags[#tags + 1] = FName(OWNED_ACTOR_TAG)
+        end
+        if spawned:ActorHasTag(FName(OWNED_ACTOR_TAG)) ~= true then
+            error("deferred actor ownership tag did not persist")
+        end
+
         local finished = gameplayStatics:FinishSpawningActor(
             spawned,
             transform,
@@ -2349,15 +2616,8 @@ local function processSpawnRequest()
             error("FinishSpawningActor returned a different actor")
         end
         request.object = finished
-        local tags = finished.Tags
-        if tags == nil then
-            error("spawned actor Tags array is unavailable")
-        end
         if finished:ActorHasTag(FName(OWNED_ACTOR_TAG)) ~= true then
-            tags[#tags + 1] = FName(OWNED_ACTOR_TAG)
-        end
-        if finished:ActorHasTag(FName(OWNED_ACTOR_TAG)) ~= true then
-            error("spawned actor ownership tag did not persist")
+            error("ownership tag did not survive FinishSpawningActor")
         end
         finished:SetEnemyLevel(request.level, false)
     end)
@@ -2454,7 +2714,11 @@ local function applyNewSettings(settings, digest)
     configDigest = digest
     configHealthy = true
     log(string.format(
-        "CONFIG APPLIED | enabled=%s spawn=%dx cap=%d random=%s bossMutation=%s bossSpawn=false scale=%.2f-%.2f color=%s",
+        "CONFIG APPLIED | enabled=%s spawn=%dx cap=%d random=%s "
+            .. "bossMutation=%s bossSpawn=false scale=%.2f-%.2f color=%s "
+            .. "| common H/A/D/S/XP=%.1f/%.1f/%.1f/%.2f/%.1f "
+            .. "| elite=%.1f/%.1f/%.1f/%.2f/%.1f "
+            .. "| boss=%.1f/%.1f/%.1f/%.2f/%.1f",
         tostring(CONFIG.ENABLED),
         CONFIG.SPAWN_MULTIPLIER,
         CONFIG.MAX_ACTIVE_EXTRAS,
@@ -2462,7 +2726,22 @@ local function applyNewSettings(settings, digest)
         tostring(CONFIG.INCLUDE_BOSSES),
         CONFIG.SCALE_MIN,
         CONFIG.SCALE_MAX,
-        CONFIG.COLOR_MODE
+        CONFIG.COLOR_MODE,
+        CONFIG.COMMON_HEALTH_MULTIPLIER,
+        CONFIG.COMMON_ATTACK_MULTIPLIER,
+        CONFIG.COMMON_DEFENCE_MULTIPLIER,
+        CONFIG.COMMON_MOVE_SPEED_MULTIPLIER,
+        CONFIG.COMMON_XP_MULTIPLIER,
+        CONFIG.ELITE_HEALTH_MULTIPLIER,
+        CONFIG.ELITE_ATTACK_MULTIPLIER,
+        CONFIG.ELITE_DEFENCE_MULTIPLIER,
+        CONFIG.ELITE_MOVE_SPEED_MULTIPLIER,
+        CONFIG.ELITE_XP_MULTIPLIER,
+        CONFIG.BOSS_HEALTH_MULTIPLIER,
+        CONFIG.BOSS_ATTACK_MULTIPLIER,
+        CONFIG.BOSS_DEFENCE_MULTIPLIER,
+        CONFIG.BOSS_MOVE_SPEED_MULTIPLIER,
+        CONFIG.BOSS_XP_MULTIPLIER
     ))
 
     if worldPaused then return end
@@ -2634,6 +2913,7 @@ local function checkAmbientEmptyAreaSpawns()
         key = ambientKey,
         classObject = classInfo.classObject,
         classKey = chosenClassKey,
+        physicalContract = classInfo.physicalContract,
         level = heroLevel,
         location = navPoint,
         issued = 1,
@@ -2648,6 +2928,7 @@ local function checkAmbientEmptyAreaSpawns()
         slot = 1,
         classKey = chosenClassKey,
         classObject = classInfo.classObject,
+        physicalContract = classInfo.physicalContract,
         level = heroLevel,
         originLocation = navPoint,
         navAttempts = 0,
@@ -2887,190 +3168,44 @@ requireHook(
 
 requireHook("/Script/Engine.PlayerController:ClientRestart", beginRestartSettle)
 
---========================================================--
---                   SPAWN CALL MATRIX                    --
---========================================================--
--- `worldenemy spawntest` tries several argument shapes against RODSpawnActor in
--- one pass and reports which property each one dies on.
---
--- This exists because the failure only reproduces in game and every hypothesis
--- so far cost a full restart to test exactly one variable. The property named in
--- each rejection is the signal: comparing which parameter each shape stops at
--- says how many stack slots the ones before it consumed, which is the thing that
--- cannot be read back on this build any other way.
---
--- A shape that gets through spawns a real enemy. That is the intended success
--- condition, and the extra enemy is left as an ordinary one the director does
--- not own.
-local function spawnTestSubject()
-    local state = FindFirstOf("RODGameState")
-    if not isValid(state) then return nil, nil, nil, "RODGameState is unavailable" end
-
-    local enemy = FindFirstOf("RODEnemyCharacter")
-    if not isValid(enemy) then
-        return nil, nil, nil, "no RODEnemyCharacter is loaded to spawn beside"
-    end
-
-    local classOk, enemyClass = pcall(function() return enemy:GetClass() end)
-    if not classOk or not isValid(enemyClass) then
-        return nil, nil, nil, "enemy class is unreadable"
-    end
-
-    local library = StaticFindObject("/Script/Engine.Default__KismetMathLibrary")
-    if not isValid(library) then
-        return nil, nil, nil, "KismetMathLibrary is unavailable"
-    end
-
-    local transformOk, transform = pcall(function()
-        local origin = enemy:K2_GetActorLocation()
-        return library:MakeTransform(
-            { X = origin.X + 200.0, Y = origin.Y + 200.0, Z = origin.Z },
-            { Pitch = 0.0, Yaw = 0.0, Roll = 0.0 },
-            { X = 1.0, Y = 1.0, Z = 1.0 }
-        )
-    end)
-    if not transformOk or transform == nil then
-        return nil, nil, nil, "MakeTransform failed: " .. tostring(transform)
-    end
-
-    return state, enemyClass, { enemy = enemy, transform = transform }, nil
-end
-
-local function fullSpawnOption(location)
-    return {
-        ActorTags = {},
-        FlowGameplayTags = {},
-        DefaultSpawnOn = SPAWN_ON_SERVER,
-        ItemLotKey = "None",
-        Items = {},
-        IsDropItems = false,
-        HeroNumber = 0,
-        IsPermanentableItem = false,
-        ReplaceNameID = 0,
-        Level = 1,
-        InitialState = INITIAL_STATE_PROWL,
-        InitialStateLoc = location,
-        IsNodetect = false,
-        IsStartBehaviorTree = true,
-        IsBossWave = false,
-        IsDangerousTreasureChests = false,
-        IsForcePlaySpawnFX = false,
-    }
-end
-
-local function runSpawnTest()
-    local state, enemyClass, subject, subjectError = spawnTestSubject()
-    if state == nil then
-        log("SPAWN TEST | cannot run: " .. tostring(subjectError))
-        return
-    end
-
-    local enemy = subject.enemy
-    local transform = subject.transform
-    local location = nil
-    pcall(function() location = enemy:K2_GetActorLocation() end)
-
-    log("SPAWN TEST | subject class=" .. tostring(objectKey(enemyClass))
-        .. " owner=" .. tostring(objectKey(enemy)))
-
-    local controller = resolveLocalController()
-    local spawnPoint = nil
-    pcall(function()
-        local origin = enemy:K2_GetActorLocation()
-        spawnPoint = {
-            X = origin.X + 200.0,
-            Y = origin.Y + 200.0,
-            Z = origin.Z,
-        }
-    end)
-
-    -- Each shape varies exactly one thing from the one above it.
-    local shapes = {
-        {
-            -- The path the director uses. Its native symbol exists, it returns
-            -- without error, and nothing appears; this confirms that against a
-            -- deliberate, visible attempt right next to the player.
-            name = "ServerDebugEnemySpawn(class, level, position)",
-            call = function()
-                if not isValid(controller) then
-                    error("RODInGamePlayerController is unavailable")
-                end
-                if spawnPoint == nil then error("spawn point unreadable") end
-                return controller:ServerDebugEnemySpawn(enemyClass, 1, spawnPoint)
-            end,
-        },
-        {
-            name = "full option, instigator=owner",
-            call = function()
-                return state:RODSpawnActor(enemyClass, transform,
-                    fullSpawnOption(location), enemy, enemy,
-                    SPAWN_COLLISION_ADJUST_OR_REJECT)
-            end,
-        },
-        {
-            name = "empty option, instigator=owner",
-            call = function()
-                return state:RODSpawnActor(enemyClass, transform, {}, enemy,
-                    enemy, SPAWN_COLLISION_ADJUST_OR_REJECT)
-            end,
-        },
-        {
-            name = "nil option, instigator=owner",
-            call = function()
-                return state:RODSpawnActor(enemyClass, transform, nil, enemy,
-                    enemy, SPAWN_COLLISION_ADJUST_OR_REJECT)
-            end,
-        },
-        {
-            name = "four arguments only",
-            call = function()
-                return state:RODSpawnActor(enemyClass, transform,
-                    fullSpawnOption(location), enemy)
-            end,
-        },
-        {
-            name = "two arguments only",
-            call = function()
-                return state:RODSpawnActor(enemyClass, transform)
-            end,
-        },
-    }
-
-    for index, shape in ipairs(shapes) do
-        -- Logged before the call: a native marshaling fault can take the process
-        -- down past pcall, and then this line names the shape that did it.
-        log(string.format("SPAWN TEST | %d/%d trying: %s",
-            index, #shapes, shape.name))
-        local ok, resultOrError = pcall(shape.call)
-        if ok then
-            local spawnOn = "unreadable"
-            pcall(function() spawnOn = tostring(resultOrError.SpawnOn) end)
-            log(string.format("SPAWN TEST | %d PASSED: %s | SpawnOn=%s",
-                index, shape.name, spawnOn))
-        else
-            log(string.format("SPAWN TEST | %d failed: %s | %s",
-                index, shape.name, summarizeSpawnCallError(resultOrError)))
-        end
-    end
-    log("SPAWN TEST | matrix complete")
-end
-
 RegisterConsoleCommandGlobalHandler(
     "enemy_director_status",
     function()
         ExecuteInGameThread(function()
-            local natural, owned = 0, 0
+            local natural, owned, admissionPending = 0, 0, 0
+            local common, elite, boss = 0, 0, 0
             for _, state in pairs(states) do
-                if state.owned then owned = owned + 1 else natural = natural + 1 end
+                if state.owned then
+                    owned = owned + 1
+                    if state.admitted ~= true then
+                        admissionPending = admissionPending + 1
+                    end
+                else
+                    natural = natural + 1
+                end
+                if state.baseline.tier == "common" then
+                    common = common + 1
+                elseif state.baseline.tier == "elite" then
+                    elite = elite + 1
+                elseif state.baseline.tier == "boss" then
+                    boss = boss + 1
+                end
             end
             log(string.format(
-                "STATUS | healthy=%s enabled=%s paused=%s fault=%s natural=%d extras=%d queued=%d pending=%d classes=%d spawning=%s",
+                "STATUS | healthy=%s enabled=%s paused=%s fault=%s "
+                    .. "natural=%d extras=%d admissionPending=%d "
+                    .. "tiers=%d/%d/%d(common/elite/boss) "
+                    .. "queued=%d pending=%d classes=%d spawning=%s",
                 tostring(configHealthy),
                 tostring(CONFIG ~= nil and CONFIG.ENABLED),
                 tostring(worldPaused),
                 tostring(worldFault),
                 natural,
                 owned,
+                admissionPending,
+                common,
+                elite,
+                boss,
                 #spawnQueue,
                 #pendingSpawns,
                 #classOrder,
