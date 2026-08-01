@@ -574,8 +574,10 @@ do
             note("object type", expected.objectType, actual.objectType)
         end
         if compareEnabled then
+            -- IsActive controls component activation/ticking; it is not a
+            -- collision predicate. The query mode, collision responses, and
+            -- registered Chaos body below are the physical contract.
             for _, field in ipairs({
-                "active",
                 "collisionEnabled",
                 "queryEnabled",
                 "physicsEnabled",
@@ -2551,7 +2553,6 @@ local function auditOwnedEnemyCollision()
     if rejected ~= nil then
         local state = rejected.state
         spawnQueue = {}
-        pendingSpawns = {}
         worldFault = "spawn admission failed for " .. tostring(state.key) ..
             ": " .. tostring(rejected.reason)
         log("SPAWN ADMISSION REJECTED | " .. tostring(state.key) .. " | " ..
@@ -3097,6 +3098,7 @@ local function tick(stepMs)
     cleanupInvalidStates()
     expirePendingSpawns()
     auditOwnedEnemyCollision()
+    if worldFault ~= nil then return end
     if not discoveryBatch then
         if elapsedMs >= nextOriginSweepMs then
             nextOriginSweepMs = elapsedMs + ORIGIN_SWEEP_MS
