@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // This bridge intentionally binds to the exported ABI of the exact UE4SS build
@@ -546,6 +547,7 @@ namespace
         std::string failure{};
         std::int32_t object_count = 0;
         std::vector<void*> resolved_actors{};
+        std::vector<WeakObjectPtr> resolved_weak_actors{};
         std::vector<void*> async_items{};
 
         if (!guarded_get_num_elements(object_count)
@@ -558,6 +560,7 @@ namespace
         if (success)
         {
             resolved_actors.reserve(g_owned_actors.size());
+            resolved_weak_actors.reserve(g_owned_actors.size());
             for (const WeakObjectPtr& weak : g_owned_actors)
             {
                 void* item = nullptr;
@@ -583,7 +586,11 @@ namespace
                     failure = "tracked actor object could not be read";
                     break;
                 }
-                if (actor != nullptr) resolved_actors.push_back(actor);
+                if (actor != nullptr)
+                {
+                    resolved_actors.push_back(actor);
+                    resolved_weak_actors.push_back(weak);
+                }
             }
         }
 
@@ -676,11 +683,15 @@ namespace
 
         const std::int64_t resolved_count = static_cast<std::int64_t>(resolved_actors.size());
         const std::int64_t cleared_count = static_cast<std::int64_t>(async_items.size());
-        g_owned_actors.clear();
+        // Weak identities do not retain UObjects. Keep the identities that are
+        // still live so same-world teleports can sanitize the same actors again
+        // if gameplay creates another Async child after this pass. Expired
+        // identities are pruned by the exact index+serial resolution above.
+        g_owned_actors = std::move(resolved_weak_actors);
         return push_result(
             lua,
             true,
-            "cleared Async GC roots from issued actor object graphs",
+            "cleared Async GC roots and retained live weak identities",
             resolved_count,
             cleared_count,
             tracked_count);

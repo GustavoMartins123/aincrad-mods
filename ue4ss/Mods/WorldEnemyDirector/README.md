@@ -95,15 +95,22 @@ process.
 
 Reducing the multiplier cancels only queued work that has not created an actor;
 already-issued extras stay alive and the lower cap prevents replacements until
-the population falls naturally. Killed extras are not recreated indefinitely.
-A confirmed map-travel signal first locks the live UObject array and resolves
+the population falls naturally. Killed extras release their live cap slot and
+are not recreated indefinitely. Each origin reserves at most one queued slot
+per sweep, and an uncreated request is released when its origin leaves the
+active radius, so one room cannot reserve the cap for later rooms.
+
+After an issued batch finishes initialization, and at every same-world or
+cross-world travel boundary, the bridge locks the live UObject array and resolves
 the retained weak identities, including actors already marked `PendingKill`.
 For those exact actor object graphs only, the bridge clears the internal `Async`
 GC flag that would otherwise keep their Gameplay Effects and outgoing World
-rooted. It verifies each flag removal, releases the weak identities, and then
-Lua releases all outgoing-world references without destroying actors or racing
-Unreal's asynchronous teardown. Processing resumes only after the matching
-`ClientRestart` signal and the fixed settlement period.
+rooted. It verifies each flag removal and retains only weak identities that are
+still live, allowing later same-world passes to sanitize new Gameplay Effects
+without retaining any UObject. On world travel Lua then releases outgoing-world
+references without destroying actors or racing Unreal's asynchronous teardown.
+Processing resumes only after the matching `ClientRestart` signal and settlement
+period.
 
 The safe lobby and a mission are separate worlds. A `ClientRestart` that follows
 confirmed travel starts a clean scan of the new world. A standalone
@@ -192,6 +199,8 @@ logging.
   The same invalid native call is not retried or expanded into repeated Lua
   stack dumps.
 - Actor initialization failures are reported and are not retried silently.
+  An issued actor that never enters `OnFinishedInitialize` is retained unmutated
+  and its origin is quarantined; other origins and later rooms keep processing.
 
 ## Reverse-engineering references
 

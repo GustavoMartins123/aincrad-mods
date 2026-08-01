@@ -804,6 +804,7 @@ local readinessStabilitySamples = 0
 local objectQueue = {}
 local spawnQueue = {}
 local pendingSpawns = {}
+local quarantinedActorKeys = {}
 local discoveryBatch = false
 local discoveryReadyAtMs = nil
 local generation = 1
@@ -830,6 +831,10 @@ local AMBIENT_SPAWN_MIN_DIST_CM = 1800.0
 local AMBIENT_SPAWN_MAX_DIST_CM = 3200.0
 local nextAmbientCheckMs = 0
 local ambientCounter = 0
+local NATIVE_SANITIZE_DELAY_MS = 2000
+local nativeSanitizeRequested = false
+local nativeSanitizeDueMs = 0
+local nativeSanitizeReason = nil
 local disableWorld
 local activateSpawnedEnemy
 local releaseWorldForTravel
@@ -854,6 +859,7 @@ local function clearWorldReferences()
     objectQueue = {}
     spawnQueue = {}
     pendingSpawns = {}
+    quarantinedActorKeys = {}
     discoveryBatch = false
     discoveryReadyAtMs = nil
     worldFault = nil
@@ -867,12 +873,21 @@ local function clearWorldReferences()
     lastSpawnMs = 0
     nextAmbientCheckMs = 0
     ambientCounter = 0
+    nativeSanitizeRequested = false
+    nativeSanitizeDueMs = 0
+    nativeSanitizeReason = nil
 end
 
-local function releaseNativeOwnedWorld(reason)
+local function requestNativeSanitize(reason)
+    nativeSanitizeRequested = true
+    nativeSanitizeDueMs = elapsedMs + NATIVE_SANITIZE_DELAY_MS
+    nativeSanitizeReason = tostring(reason)
+end
+
+local function sanitizeNativeOwnedActors(reason)
     if type(WEDNativeReleaseOwnedWorld) ~= "function" then
         return 0, 0, 0,
-            "WorldEnemyDirector native world teardown API is not loaded"
+            "WorldEnemyDirector native Async sanitizer is not loaded"
     end
 
     local callOk, released, detail, resolvedActors, clearedObjects, trackedActors =
@@ -885,27 +900,31 @@ local function releaseNativeOwnedWorld(reason)
     if not resultValid then
         local failure = callOk and tostring(detail) or firstErrorLine(released)
         return 0, 0, 0,
-            "native owned-world release failed: " .. failure
+            "native owned-actor sanitation failed: " .. failure
     end
 
     resolvedActors = math.floor(resolvedActors)
     clearedObjects = math.floor(clearedObjects)
     trackedActors = math.floor(trackedActors)
-    dbg(string.format(
-        "NATIVE TRAVEL RELEASE | %s | tracked=%d resolved=%d async-cleared=%d | %s",
+    nativeSanitizeRequested = false
+    nativeSanitizeDueMs = 0
+    nativeSanitizeReason = nil
+    local sanitizeReport = string.format(
+        "NATIVE ASYNC SANITIZE | %s | tracked=%d resolved=%d async-cleared=%d | %s",
         tostring(reason),
         trackedActors,
         resolvedActors,
         clearedObjects,
         tostring(detail)
-    ))
+    )
+    if clearedObjects > 0 then log(sanitizeReport) else dbg(sanitizeReport) end
     return resolvedActors, clearedObjects, trackedActors, nil
 end
 
 local function beginTravel(reason)
     if awaitingTravelRestart and worldPaused and resumeAtMs == nil then return end
     local nativeResolved, nativeCleared, nativeTracked, nativeError =
-        releaseNativeOwnedWorld(reason)
+        sanitizeNativeOwnedActors(reason)
     generation = generation + 1
     awaitingTravelRestart = true
     worldPaused = true
@@ -970,16 +989,23 @@ end
 
 local function beginSameWorldSettle(reason)
     if awaitingTravelRestart and worldPaused and resumeAtMs == nil then return end
+    local nativeResolved, nativeCleared, nativeTracked, nativeError =
+        sanitizeNativeOwnedActors(reason)
     worldPaused = true
     local requestedResumeAtMs = elapsedMs + QUEST_TELEPORT_SETTLE_MS
     if resumeAtMs == nil or resumeAtMs < requestedResumeAtMs then
         resumeAtMs = requestedResumeAtMs
     end
-    clearWorldReferences()
-    scheduleReferenceCollection()
+    if nativeError ~= nil then
+        log("WORLD QUARANTINE ERROR | " .. tostring(reason) .. " | " ..
+            tostring(nativeError))
+    end
     log(string.format(
-        "WORLD QUARANTINE | %s | reset world references and waiting %d seconds",
+        "WORLD QUARANTINE | %s | native tracked=%d resolved=%d async-cleared=%d | retained same-world state and waiting %d seconds",
         tostring(reason),
+        nativeTracked,
+        nativeResolved,
+        nativeCleared,
         QUEST_TELEPORT_SETTLE_MS / 1000
     ))
 end
@@ -1630,6 +1656,9 @@ local function applyMutation(state)
     end
 
     state.applied = true
+    if state.owned then
+        requestNativeSanitize("owned mutation: " .. tostring(state.key))
+    end
     dbg(string.format(
         "MUTATED | %s | tier=%s scale=%.2fx gas_hp=%.1f/%.1f gas_atk=%.1f gas_def=%.1f speed=%.2fx xp=%.2fx",
         state.key,
@@ -1657,11 +1686,15 @@ local function removeOrigin(originKey)
 end
 
 local function activeExtraCount()
-    local count = #spawnQueue + #pendingSpawns
+    local count = #spawnQueue
+    for _, request in ipairs(pendingSpawns) do
+        if request.quarantined ~= true then count = count + 1 end
+    end
     for _, state in pairs(states) do
         -- A corpse waiting for the game to despawn it is no longer a live
         -- extra, so it does not hold a slot under the cap.
-        if state.owned and isValid(state.object) and not state.retired then
+        if state.owned and isValid(state.object)
+            and not state.retired and state.quarantined ~= true then
             count = count + 1
         end
     end
@@ -1686,6 +1719,30 @@ local function enforceGlobalCap()
             CONFIG.MAX_ACTIVE_EXTRAS
         ))
     end
+end
+
+local function activePendingSpawnCount()
+    local count = 0
+    for _, request in ipairs(pendingSpawns) do
+        if request.quarantined ~= true then count = count + 1 end
+    end
+    return count
+end
+
+local function runRequestedNativeSanitize()
+    if not nativeSanitizeRequested
+        or elapsedMs < nativeSanitizeDueMs
+        or activePendingSpawnCount() > 0
+        or #spawnQueue > 0 then
+        return true
+    end
+    local reason = nativeSanitizeReason or "owned spawn batch"
+    local _, _, _, sanitizeError = sanitizeNativeOwnedActors(reason)
+    if sanitizeError == nil then return true end
+    nativeSanitizeRequested = false
+    worldFault = sanitizeError
+    log("WORLD ERROR | " .. worldFault .. " | director paused")
+    return false
 end
 
 -- Spawn selection operates only on the currently valid catalog.
@@ -1916,6 +1973,7 @@ local function resolveNavigableSpawnPosition(request, worldContext)
 end
 
 local function queueExtra(origin, slot)
+    if origin.quarantined == true then return false end
     if origin.spawnEligible ~= true then
         worldFault = "boss-protection invariant rejected spawn origin " ..
             tostring(origin.key)
@@ -1974,7 +2032,7 @@ local function queueExtra(origin, slot)
 end
 
 local function reconcileOrigin(origin)
-    if origin.completed == true then
+    if origin.completed == true or origin.quarantined == true then
         return
     end
     local desired = CONFIG.SPAWN_MULTIPLIER - 1
@@ -1996,9 +2054,10 @@ local function reconcileOrigin(origin)
         origin.completed = true
         return
     end
-    for slot = origin.issued + 1, desired do
-        if not queueExtra(origin, slot) then break end
-    end
+    -- Reserve at most one slot per origin per sweep. Reserving every slot at
+    -- discovery let the first room consume the global cap with queued work
+    -- before later-room origins were even seen.
+    queueExtra(origin, origin.issued + 1)
     origin.completed = origin.issued >= desired
 end
 
@@ -2159,6 +2218,9 @@ local function registerEnemy(enemy, reused, queued)
 
     local key = objectKey(enemy)
     if key == nil or key:find("Default__", 1, true) ~= nil then return end
+    if quarantinedActorKeys[key] == true then
+        return
+    end
     local operational, lifecycleError = enemyOperational(enemy)
     if not operational then
         if lifecycleError ~= "enemy is dead"
@@ -2366,6 +2428,9 @@ local function cleanupInvalidStates()
         if not isValid(state.object) then
             states[key] = nil
             if not state.owned then invalidNatural[#invalidNatural + 1] = key end
+        elseif not state.owned and origins[key] ~= nil
+            and enemyIsDead(state.object) == true then
+            invalidNatural[#invalidNatural + 1] = key
         end
     end
     for _, key in ipairs(invalidNatural) do removeOrigin(key) end
@@ -2377,13 +2442,27 @@ local function expirePendingSpawns()
         if request.generation ~= generation or elapsedMs >= request.expiresAtMs then
             table.remove(pendingSpawns, index)
             if request.generation == generation then
-                spawnQueue = {}
-                pendingSpawns = {}
-                worldFault = string.format(
-                    "direct spawn %s did not enter the enemy lifecycle",
-                    tostring(request.actorKey or request.actorAddress))
-                log("WORLD ERROR | " .. worldFault .. " | director paused")
-                return
+                request.quarantined = true
+                if type(request.actorKey) == "string" then
+                    quarantinedActorKeys[request.actorKey] = true
+                end
+                local origin = origins[request.originKey]
+                if origin ~= nil then
+                    origin.quarantined = true
+                    origin.completed = true
+                end
+                for queueIndex = #spawnQueue, 1, -1 do
+                    if spawnQueue[queueIndex].originKey == request.originKey then
+                        table.remove(spawnQueue, queueIndex)
+                    end
+                end
+                requestNativeSanitize(
+                    "lifecycle quarantine: " ..
+                        tostring(request.actorKey or request.actorAddress))
+                log(string.format(
+                    "SPAWN LIFECYCLE QUARANTINED | %s | origin=%s | actor retained unmutated; only this origin was stopped",
+                    tostring(request.actorKey or request.actorAddress),
+                    tostring(request.originKey)))
             end
         end
     end
@@ -2804,6 +2883,8 @@ local function processSpawnRequest()
         end
         request.weakIndex = math.floor(trackedWeakIndex)
         request.weakSerial = math.floor(trackedWeakSerial)
+        requestNativeSanitize(
+            "issued actor batch: " .. tostring(request.actorKey))
         request.object = spawned
         request.expiresAtMs = elapsedMs + SPAWN_INITIALIZE_MS
         pendingSpawns[#pendingSpawns + 1] = request
@@ -3026,6 +3107,38 @@ local function reconcileNearbyOrigins()
     if heroLocation == nil then return end
 
     local limitSquared = CONFIG.DESPAWN_RADIUS * CONFIG.DESPAWN_RADIUS
+    local resetSlots = {}
+    for index = #spawnQueue, 1, -1 do
+        local request = spawnQueue[index]
+        local origin = origins[request.originKey]
+        local outOfRange = origin == nil or origin.location == nil
+            or planarDistanceSquared(origin.location, heroLocation) > limitSquared
+        if outOfRange then
+            table.remove(spawnQueue, index)
+            if origin ~= nil then
+                if origin.isAmbient then
+                    origins[request.originKey] = nil
+                else
+                    local current = resetSlots[request.originKey]
+                    if current == nil or request.slot < current then
+                        resetSlots[request.originKey] = request.slot
+                    end
+                end
+            end
+        end
+    end
+    for originKey, firstRemovedSlot in pairs(resetSlots) do
+        local origin = origins[originKey]
+        if origin ~= nil and origin.quarantined ~= true then
+            origin.issued = math.min(origin.issued, firstRemovedSlot - 1)
+            origin.completed = false
+            dbg(string.format(
+                "SPAWN QUEUE RELEASED | origin=%s reset to issued=%d after leaving active radius",
+                originKey,
+                origin.issued))
+        end
+    end
+
     for _, origin in pairs(origins) do
         -- reconcileOrigin's own first act is to return on a completed origin,
         -- so testing it here first keeps the sweep from measuring a distance
@@ -3124,6 +3237,7 @@ end
 local function tick(stepMs)
     elapsedMs = elapsedMs + stepMs
     checkSettings(CONFIG == nil)
+    if not runRequestedNativeSanitize() then return end
 
     if worldPaused then
         local hero = resolveHeroObject()
@@ -3293,6 +3407,13 @@ requireHook(
     end
 )
 
+requireHook(
+    "/Script/ROD.RODPlayerState:ServerDecideStartTerminal",
+    function()
+        beginTravel("ServerDecideStartTerminal")
+    end
+)
+
 -- Mod-performed same-world travel does not enter ServerDecideFastTravel.
 -- K2_TeleportTo is the actual engine move used by FastTravelMod, so a large
 -- move of the local hero is the canonical boundary at which every retained
@@ -3334,7 +3455,7 @@ requireHook(
 requireHook(
     "/Script/ROD.RODHeroCharacter:MulticastRestSafeArea",
     function()
-        beginSameWorldSettle("MulticastRestSafeArea (Checkpoint Rest)")
+        beginTravel("MulticastRestSafeArea (Checkpoint Rest)")
     end
 )
 

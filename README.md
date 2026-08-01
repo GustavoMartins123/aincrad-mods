@@ -443,9 +443,12 @@ mission restart rather than destroying an initializing actor.
 Confirmed travel clears the internal `Async` GC root only from UObject graphs
 whose Outer chain reaches an exact issued actor, then releases outgoing-world
 references before Unreal collects the mission. It does not destroy actors or
-touch natural enemies. A standalone `ClientRestart` or quest teleport within
-the same world preserves ownership and temporarily quarantines processing,
-preventing the director from rediscovering and multiplying its own extras.
+touch natural enemies. The same sanitation runs after issued batches and before
+safe-area or same-world teleports, while weak identities remain non-owning for
+later passes. Killed extras release their cap slots; queued work is distributed
+one slot per origin per sweep and is cancelled when an uncreated origin leaves
+the active radius. A standalone `ClientRestart` or quest teleport temporarily
+quarantines processing without rediscovering and multiplying existing extras.
 
 Visual size changes target only the enemy skeletal mesh. Character capsules,
 NavMesh agents, controllers, perception, and movement remain at native scale,
