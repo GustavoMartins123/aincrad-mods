@@ -1,14 +1,22 @@
 -- Folder-driven discovery for ModMenu.
 --
--- There is no central allow-list. Every folder under Mods/ is enumerated
--- through IterateGameDirectories, and a mod appears in the menu by shipping
--- Scripts/modmenu.lua inside its own folder, declaring its own settings next
--- to the config.lua those settings live in. Nothing outside a mod's folder
--- has to be edited to add it, remove it, or move it.
+-- There is no central allow-list and nothing to opt into. Every folder under
+-- Mods/ is enumerated through IterateGameDirectories, and every one of them
+-- that UE4SS would load as a Lua mod is listed, so dropping a mod into the
+-- folder is the whole of installing it.
 --
--- Opting in is not the same as being accepted: a manifest is still validated
--- against the mod's real effective settings, so a contract that has drifted
--- from the config it describes is reported and skipped rather than shown.
+-- A mod is listed in one of two shapes:
+--
+--   configured  it ships Scripts/modmenu.lua declaring its own settings next
+--               to the config.lua those settings live in, and that contract
+--               validates against the mod's real effective settings. The menu
+--               expands it and edits those settings.
+--   basic       everything else. The menu cannot know what the mod's settings
+--               mean, so it offers the one thing it does know: whether UE4SS
+--               loads the mod at all, held in Mods/<Mod>/enabled.txt.
+--
+-- A drifted or broken contract degrades to basic and says why in the log. It
+-- costs the mod its settings rows, never its place in the list.
 
 local Discovery = {}
 
@@ -227,9 +235,33 @@ local function childDirectory(parent, name)
     return nil
 end
 
+-- Paths arrive from two unrelated sources -- Lua's own debug info and UE4SS's
+-- __absolute_path -- so they are compared only in this one shape: forward
+-- slashes, no trailing slash, lower case. Windows treats case as insignificant
+-- and this walk must not be the one thing that disagrees.
+local function normalizePath(path)
+    if type(path) ~= "string" or path == "" then return nil end
+    local normalized = path:gsub("\\", "/"):gsub("/+$", ""):lower()
+    if normalized == "" then return nil end
+    return normalized
+end
+
+local function parentDirectory(path)
+    if type(path) ~= "string" then return nil end
+    return path:match("^(.*)/[^/]+$")
+end
+
 -- Every folder under Mods/, by name. This is what makes a central allow-list
 -- unnecessary: the installed set is read off disk instead of declared.
-local function installedModNames()
+--
+-- The descent is driven by this mod's own absolute path, not by an assumed
+-- .Game.Binaries.<platform>.ue4ss.Mods shape. Binaries/ is not guaranteed to
+-- hold the platform folder alone -- on this install it also holds six loose
+-- mod folders -- so treating it as a single child walked into whichever one
+-- pairs() happened to yield first and reported the Mods directory as missing.
+-- ModMenu already knows exactly where it was loaded from; that is a fact about
+-- the install rather than a guess about the loader, so it drives the walk.
+local function installedModNames(scriptDir)
     if type(IterateGameDirectories) ~= "function" then
         return nil, "this UE4SS build does not expose IterateGameDirectories"
     end
@@ -239,23 +271,37 @@ local function installedModNames()
         return nil, "IterateGameDirectories returned no directory tree"
     end
 
-    -- .Game.Binaries.<platform>.ue4ss.Mods -- the platform folder is whatever
-    -- this build ships (Win64, WinGDK, ...), so it is taken as the single
-    -- child rather than named.
-    local binaries = childDirectory(childDirectory(directories, "Game"),
-        "Binaries")
-    local platform = nil
-    if type(binaries) == "table" then
-        for key, value in pairs(binaries) do
-            if not RESERVED_KEYS[key] and type(value) == "table" then
-                platform = value
-                break
-            end
-        end
+    -- The game folder is keyed "Game" whatever it is really called.
+    local root = childDirectory(directories, "Game")
+    if type(root) ~= "table" then
+        return nil, "the game directory tree has no Game folder"
     end
-    local mods = childDirectory(childDirectory(platform, "ue4ss"), "Mods")
-    if type(mods) ~= "table" then
-        return nil, "the Mods directory was not found in the game tree"
+    local rootPath = normalizePath(root.__absolute_path)
+    if rootPath == nil then
+        return nil, "the game directory tree exposes no absolute path"
+    end
+
+    -- <Mods>/ModMenu/Scripts/ -> <Mods>
+    local modsRoot = parentDirectory(parentDirectory(normalizePath(scriptDir)))
+    if modsRoot == nil then
+        return nil, "there is no Mods directory above " .. tostring(scriptDir)
+    end
+
+    if modsRoot:sub(1, #rootPath) ~= rootPath
+        or modsRoot:sub(#rootPath + 1, #rootPath + 1) ~= "/" then
+        return nil, string.format(
+            "the Mods directory (%s) is not inside the game tree (%s)",
+            modsRoot, rootPath)
+    end
+
+    local mods = root
+    local relative = modsRoot:sub(#rootPath + 2)
+    for segment in relative:gmatch("[^/]+") do
+        mods = childDirectory(mods, segment)
+        if type(mods) ~= "table" then
+            return nil, string.format(
+                "the game tree stops at %s on the way to %s", segment, relative)
+        end
     end
 
     local names = {}
@@ -270,6 +316,44 @@ local function installedModNames()
 end
 
 Discovery.installedModNames = installedModNames
+
+-- Mods named in Mods/mods.txt or Mods/mods.json are the loader's own suite
+-- entries -- BPModLoaderMod, BPML_GenericFunctions, Keybinds. UE4SS switches
+-- those from those files, not from a per-folder enabled.txt, so an ON/OFF row
+-- here could not tell the truth about them and they are left out entirely.
+-- This menu is for mods the player drops into the folder.
+local function suiteManagedNames(bridge, modsDir)
+    local managed = {}
+
+    local listText = bridge.readFile(modsDir .. "mods.txt")
+    if type(listText) == "string" then
+        for line in listText:gmatch("[^\r\n]+") do
+            if line:match("^%s*;") == nil then
+                -- "<Name> : <0 or 1>"
+                local name = line:match("^%s*([%w_.-]+)%s*:")
+                if name ~= nil then managed[name] = true end
+            end
+        end
+    end
+
+    -- Read for its names only; the enabled flag beside them is not this menu's
+    -- to interpret, so no JSON parser has to be right about anything else.
+    local jsonText = bridge.readFile(modsDir .. "mods.json")
+    if type(jsonText) == "string" then
+        for name in jsonText:gmatch('"mod_name"%s*:%s*"([^"]+)"') do
+            managed[name] = true
+        end
+    end
+
+    return managed
+end
+
+-- ModMenu's own folder, taken from the Scripts directory it was loaded from so
+-- that renaming the folder cannot make the menu list itself. Switching this mod
+-- off from inside its own panel would close the only door back in.
+local function owningModName(scriptDir)
+    return scriptDir:match("([^\\/]+)[\\/][Ss]cripts[\\/]$")
+end
 
 -- A mod declares its own menu contract in Scripts/modmenu.lua, inside its own
 -- folder, next to the config.lua that contract describes. Nothing outside the
@@ -296,6 +380,60 @@ local function readManifest(bridge, targetDir, modName)
     return manifest, nil
 end
 
+-- A mod without a usable settings contract still belongs in the list: UE4SS
+-- loads it, so the player has to be able to switch it off from here. It simply
+-- has nothing to expand, and its only value is the enabled.txt marker -- which
+-- UE4SS reads once at startup, hence the restart marker.
+local function basicEntry(modName)
+    return {
+        mod = modName,
+        label = modName,
+        summary = "No in-game settings.",
+        apply = "restart",
+        settings = {},
+        configured = false,
+    }
+end
+
+-- Returns the entry to list, plus a reason when a mod meant to be configured
+-- had to fall back to on/off. The reason is for the log; the entry is shown
+-- either way.
+local function describeMod(bridge, targetDir, modName)
+    local manifest, manifestError = readManifest(bridge, targetDir, modName)
+    if manifestError ~= nil then
+        return basicEntry(modName), manifestError
+    end
+    if manifest == nil then
+        -- Installed, and simply has no settings to offer.
+        return basicEntry(modName), nil
+    end
+
+    local configPresent, configError =
+        readPresence(bridge, targetDir .. "config.lua")
+    if configError ~= nil then
+        return basicEntry(modName),
+            "config.lua could not be read: " .. tostring(configError)
+    end
+    if not configPresent then
+        return basicEntry(modName),
+            "modmenu.lua declares settings but there is no config.lua"
+    end
+
+    local settings, _, info = bridge.readSettings(modName, targetDir)
+    if settings == nil then
+        return basicEntry(modName),
+            tostring(info and info.error or "settings are unavailable")
+    end
+
+    local valid, validationError = validateEntry(manifest, settings)
+    if not valid then
+        return basicEntry(modName), tostring(validationError)
+    end
+
+    manifest.configured = true
+    return manifest, nil
+end
+
 function Discovery.discover(scriptDir, bridge)
     if not nonEmptyString(scriptDir) then
         error("canonical ModMenu Scripts directory is unavailable")
@@ -310,12 +448,13 @@ function Discovery.discover(scriptDir, bridge)
     local accepted = {}
     local report = {
         registered = 0,
-        accepted = {},
-        absent = {},
+        configured = {},
+        basic = {},
+        skipped = {},
         invalid = {},
     }
 
-    local names, enumerationError = installedModNames()
+    local names, enumerationError = installedModNames(scriptDir)
     if names == nil then
         report.invalid[#report.invalid + 1] = {
             mod = "<Mods directory>",
@@ -323,57 +462,47 @@ function Discovery.discover(scriptDir, bridge)
         }
         return accepted, report
     end
-    report.registered = #names
+
+    local modsDir = scriptDir .. "../../"
+    local suiteManaged = suiteManagedNames(bridge, modsDir)
+    local ownName = owningModName(scriptDir)
 
     for _, modName in ipairs(names) do
-        local targetDir = scriptDir .. "../../" .. modName .. "/Scripts/"
-        local mainPresent, mainError =
-            readPresence(bridge, targetDir .. "main.lua")
-        local configPresent, configError =
-            readPresence(bridge, targetDir .. "config.lua")
+        local targetDir = modsDir .. modName .. "/Scripts/"
 
-        if mainError ~= nil or configError ~= nil then
-            report.invalid[#report.invalid + 1] = {
-                mod = modName,
-                reason = "installation probe failed: " ..
-                    tostring(mainError or configError),
-            }
-        elseif not mainPresent or not configPresent then
-            -- Not every folder under Mods/ is a settings-bearing Lua mod, and
-            -- one that is not simply has nothing to show here.
-            report.absent[#report.absent + 1] = modName
+        if modName == ownName or suiteManaged[modName] then
+            report.skipped[#report.skipped + 1] = modName
         else
-            local manifest, manifestError =
-                readManifest(bridge, targetDir, modName)
-            if manifestError ~= nil then
+            local mainPresent, mainError =
+                readPresence(bridge, targetDir .. "main.lua")
+
+            if mainError ~= nil then
+                -- A folder that cannot even be probed is one this menu has no
+                -- business claiming to switch.
                 report.invalid[#report.invalid + 1] = {
                     mod = modName,
-                    reason = manifestError,
+                    reason = "installation probe failed: " .. tostring(mainError),
                 }
-            elseif manifest == nil then
-                -- Installed, but has not opted into the menu.
-                report.absent[#report.absent + 1] = modName
+                report.skipped[#report.skipped + 1] = modName
+            elseif not mainPresent then
+                -- Not every folder under Mods/ is a UE4SS Lua mod. shared/ is
+                -- a library folder, not something to switch on and off.
+                report.skipped[#report.skipped + 1] = modName
             else
-                local settings, _, info =
-                    bridge.readSettings(modName, targetDir)
-                if settings == nil then
+                local entry, reason = describeMod(bridge, targetDir, modName)
+                if reason ~= nil then
                     report.invalid[#report.invalid + 1] = {
                         mod = modName,
-                        reason = tostring(info and info.error
-                            or "settings are unavailable"),
+                        reason = reason,
                     }
+                end
+
+                accepted[#accepted + 1] = entry
+                report.registered = report.registered + 1
+                if entry.configured then
+                    report.configured[#report.configured + 1] = modName
                 else
-                    local valid, validationError =
-                        validateEntry(manifest, settings)
-                    if valid then
-                        accepted[#accepted + 1] = manifest
-                        report.accepted[#report.accepted + 1] = modName
-                    else
-                        report.invalid[#report.invalid + 1] = {
-                            mod = modName,
-                            reason = tostring(validationError),
-                        }
-                    end
+                    report.basic[#report.basic + 1] = modName
                 end
             end
         end
@@ -385,8 +514,9 @@ end
 function Discovery.reportFingerprint(report)
     local parts = {
         tostring(report and report.registered or 0),
-        table.concat(report and report.accepted or {}, ","),
-        table.concat(report and report.absent or {}, ","),
+        table.concat(report and report.configured or {}, ","),
+        table.concat(report and report.basic or {}, ","),
+        table.concat(report and report.skipped or {}, ","),
     }
     for _, item in ipairs(report and report.invalid or {}) do
         parts[#parts + 1] = tostring(item.mod) .. "=" .. tostring(item.reason)

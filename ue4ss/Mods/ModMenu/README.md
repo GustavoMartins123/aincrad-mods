@@ -9,8 +9,8 @@ supported settings without leaving the game.
 - Echoes of Aincrad **1.0.3**.
 - The Echoes of Aincrad-compatible UE4SS build.
 
-ModMenu includes its own private settings bridge. It does not require the
-suite-level `Mods/shared` folder and can be installed by itself.
+ModMenu carries its own settings bridge inside its folder. It reads nothing
+from `Mods/shared` and can be installed by itself.
 
 ## Installation
 
@@ -59,28 +59,48 @@ MODS
   + Fast Travel                    ON
   + Enemy Director                 ON
   + XP Notifications               ON
+    SomeOtherMod *                 ON
 
   * restart required    + reopen menu
 ```
+
+A row that opens with `+` or `-` has settings to expand. A row with neither,
+like `SomeOtherMod` above, is a mod that ships no settings contract: it is
+still listed and still switches on and off, it simply has nothing underneath.
 
 The panel virtualises twelve visible rows. Expanding a mod with more settings
 automatically scrolls that fixed viewport, so controller navigation remains
 independent of the expanded list's length.
 
-## Automatic discovery and compatibility validation
+## Automatic discovery
 
-There is no central list of supported mods. Every mod is self-contained: it
-appears in this menu by shipping `Scripts/modmenu.lua` inside its own folder,
-declaring its own label, settings, types, choices, numeric bounds, and when a
-change takes effect -- next to the `config.lua` those settings live in.
+There is no central list of supported mods and nothing for a mod to opt into.
+Dropping a mod into `Mods/` is the whole of installing it here.
 
-At startup, `Scripts/registry.lua` enumerates every folder under `Mods/` through
-`IterateGameDirectories` and validates each mod that opted in. A mod is shown
-only if it has:
+At startup, `Scripts/registry.lua` enumerates every folder under `Mods/`
+through `IterateGameDirectories`. A folder is listed when it holds a
+`Scripts/main.lua` -- that is, when UE4SS would load it as a Lua mod. Three
+kinds of folder are left out, because an ON/OFF row could not tell the truth
+about any of them:
 
-- `Scripts/main.lua`;
+- ModMenu itself, which must not offer the one switch that cannot be undone
+  from in-game;
+- mods named in `Mods/mods.txt` or `Mods/mods.json`, which UE4SS switches from
+  those files rather than from a per-folder `enabled.txt`;
+- folders that are not Lua mods at all, such as `shared`.
+
+A listed mod appears in one of two shapes.
+
+**On/off only.** The default. The menu offers the one thing it can know without
+being told: whether UE4SS loads the mod, held in `Mods/<Mod>/enabled.txt`.
+Nothing is written inside the mod's own folder.
+
+**With settings.** The mod ships `Scripts/modmenu.lua` next to the `config.lua`
+those settings live in, declaring its own label, settings, types, choices,
+numeric bounds, and when a change takes effect. Its row expands. This shape
+requires all of:
+
 - `Scripts/config.lua`;
-- `Scripts/modmenu.lua` declaring its contract;
 - a readable and valid effective configuration;
 - an `ENABLED` boolean setting;
 - every declared setting present with the expected type;
@@ -88,11 +108,10 @@ only if it has:
 - choice values present in the declared option list;
 - valid cross-setting floor and ceiling relationships.
 
-Opting in is not the same as being accepted. The manifest is checked against the
-mod's real effective settings, so a contract that has drifted from the config it
-describes is skipped with one concise reason in `UE4SS.log` rather than shown.
-It cannot make the entire panel fail to open. A folder without a
-`Scripts/modmenu.lua` simply has nothing to show and is passed over silently.
+The manifest is checked against the mod's real effective settings, so a
+contract that has drifted from the config it describes **loses its settings
+rows, never its place in the list**: the mod falls back to on/off and says why
+in `UE4SS.log`. One broken contract cannot make the panel fail to open.
 
 Discovery runs when ModMenu starts. Restart the game after adding, removing, or
 updating a mod.
@@ -114,6 +133,11 @@ their last fully validated configuration and never parse an incomplete table.
 | `Scripts/runtime.lua` | ModMenu | Optional live overrides applied over `config.lua` |
 
 **Reset** removes runtime overrides and returns control to `config.lua`.
+
+None of this touches a mod listed on/off only. That mod has no settings
+contract, so ModMenu writes nothing inside its folder and never plants a
+`runtime.lua` in a mod that never asked for one -- its `enabled.txt` marker is
+the whole of the state the menu owns.
 
 ## When changes take effect
 
@@ -143,12 +167,23 @@ The console requires `GuiConsoleEnabled = 1` under `[Debug]` in
 Startup also reports a discovery summary:
 
 ```text
-[ModMenu] discovery | 10 folder(s) | 5 with a menu | 5 without | 0 invalid
+[ModMenu] discovery | 6 mod(s) | 5 with settings | 1 on/off only | 5 not a mod
 ```
 
-## Adding support for another mod
+A mod that meant to have settings and did not get them is named on its own
+line, with the reason:
 
-Nothing here changes. The work happens in that mod's own folder:
+```text
+[ModMenu] SomeMod has no usable settings contract | SomeMod: SCALE is above the registered maximum
+```
+
+## Giving a mod editable settings
+
+Any installed mod already appears here with an on/off row. Nothing has to be
+done to get that, and nothing here changes to grant it.
+
+Exposing that mod's *settings* is the opt-in, and the work happens entirely in
+that mod's own folder:
 
 1. Add `Scripts/modmenu.lua` to the mod, returning `label`, `summary`, `apply`
    and `settings`. The folder name is the identity, so the manifest does not
@@ -159,9 +194,13 @@ Nothing here changes. The work happens in that mod's own folder:
    `config.lua`, and validates the complete result before applying values.
 5. Restart the game and check the discovery summary in `UE4SS.log`.
 
+Step 4 is a behaviour, not a file. Copying a `ModMenuBridge.lua` into the mod
+is one way to get it; `WorldEnemyDirector` writes the same watch-overlay-
+validate loop directly in its own `main.lua` and works identically.
+
 A malformed or unsupported configuration must fail closed in the mod itself.
-ModMenu also refuses to expose a mod whose declared contract does not validate
-against its actual settings.
+ModMenu refuses to expose settings whose declared contract does not validate
+against the mod's actual configuration, and shows the mod on/off only.
 
 ## Coexisting with other Start Menu mods
 

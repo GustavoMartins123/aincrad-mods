@@ -140,37 +140,24 @@ local function applyExternalConfig(external)
 end
 
 local MOD_MENU_BRIDGE = (function()
-    local path = SCRIPT_DIR .. "../../shared/ModMenuBridge.lua"
+    local path = SCRIPT_DIR .. "standalone/ModMenuBridge.lua"
     local ok, bridge = pcall(function() return dofile(path) end)
-    if ok and type(bridge) == "table" then return bridge end
-
-    local pathLocal = SCRIPT_DIR .. "standalone/ModMenuBridge.lua"
-    local okLocal, bridgeLocal = pcall(function() return dofile(pathLocal) end)
-    if okLocal and type(bridgeLocal) == "table" then return bridgeLocal end
-
-    return nil
+    if not ok then
+        error("canonical ModMenuBridge load failed: " .. tostring(bridge))
+    end
+    if type(bridge) ~= "table" then
+        error("canonical ModMenuBridge did not return a table")
+    end
+    return bridge
 end)()
 
 do
-    local external = nil
-    if MOD_MENU_BRIDGE ~= nil then
-        local settings, _, _ = MOD_MENU_BRIDGE.readSettings("FieldEquipPro", SCRIPT_DIR)
-        if type(settings) == "table" then external = settings end
+    local settings, _, info = MOD_MENU_BRIDGE.readSettings(MOD_NAME, SCRIPT_DIR)
+    if settings == nil then
+        error("canonical settings load failed: " ..
+            tostring(info and info.error or "unknown settings error"))
     end
-    if external == nil then
-        local cfg = {}
-        for k, v in pairs(CONFIG) do cfg[k] = v end
-        local okCfg, loadedCfg = pcall(function() return dofile(SCRIPT_DIR .. "config.lua") end)
-        if okCfg and type(loadedCfg) == "table" then
-            for k, v in pairs(loadedCfg) do cfg[k] = v end
-        end
-        local okRt, loadedRt = pcall(function() return dofile(SCRIPT_DIR .. "runtime.lua") end)
-        if okRt and type(loadedRt) == "table" then
-            for k, v in pairs(loadedRt) do cfg[k] = v end
-        end
-        external = cfg
-    end
-    applyExternalConfig(external)
+    applyExternalConfig(settings)
 end
 
 local function unwrap(parameter)
@@ -2247,7 +2234,7 @@ end
 -- ENABLED change lands the next time the menu is opened rather than instantly.
 do
     local attachment, attachmentError = MOD_MENU_BRIDGE.attach({
-        modName = "FieldEquipPro",
+        modName = MOD_NAME,
         scriptDir = SCRIPT_DIR,
         pollMs = 750,
         load = applyExternalConfig,

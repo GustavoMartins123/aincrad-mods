@@ -72,7 +72,7 @@ local function readSettings(settings)
 end
 
 local MOD_MENU_BRIDGE = (function()
-    local path = SCRIPT_DIR .. "../../shared/ModMenuBridge.lua"
+    local path = SCRIPT_DIR .. "standalone/ModMenuBridge.lua"
     local ok, bridge = pcall(function() return dofile(path) end)
     if not ok then
         error("canonical ModMenuBridge load failed: " .. tostring(bridge))

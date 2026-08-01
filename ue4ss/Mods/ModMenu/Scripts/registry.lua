@@ -1,8 +1,9 @@
 -- The set of mods the menu shows.
 --
--- There is no list here to maintain. Every folder under Mods/ is enumerated,
--- and a mod appears by shipping Scripts/modmenu.lua inside its own folder --
--- so installing, removing or renaming a mod needs no edit outside that mod.
+-- There is no list here to maintain and nothing for a mod to opt into. Every
+-- folder under Mods/ that UE4SS would load as a Lua mod is listed: with its
+-- own settings if it ships Scripts/modmenu.lua, and with a plain on/off row
+-- driven by enabled.txt if it does not.
 
 local sourceInfo = debug.getinfo(1, "S")
 if type(sourceInfo) ~= "table" or type(sourceInfo.source) ~= "string" then
@@ -29,23 +30,25 @@ end
 local accepted, report = discovery.discover(SCRIPT_DIR, bridge)
 
 print(string.format(
-    "[ModMenu] discovery | %d folder(s) | %d with a menu | %d without | %d invalid\n",
+    "[ModMenu] discovery | %d mod(s) | %d with settings | %d on/off only | %d not a mod\n",
     report.registered,
-    #report.accepted,
-    #report.absent,
-    #report.invalid
+    #report.configured,
+    #report.basic,
+    #report.skipped
 ))
 
+-- A mod in this list is still shown; it just lost its settings rows and kept
+-- its on/off row, so the reason has to be findable.
 for _, item in ipairs(report.invalid) do
     print(string.format(
-        "[ModMenu] skipped %s | %s\n",
+        "[ModMenu] %s has no usable settings contract | %s\n",
         tostring(item.mod),
         tostring(item.reason)
     ))
 end
 
 if #accepted == 0 then
-    print("[ModMenu] no installed mod ships a Scripts/modmenu.lua\n")
+    print("[ModMenu] no mods installed under Mods/\n")
 end
 
 return accepted

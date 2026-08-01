@@ -330,9 +330,17 @@ function Store.setModEnabled(modName, enabled)
     return false, "could not remove enabled.txt: " .. tostring(removeError)
 end
 
--- Changes the launch marker and the live ENABLED override as one transaction.
--- If either write fails, restore the previous runtime table and launch marker.
+-- Changes the launch marker and, for a mod that has a settings contract, its
+-- live ENABLED override as one transaction. If either write fails, restore the
+-- previous runtime table and launch marker.
+--
+-- A mod without a contract has no runtime.lua of ours to write: enabled.txt is
+-- the whole of its state, and this must not plant a settings file inside a mod
+-- that never asked for one.
 function Store.setEnabledState(modName, runtimeKey, enabled)
+    if runtimeKey == nil then
+        return Store.setModEnabled(modName, enabled)
+    end
     if type(runtimeKey) ~= "string" or runtimeKey == "" then
         return false, "registered mod has no canonical ENABLED key"
     end

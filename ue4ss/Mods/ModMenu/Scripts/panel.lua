@@ -129,10 +129,26 @@ end
 local function buildRows()
     local built = {}
     for _, entry in ipairs(registry or {}) do
-        local effective = store.readEffective(entry.mod)
+        -- A mod with no settings contract has nothing to read: its whole state
+        -- is the enabled.txt marker. A configured mod whose settings have
+        -- broken since startup is demoted to the same row rather than taking
+        -- the entire panel down with it.
+        local configured = entry.configured == true
+        local effective = nil
         local enabledSetting = nil
-        for _, setting in ipairs(entry.settings or {}) do
-            if setting.key == "ENABLED" then enabledSetting = setting end
+
+        if configured then
+            local ok, result = pcall(store.readEffective, entry.mod)
+            if ok then
+                effective = result
+                for _, setting in ipairs(entry.settings or {}) do
+                    if setting.key == "ENABLED" then enabledSetting = setting end
+                end
+            else
+                configured = false
+                log(entry.mod .. " settings unreadable, showing on/off only: " ..
+                    tostring(result))
+            end
         end
 
         built[#built + 1] = {
@@ -140,9 +156,10 @@ local function buildRows()
             entry = entry,
             effective = effective,
             enabledSetting = enabledSetting,
+            configured = configured,
         }
 
-        if expandedMod == entry.mod then
+        if configured and expandedMod == entry.mod then
             for _, setting in ipairs(entry.settings or {}) do
                 if setting.key ~= "ENABLED" then
                     built[#built + 1] = {
@@ -179,7 +196,10 @@ local function describeValue(row)
         -- UE4SS decides whether a mod runs at all, from enabled.txt. That is the
         -- state worth showing on the header; the mod's own ENABLED setting is
         -- just one of its settings and lives in the expanded list.
-        local loaded = store.isModEnabled(row.entry.mod)
+        local ok, loaded = pcall(store.isModEnabled, row.entry.mod)
+        -- Rendering runs on every cursor move, so an unreadable marker says so
+        -- in the row instead of filling the log or throwing out of input.
+        if not ok then return "--" end
         return loaded and "ON" or "OFF"
     end
 
@@ -202,7 +222,13 @@ end
 
 local function describeLabel(row)
     if row.kind == "mod" then
-        local prefix = expandedMod == row.entry.mod and "- " or "+ "
+        -- Only a mod with settings has something to expand. One without gets a
+        -- blank of the same width, so the labels still line up and the +/- is
+        -- never a promise the row cannot keep.
+        local prefix = "  "
+        if row.configured then
+            prefix = expandedMod == row.entry.mod and "- " or "+ "
+        end
         return prefix .. row.entry.label .. applyMarker(row.entry)
     end
     return row.setting.label
@@ -586,32 +612,34 @@ end
 local function toggleBool(row)
     if row.kind == "mod" then
         -- This is one UI toggle backed by an atomic store operation. enabled.txt
-        -- controls the next launch and the runtime ENABLED value controls the
-        -- already-loaded Lua state; neither half may change without the other.
-        local loaded = store.isModEnabled(row.entry.mod)
-        if loaded ~= nil then
-            local wanted = not loaded
-            local enabledKey = nil
-            if row.enabledSetting ~= nil then
-                enabledKey = row.enabledSetting.key
-            end
-            local ok, err = store.setEnabledState(
-                row.entry.mod,
-                enabledKey,
-                wanted
-            )
-            if not ok then
-                log("could not switch " .. row.entry.mod .. ": " .. tostring(err))
-                return false
-            end
-            buildRows()
-            Panel.render()
-            return true
+        -- controls the next launch and, when the mod has one, the runtime
+        -- ENABLED value controls the already-loaded Lua state; neither half may
+        -- change without the other.
+        local read, loaded = pcall(store.isModEnabled, row.entry.mod)
+        if not read then
+            log("could not read the load state of " .. row.entry.mod ..
+                ": " .. tostring(loaded))
+            return false
         end
 
-        if row.enabledSetting == nil then return false end
-        local current = store.valueOf(row.effective, row.enabledSetting)
-        return commit(row.entry, row.enabledSetting.key, not current)
+        -- No contract, no runtime key: the store then writes enabled.txt alone.
+        local enabledKey = nil
+        if row.enabledSetting ~= nil then
+            enabledKey = row.enabledSetting.key
+        end
+
+        local ok, err = store.setEnabledState(
+            row.entry.mod,
+            enabledKey,
+            not loaded
+        )
+        if not ok then
+            log("could not switch " .. row.entry.mod .. ": " .. tostring(err))
+            return false
+        end
+        buildRows()
+        Panel.render()
+        return true
     end
     local current = store.valueOf(row.effective, row.setting)
     return commit(row.entry, row.setting.key, not current)
@@ -653,7 +681,13 @@ function Panel.activate()
 
     if row.kind == "mod" then
         -- Enter expands, so a mod's settings are one press away and the enable
-        -- toggle stays on left/right.
+        -- toggle stays on left/right. A mod with no settings has nothing to
+        -- open, so there Enter switches it rather than doing nothing at all.
+        if not row.configured then
+            toggleBool(row)
+            return
+        end
+
         local opening = expandedMod ~= row.entry.mod
         if opening then
             expandedMod = row.entry.mod
@@ -692,6 +726,11 @@ end
 function Panel.resetSelectedMod()
     local row = rows[selectionIndex]
     if row == nil then return false end
+    -- No settings contract means no runtime.lua of ours to take away.
+    if row.kind == "mod" and not row.configured then
+        log(row.entry.mod .. " has no menu-written settings to reset")
+        return false
+    end
     local ok, err = store.resetMod(row.entry.mod)
     if not ok then
         log("could not reset " .. row.entry.mod .. ": " .. tostring(err))

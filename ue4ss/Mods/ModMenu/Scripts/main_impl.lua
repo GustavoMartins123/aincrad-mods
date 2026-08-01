@@ -153,7 +153,7 @@ local function loadLocalModule(name)
 end
 
 local function loadModMenuBridge()
-    local path = SCRIPT_DIR .. "../../shared/ModMenuBridge.lua"
+    local path = SCRIPT_DIR .. "standalone/ModMenuBridge.lua"
     local ok, result = pcall(function() return dofile(path) end)
     if not ok then return nil, tostring(result) end
     if type(result) ~= "table" then
@@ -1471,17 +1471,27 @@ local function runCommand(params, reply)
 
     if sub == "list" or sub == "show" then
         for _, entry in ipairs(registry) do
-            local effective = store.readEffective(entry.mod)
             local marker = entry.apply == "restart" and "  (restart)"
                 or (entry.apply == "menu" and "  (reopen menu)" or "")
             -- Same truth the panel shows: whether UE4SS will load the mod.
-            local loaded = store.isModEnabled(entry.mod)
-            local enabled = loaded and "ON" or "OFF"
+            local read, loaded = pcall(store.isModEnabled, entry.mod)
+            local enabled = read and (loaded and "ON" or "OFF") or "--"
             reply(string.format("%-18s %-3s%s", entry.mod, enabled, marker))
-            for _, setting in ipairs(entry.settings or {}) do
-                if setting.key ~= "ENABLED" then
-                    local value = store.valueOf(effective, setting)
-                    reply(string.format("    %-22s %s", setting.key, tostring(value)))
+
+            -- A mod with no settings contract is one line and no more.
+            if entry.configured then
+                local ok, failure = pcall(function()
+                    local effective = store.readEffective(entry.mod)
+                    for _, setting in ipairs(entry.settings or {}) do
+                        if setting.key ~= "ENABLED" then
+                            local value = store.valueOf(effective, setting)
+                            reply(string.format("    %-22s %s",
+                                setting.key, tostring(value)))
+                        end
+                    end
+                end)
+                if not ok then
+                    reply("    settings unavailable: " .. tostring(failure))
                 end
             end
         end
