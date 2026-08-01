@@ -116,6 +116,7 @@ namespace
     constexpr int kManagerEnemyGroupOffset = 0x3E0;
     constexpr int kEnemyListOffset = 0x90;
     constexpr int kObjectArraySize = 0x10;
+    constexpr std::uint32_t kInternalFlagAsync = 0x04000000;
 
     struct WeakObjectPtr
     {
@@ -152,6 +153,14 @@ namespace
         using GetPropertyByNameInChain = void* (*)(void*, const wchar_t*);
         using MemoryMalloc = void* (*)(std::size_t, std::uint32_t);
         using MemoryFree = void (*)(void*);
+        using GetNumElements = std::int32_t (*)();
+        using IndexToObject = void* (*)(std::int32_t);
+        using GetItemObject = void* (*)(const void*);
+        using GetOuterPrivate = const void* const* (*)(const void*);
+        using HasAnyInternalFlags = bool (*)(const void*, std::uint32_t);
+        using UnsetInternalFlags = void (*)(void*, std::uint32_t);
+        using SerialNumbersMatch = bool (*)(const WeakObjectPtr*, void*);
+        using ObjectArrayLock = void (*)(void*);
 
         HMODULE module{};
         RegisterFunction register_function{};
@@ -170,6 +179,16 @@ namespace
         GetPropertyByNameInChain get_property_by_name_in_chain{};
         MemoryMalloc memory_malloc{};
         MemoryFree memory_free{};
+        GetNumElements get_num_elements{};
+        IndexToObject index_to_object{};
+        GetItemObject get_item_object{};
+        GetOuterPrivate get_outer_private{};
+        HasAnyInternalFlags has_any_internal_flags{};
+        UnsetInternalFlags unset_internal_flags{};
+        SerialNumbersMatch serial_numbers_match{};
+        ObjectArrayLock lock_object_array{};
+        ObjectArrayLock unlock_object_array{};
+        void** guobject_array_storage{};
 
         std::string missing_symbols{};
         bool loaded{};
@@ -214,6 +233,16 @@ namespace
                  "?GetPropertyByNameInChain@UObject@Unreal@RC@@QEAAPEAVFProperty@23@PEB_W@Z");
             bind(memory_malloc, "?Malloc@FMemory@Unreal@RC@@SAPEAX_KI@Z");
             bind(memory_free, "?Free@FMemory@Unreal@RC@@SAXPEAX@Z");
+            bind(get_num_elements, "?GetNumElements@FUObjectArray@Unreal@RC@@SAHXZ");
+            bind(index_to_object, "?IndexToObject@FUObjectArray@Unreal@RC@@SAPEAUFUObjectItem@23@H@Z");
+            bind(get_item_object, "?GetUObject@FUObjectItem@Unreal@RC@@QEBAPEAVUObject@23@XZ");
+            bind(get_outer_private, "?GetOuterPrivate@UObjectBase@Unreal@RC@@QEBAAEAPEBVUObject@23@XZ");
+            bind(has_any_internal_flags, "?HasAnyFlags@FUObjectItem@Unreal@RC@@QEBA_NW4EInternalObjectFlags@23@@Z");
+            bind(unset_internal_flags, "?UnsetFlagsInternal@FUObjectItem@Unreal@RC@@AEAAXW4EInternalObjectFlags@23@@Z");
+            bind(serial_numbers_match, "?SerialNumbersMatch@FWeakObjectPtr@Unreal@RC@@QEBA_NPEAUFUObjectItem@23@@Z");
+            bind(lock_object_array, "?LockGUObjectArray@FUObjectArray@Unreal@RC@@QEAAXXZ");
+            bind(unlock_object_array, "?UnlockGUObjectArray@FUObjectArray@Unreal@RC@@QEAAXXZ");
+            bind(guobject_array_storage, "?GUObjectArray@Unreal@RC@@3PEAVFUObjectArray@12@EA");
         }
 
         [[nodiscard]] bool lua_ready() const
@@ -227,11 +256,17 @@ namespace
             return get_property_offset && get_property_size
                 && get_weak_object && set_weak_object
                 && get_property_by_name_in_chain
-                && memory_malloc && memory_free;
+                && memory_malloc && memory_free
+                && get_num_elements && index_to_object && get_item_object
+                && get_outer_private && has_any_internal_flags
+                && unset_internal_flags && serial_numbers_match
+                && lock_object_array && unlock_object_array
+                && guobject_array_storage;
         }
     };
 
     Api g_api{};
+    std::vector<WeakObjectPtr> g_owned_actors{};
 
     int push_result(
         const Lua& lua,
@@ -294,6 +329,361 @@ namespace
             weak = {};
             return false;
         }
+    }
+
+    bool guarded_get_object_array(void*& object_array)
+    {
+        __try
+        {
+            object_array = g_api.guobject_array_storage == nullptr
+                ? nullptr
+                : *g_api.guobject_array_storage;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            object_array = nullptr;
+            return false;
+        }
+    }
+
+    bool guarded_lock_object_array(void* object_array)
+    {
+        __try
+        {
+            g_api.lock_object_array(object_array);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    bool guarded_unlock_object_array(void* object_array)
+    {
+        __try
+        {
+            g_api.unlock_object_array(object_array);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    bool guarded_get_num_elements(std::int32_t& count)
+    {
+        __try
+        {
+            count = g_api.get_num_elements();
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            count = 0;
+            return false;
+        }
+    }
+
+    bool guarded_index_to_object(std::int32_t index, void*& item)
+    {
+        __try
+        {
+            item = g_api.index_to_object(index);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            item = nullptr;
+            return false;
+        }
+    }
+
+    bool guarded_get_item_object(const void* item, void*& object)
+    {
+        __try
+        {
+            object = g_api.get_item_object(item);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            object = nullptr;
+            return false;
+        }
+    }
+
+    bool guarded_serial_numbers_match(
+        const WeakObjectPtr& weak,
+        void* item,
+        bool& matches)
+    {
+        __try
+        {
+            matches = g_api.serial_numbers_match(&weak, item);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            matches = false;
+            return false;
+        }
+    }
+
+    bool guarded_get_outer(const void* object, void*& outer)
+    {
+        __try
+        {
+            const void* const* outer_reference = g_api.get_outer_private(object);
+            outer = outer_reference == nullptr
+                ? nullptr
+                : const_cast<void*>(*outer_reference);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outer = nullptr;
+            return false;
+        }
+    }
+
+    bool guarded_has_async_flag(const void* item, bool& has_async)
+    {
+        __try
+        {
+            has_async = g_api.has_any_internal_flags(item, kInternalFlagAsync);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            has_async = false;
+            return false;
+        }
+    }
+
+    bool guarded_unset_async_flag(void* item)
+    {
+        __try
+        {
+            g_api.unset_internal_flags(item, kInternalFlagAsync);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    bool exact_weak_identity(void* actor, WeakObjectPtr& weak)
+    {
+        if (!guarded_set_weak_object(weak, actor)
+            || weak.object_index < 0 || weak.object_serial_number <= 0)
+        {
+            return false;
+        }
+        void* resolved_actor = nullptr;
+        return guarded_get_weak_object(weak, resolved_actor)
+            && resolved_actor == actor;
+    }
+
+    bool is_owned_actor_tracked(const WeakObjectPtr& weak)
+    {
+        return std::any_of(
+            g_owned_actors.begin(),
+            g_owned_actors.end(),
+            [&weak](const WeakObjectPtr& tracked) {
+                return tracked.object_index == weak.object_index
+                    && tracked.object_serial_number == weak.object_serial_number;
+            });
+    }
+
+    int native_track_owned_enemy(const Lua& lua)
+    {
+        if (!g_api.unreal_ready())
+            return push_result(lua, false, "UE4SS native ABI is incomplete: " + g_api.missing_symbols);
+        if (g_api.get_stack_size(&lua) != 1)
+            return push_result(lua, false, "WEDNativeTrackOwnedEnemy requires one actor address");
+
+        std::int64_t actor_address{};
+        if (!require_integer(lua, 1, actor_address) || actor_address <= 0)
+            return push_result(lua, false, "WEDNativeTrackOwnedEnemy received an invalid Unreal address");
+
+        auto* actor = reinterpret_cast<void*>(static_cast<std::uintptr_t>(actor_address));
+        WeakObjectPtr weak{};
+        if (!exact_weak_identity(actor, weak))
+            return push_result(lua, false, "actor could not be converted to an exact weak identity");
+
+        if (!is_owned_actor_tracked(weak)) g_owned_actors.push_back(weak);
+        return push_result(
+            lua,
+            true,
+            "issued actor retained as a native weak identity until world teardown",
+            actor_address,
+            weak.object_index,
+            weak.object_serial_number);
+    }
+
+    int native_release_owned_world(const Lua& lua)
+    {
+        if (!g_api.unreal_ready())
+            return push_result(lua, false, "UE4SS native ABI is incomplete: " + g_api.missing_symbols);
+        if (g_api.get_stack_size(&lua) != 0)
+            return push_result(lua, false, "WEDNativeReleaseOwnedWorld does not accept arguments");
+
+        const std::int64_t tracked_count = static_cast<std::int64_t>(g_owned_actors.size());
+        if (g_owned_actors.empty())
+            return push_result(lua, true, "no issued actor weak identities were retained", 0, 0, 0);
+
+        void* object_array = nullptr;
+        if (!guarded_get_object_array(object_array) || object_array == nullptr)
+            return push_result(lua, false, "GUObjectArray is unavailable", 0, 0, tracked_count);
+        if (!guarded_lock_object_array(object_array))
+            return push_result(lua, false, "GUObjectArray could not be locked", 0, 0, tracked_count);
+
+        bool success = true;
+        std::string failure{};
+        std::int32_t object_count = 0;
+        std::vector<void*> resolved_actors{};
+        std::vector<void*> async_items{};
+
+        if (!guarded_get_num_elements(object_count)
+            || object_count < 0 || object_count > 50000000)
+        {
+            success = false;
+            failure = "GUObjectArray element count is invalid";
+        }
+
+        if (success)
+        {
+            resolved_actors.reserve(g_owned_actors.size());
+            for (const WeakObjectPtr& weak : g_owned_actors)
+            {
+                void* item = nullptr;
+                bool serial_matches = false;
+                void* actor = nullptr;
+                if (!guarded_index_to_object(weak.object_index, item))
+                {
+                    success = false;
+                    failure = "tracked actor index could not be resolved";
+                    break;
+                }
+                if (item == nullptr) continue;
+                if (!guarded_serial_numbers_match(weak, item, serial_matches))
+                {
+                    success = false;
+                    failure = "tracked actor serial could not be verified";
+                    break;
+                }
+                if (!serial_matches) continue;
+                if (!guarded_get_item_object(item, actor))
+                {
+                    success = false;
+                    failure = "tracked actor object could not be read";
+                    break;
+                }
+                if (actor != nullptr) resolved_actors.push_back(actor);
+            }
+        }
+
+        if (success && !resolved_actors.empty())
+        {
+            for (std::int32_t index = 0; index < object_count; ++index)
+            {
+                void* item = nullptr;
+                void* object = nullptr;
+                bool has_async = false;
+                if (!guarded_index_to_object(index, item)
+                    || (item != nullptr && !guarded_get_item_object(item, object))
+                    || (item != nullptr && object != nullptr
+                        && !guarded_has_async_flag(item, has_async)))
+                {
+                    success = false;
+                    failure = "GUObjectArray entry could not be inspected";
+                    break;
+                }
+                if (item == nullptr || object == nullptr || !has_async) continue;
+
+                void* current = object;
+                bool belongs_to_owned_actor = false;
+                for (int depth = 0; depth < 64 && current != nullptr; ++depth)
+                {
+                    if (std::find(resolved_actors.begin(), resolved_actors.end(), current)
+                        != resolved_actors.end())
+                    {
+                        belongs_to_owned_actor = true;
+                        break;
+                    }
+                    void* outer = nullptr;
+                    if (!guarded_get_outer(current, outer))
+                    {
+                        success = false;
+                        failure = "async UObject outer chain could not be inspected";
+                        break;
+                    }
+                    if (outer == current)
+                    {
+                        success = false;
+                        failure = "async UObject outer chain is cyclic";
+                        break;
+                    }
+                    current = outer;
+                }
+                if (!success) break;
+                if (current != nullptr && !belongs_to_owned_actor)
+                {
+                    success = false;
+                    failure = "async UObject outer chain exceeds the safety limit";
+                    break;
+                }
+                if (belongs_to_owned_actor) async_items.push_back(item);
+            }
+        }
+
+        if (success)
+        {
+            for (void* item : async_items)
+            {
+                bool remains_async = false;
+                if (!guarded_unset_async_flag(item)
+                    || !guarded_has_async_flag(item, remains_async)
+                    || remains_async)
+                {
+                    success = false;
+                    failure = "Async flag could not be cleared from an owned UObject";
+                    break;
+                }
+            }
+        }
+
+        const bool unlocked = guarded_unlock_object_array(object_array);
+        if (!unlocked)
+        {
+            success = false;
+            failure = "GUObjectArray could not be unlocked";
+        }
+        if (!success)
+        {
+            return push_result(
+                lua,
+                false,
+                failure,
+                static_cast<std::int64_t>(resolved_actors.size()),
+                static_cast<std::int64_t>(async_items.size()),
+                tracked_count);
+        }
+
+        const std::int64_t resolved_count = static_cast<std::int64_t>(resolved_actors.size());
+        const std::int64_t cleared_count = static_cast<std::int64_t>(async_items.size());
+        g_owned_actors.clear();
+        return push_result(
+            lua,
+            true,
+            "cleared Async GC roots from issued actor object graphs",
+            resolved_count,
+            cleared_count,
+            tracked_count);
     }
 
     bool guarded_get_property(void* object, const wchar_t* name, void*& property)
@@ -472,16 +862,10 @@ namespace
         auto* game_state = reinterpret_cast<void*>(static_cast<std::uintptr_t>(game_state_address));
 
         WeakObjectPtr weak{};
-        if (!guarded_set_weak_object(weak, actor)
-            || weak.object_index < 0 || weak.object_serial_number <= 0)
-        {
+        if (!exact_weak_identity(actor, weak))
             return push_result(lua, false, "actor could not be converted to an exact weak identity");
-        }
-        void* resolved_actor = nullptr;
-        if (!guarded_get_weak_object(weak, resolved_actor) || resolved_actor != actor)
-        {
-            return push_result(lua, false, "actor weak identity did not resolve to the issued address");
-        }
+        if (!is_owned_actor_tracked(weak))
+            return push_result(lua, false, "actor was not tracked before native registry injection");
 
         void* enemies_property = nullptr;
         void* group_property = nullptr;
@@ -567,8 +951,12 @@ namespace
         {
             if (!g_api.lua_ready()) return;
 
+            const LuaFunction track_owned_enemy = &native_track_owned_enemy;
             const LuaFunction register_enemy = &native_register_enemy;
+            const LuaFunction release_owned_world = &native_release_owned_world;
+            const std::string track_name = "WEDNativeTrackOwnedEnemy";
             const std::string register_name = "WEDNativeRegisterEnemy";
+            const std::string release_name = "WEDNativeReleaseOwnedWorld";
 
             std::vector<Lua*> states{&lua, &main_lua, &async_lua};
             if (hook_lua != nullptr) states.push_back(hook_lua);
@@ -584,7 +972,9 @@ namespace
                     }
                 }
                 if (duplicate) continue;
+                g_api.register_function(states[index], track_name, track_owned_enemy);
                 g_api.register_function(states[index], register_name, register_enemy);
+                g_api.register_function(states[index], release_name, release_owned_world);
             }
         }
     };

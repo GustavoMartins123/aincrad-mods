@@ -869,8 +869,43 @@ local function clearWorldReferences()
     ambientCounter = 0
 end
 
+local function releaseNativeOwnedWorld(reason)
+    if type(WEDNativeReleaseOwnedWorld) ~= "function" then
+        return 0, 0, 0,
+            "WorldEnemyDirector native world teardown API is not loaded"
+    end
+
+    local callOk, released, detail, resolvedActors, clearedObjects, trackedActors =
+        pcall(WEDNativeReleaseOwnedWorld)
+    local resultValid = callOk
+        and released == true
+        and finiteNumber(resolvedActors) and resolvedActors >= 0
+        and finiteNumber(clearedObjects) and clearedObjects >= 0
+        and finiteNumber(trackedActors) and trackedActors >= 0
+    if not resultValid then
+        local failure = callOk and tostring(detail) or firstErrorLine(released)
+        return 0, 0, 0,
+            "native owned-world release failed: " .. failure
+    end
+
+    resolvedActors = math.floor(resolvedActors)
+    clearedObjects = math.floor(clearedObjects)
+    trackedActors = math.floor(trackedActors)
+    dbg(string.format(
+        "NATIVE TRAVEL RELEASE | %s | tracked=%d resolved=%d async-cleared=%d | %s",
+        tostring(reason),
+        trackedActors,
+        resolvedActors,
+        clearedObjects,
+        tostring(detail)
+    ))
+    return resolvedActors, clearedObjects, trackedActors, nil
+end
+
 local function beginTravel(reason)
     if awaitingTravelRestart and worldPaused and resumeAtMs == nil then return end
+    local nativeResolved, nativeCleared, nativeTracked, nativeError =
+        releaseNativeOwnedWorld(reason)
     generation = generation + 1
     awaitingTravelRestart = true
     worldPaused = true
@@ -882,18 +917,23 @@ local function beginTravel(reason)
     end
     clearWorldReferences()
     scheduleReferenceCollection()
+    if nativeError ~= nil then releaseFailures = releaseFailures + 1 end
     if releaseFailures > 0 then
         log(string.format(
-            "TRAVEL CLEANUP ERROR | %s | released=%d failed=%d",
+            "TRAVEL CLEANUP ERROR | %s | released=%d failed=%d | %s",
             reason,
             released,
-            releaseFailures
+            releaseFailures,
+            tostring(nativeError or "Lua reference release failed")
         ))
     end
     log(string.format(
-        "TRAVEL START | %s | owned references released=%d | native references cleared",
+        "TRAVEL START | %s | Lua references released=%d | native tracked=%d resolved=%d async-cleared=%d",
         reason,
-        released
+        released,
+        nativeTracked,
+        nativeResolved,
+        nativeCleared
     ))
 end
 
@@ -1013,13 +1053,16 @@ local function resolveSpawnApi()
         gameplayStatics = library
     end
 
-    if type(WEDNativeRegisterEnemy) ~= "function" then
-        return false, "WorldEnemyDirector native registry bridge is not loaded"
+    if type(WEDNativeTrackOwnedEnemy) ~= "function"
+        or type(WEDNativeRegisterEnemy) ~= "function"
+        or type(WEDNativeReleaseOwnedWorld) ~= "function" then
+        return false,
+            "WorldEnemyDirector native spawn and world teardown contract is not loaded"
     end
 
     if not nativeContractReported then
         nativeContractReported = true
-        log("SPAWN CONTRACT | direct deferred spawn plus native registry injection is available")
+        log("SPAWN CONTRACT | direct spawn, native registry injection and world teardown are available")
     end
     return true, nil
 end
@@ -2745,6 +2788,22 @@ local function processSpawnRequest()
         if not finiteNumber(request.actorAddress) or request.actorAddress <= 0 then
             error("created actor has no canonical address")
         end
+
+        local trackCallOk, tracked, trackDetail,
+            trackedAddress, trackedWeakIndex, trackedWeakSerial =
+            pcall(WEDNativeTrackOwnedEnemy, request.actorAddress)
+        local trackedIdentityValid = trackCallOk
+            and tracked == true
+            and trackedAddress == request.actorAddress
+            and finiteNumber(trackedWeakIndex) and trackedWeakIndex >= 0
+            and finiteNumber(trackedWeakSerial) and trackedWeakSerial > 0
+        if not trackedIdentityValid then
+            error("native ownership tracking rejected the issued actor: " ..
+                (trackCallOk and tostring(trackDetail)
+                    or firstErrorLine(tracked)))
+        end
+        request.weakIndex = math.floor(trackedWeakIndex)
+        request.weakSerial = math.floor(trackedWeakSerial)
         request.object = spawned
         request.expiresAtMs = elapsedMs + SPAWN_INITIALIZE_MS
         pendingSpawns[#pendingSpawns + 1] = request
@@ -2790,14 +2849,12 @@ local function processSpawnRequest()
         local identityValid = callOk
             and registered == true
             and actorAddress == request.actorAddress
-            and finiteNumber(weakIndex) and weakIndex >= 0
-            and finiteNumber(weakSerial) and weakSerial > 0
+            and weakIndex == request.weakIndex
+            and weakSerial == request.weakSerial
         if not identityValid then
             error("native registry injection rejected the issued actor: " ..
                 (callOk and tostring(detail) or firstErrorLine(registered)))
         end
-        request.weakIndex = math.floor(weakIndex)
-        request.weakSerial = math.floor(weakSerial)
     end)
     if not spawnOk then
         for index = #pendingSpawns, 1, -1 do
@@ -2856,9 +2913,10 @@ end
 
 -- The outgoing world is about to be destroyed. Calling K2_DestroyActor here
 -- races the game's asynchronous enemy teardown and can leave worker tasks with
--- a dangling actor. Count the owned references for diagnostics and let
--- beginTravel release every Lua reference; the world remains the authoritative
--- owner of actor destruction.
+-- a dangling actor. Native teardown has already removed the Async GC roots from
+-- the exact issued actor graphs; this stage only counts the Lua references that
+-- beginTravel is about to release. The world remains the authoritative owner of
+-- actor destruction.
 releaseWorldForTravel = function(reason)
     local released = 0
     spawnQueue = {}
