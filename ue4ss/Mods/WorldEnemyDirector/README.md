@@ -49,21 +49,21 @@ rejected; the director stops issuing new actors.
 
 The director listens for `RODEnemyCharacter` construction and pool reuse. For
 each eligible natural enemy, it creates up to `SPAWN_MULTIPLIER - 1` actors
-through the game's own `ARODGameState::RODSpawnActor` entry point. Lua retains
-the existing population, species, cap, radius, navigation, streaming, and queue
-policy. A C++ bridge constructs the otherwise unmarshalable
-`FRODSpawnActorOption`, including the ownership tag, level, `Prowl` initial
-state, and `IsStartBehaviorTree`, then invokes the reflected native function on
-the game thread. The destination is first accepted by the live navigation
-system and lifted above the surface for capsule placement. Creation is deferred
-while World Partition reports incomplete streaming.
+through `GameplayStatics::BeginDeferredActorSpawnFromClass` and
+`FinishSpawningActor`. This path does not call `RODSpawnActor` and therefore
+does not consume or recycle entries from `URODManagerEnemy::EnemySpawnPool`.
+Lua retains the existing population, species, cap, radius, navigation,
+streaming, and queue policy. The destination is first accepted by the live
+navigation system and lifted above the surface for capsule placement. Creation
+is deferred while World Partition reports incomplete streaming.
 
-The bridge is bound to the exported ABI of UE4SS c838a8ac. It reads parameter
-offsets from the live `UFunction` and requires the header sizes
-`FTransform=0x60`, `FRODSpawnActorOption=0x88`, and
-`FRODSpawnActorResult=0x10` before calling `ProcessEvent`. The exact actor is
-returned as a validated `TWeakObjectPtr`; Lua claims lifecycle events by its
-resolved address, never by class or proximity.
+After the direct actor is finished, the C++ bridge converts its exact address
+to a validated `TWeakObjectPtr` and registers only that actor in
+`ARODGameState::RODEnemies` and `URODAIEnemyGroup::EnemyList`. The operation
+runs on the game thread, prepares capacity for both arrays before publishing
+either entry, and verifies the generated-header layouts `0x5B8`, `0x3E0`, and
+`0x90` through live reflected properties. A rejected layout or allocation
+pauses the director fail-closed; there is no alternate spawn channel.
 
 Extra enemies retain the collision profiles authored by their Blueprints. The
 director does not replace channel responses. After initialization it verifies
@@ -74,13 +74,12 @@ combat changes belong to the game and are not reclassified as spawn failures.
 An extra that fails admission remains unmutated and the director pauses
 fail-closed. It is never forcibly destroyed or returned to a pool.
 
-`RODSpawnActor` performs the game's native controller, behavior-tree, minimap,
-targeting, and GameState registration path. The director does not repair an
-actor after creation. Admission requires stable collision, running AI,
+After `OnFinishedInitialize`, the director starts the direct actor's authored
+controller and behavior tree. Admission requires stable collision, running AI,
 membership in `RODEnemies`, and membership in
-`ManagerEnemyGroup.EnemyList`. If registration is rejected, the director pauses
-and the actor remains unmutated; no lifecycle call is attempted. Every extra
-receives the persistent
+`ManagerEnemyGroup.EnemyList`. If creation, registration, or activation is
+rejected, the director pauses and retains the issued actor; no destruction or
+pool call is attempted. Every extra receives the persistent
 `WorldEnemyDirectorOwned` actor tag. If a same-world teleport releases Lua
 references, the next scan adopts tagged orphans instead of misclassifying them
 as natural enemies. Natural actors remain unowned, and the director never ends
@@ -190,8 +189,8 @@ logging.
 
 Implementation contracts were checked against the public
 [`toeofcharmander/mod_template`](https://github.com/toeofcharmander/mod_template)
-headers, enemy curve tables, navigation declarations, and
-`FRODSpawnActorOption` schema for Echoes of Aincrad. The native bridge ABI and
+headers, enemy curve tables, navigation declarations, and the `ARODGameState`,
+`URODAIEnemyGroup`, and `URODManagerEnemy` layouts for Echoes of Aincrad. The native bridge ABI and
 the UE4SS parameter contract used for `FGameplayAttribute` enumeration were
 also checked against the exact c838a8ac source and the official
 [`UE4SS-RE/RE-UE4SS`](https://github.com/UE4SS-RE/RE-UE4SS) Lua binding source

@@ -63,6 +63,8 @@ local MAX_DISCOVERY_PER_TICK = 2
 local SNAPSHOT_RETRY_LIMIT = 32
 local SNAPSHOT_RETRY_BACKOFF_MS = 250
 local GAMEPLAY_MOD_ADDITIVE = 0
+local SPAWN_COLLISION_ADJUST_OR_REJECT = 3
+local SPAWN_SCALE_MULTIPLY_ROOT = 1
 local GAS_VALUE_EPSILON = 0.01
 local ENEMY_ROLE_NONE = 0
 local ENEMY_ROLE_MOB = 1
@@ -812,6 +814,7 @@ local awaitingTravelRestart = false
 local materialLibrary = nil
 local materialInterface = nil
 local navigationSystem = nil
+local gameplayStatics = nil
 local worldPartitionSubsystem = nil
 local cachedHero = nil
 local nativeContractReported = false
@@ -826,6 +829,7 @@ local AMBIENT_SPAWN_MAX_DIST_CM = 3200.0
 local nextAmbientCheckMs = 0
 local ambientCounter = 0
 local disableWorld
+local activateSpawnedEnemy
 local releaseWorldForTravel
 local gcScheduled = false
 
@@ -852,6 +856,7 @@ local function clearWorldReferences()
     discoveryReadyAtMs = nil
     worldFault = nil
     navigationSystem = nil
+    gameplayStatics = nil
     worldPartitionSubsystem = nil
     nativeContractReported = false
     cachedHero = nil
@@ -994,13 +999,25 @@ local function resolveSpawnApi()
         navigationSystem = nav
     end
 
-    if type(WEDNativeSpawn) ~= "function" then
-        return false, "WorldEnemyDirector native C++ bridge is not loaded"
+    if not isValid(gameplayStatics) then
+        gameplayStatics = nil
+        local ok, library = pcall(
+            StaticFindObject,
+            "/Script/Engine.Default__GameplayStatics"
+        )
+        if not ok or not isValid(library) then
+            return false, "canonical GameplayStatics spawn API is unavailable"
+        end
+        gameplayStatics = library
+    end
+
+    if type(WEDNativeRegisterEnemy) ~= "function" then
+        return false, "WorldEnemyDirector native registry bridge is not loaded"
     end
 
     if not nativeContractReported then
         nativeContractReported = true
-        log("SPAWN CONTRACT | native ARODGameState.RODSpawnActor bridge is available")
+        log("SPAWN CONTRACT | direct deferred spawn plus native registry injection is available")
     end
     return true, nil
 end
@@ -1583,7 +1600,7 @@ local function applyMutation(state)
     return true
 end
 
--- Once RODSpawnActor has issued an actor, only the game may end its lifecycle.
+-- Once direct creation has issued an actor, only the game may end its lifecycle.
 -- Forcing EnemyReturnToPool from the director raced the render/physics threads,
 -- deleted valid enemies, and produced a dangling RHI resource. Origin removal
 -- therefore cancels only requests that have not created an actor yet.
@@ -2009,8 +2026,8 @@ local function protectBossClass(classKey)
     log("MISSION BOSS PROTECTED | removed from spawn system: " .. classKey)
 end
 
--- RODSpawnActor returns a weak identity. The lifecycle callback is claimed by
--- the exact resolved address, never by class or proximity.
+-- Native registration returns a weak identity. The lifecycle callback is
+-- claimed by the exact resolved address, never by class or proximity.
 local function takePendingSpawn(enemy, actorKey)
     local addressOk, actorAddress = pcall(function() return enemy:GetAddress() end)
     if not addressOk or type(actorAddress) ~= "number" then return nil end
@@ -2239,10 +2256,19 @@ local function registerEnemy(enemy, reused, queued)
     }
     states[key] = state
 
-    -- Owned enemies arrived through RODSpawnActor with the initial state and
-    -- IsStartBehaviorTree already authored in FRODSpawnActorOption. Admission
-    -- below verifies the resulting physical, AI and native-registry contracts;
-    -- no post-spawn repair path is permitted.
+    -- Direct extras bypass the game's finite EnemySpawnPool. Their own
+    -- initialization event is the canonical point for starting their authored
+    -- controller and behavior tree.
+    if state.owned then
+        if activateSpawnedEnemy(enemy, key, state.spawnPosition) ~= true then
+            spawnQueue = {}
+            pendingSpawns = {}
+            worldFault = "direct spawn activation failed for " .. tostring(key)
+            log("WORLD ERROR | " .. worldFault ..
+                " | actor retained; director paused")
+            return
+        end
+    end
 
     -- INCLUDE_BOSSES controls mutation only. Boss classes and boss actors are
     -- never admitted to either spawning structure, so a quest boss cannot be
@@ -2309,7 +2335,7 @@ local function expirePendingSpawns()
                 spawnQueue = {}
                 pendingSpawns = {}
                 worldFault = string.format(
-                    "native RODSpawnActor result %s did not enter the enemy lifecycle",
+                    "direct spawn %s did not enter the enemy lifecycle",
                     tostring(request.actorKey or request.actorAddress))
                 log("WORLD ERROR | " .. worldFault .. " | director paused")
                 return
@@ -2324,6 +2350,51 @@ local function pauseForSpawnContractFailure(reason)
     log("WORLD ERROR | " .. worldFault .. " | director paused")
 end
 
+activateSpawnedEnemy = function(enemy, key, spawnPosition)
+    if not isValid(enemy) then return false end
+    local state = states[key]
+    if state == nil or type(state.expectedPhysical) ~= "table" then
+        log("SPAWN ACTIVATION ERROR | " .. tostring(key) ..
+            " | same-class natural collision contract is unavailable")
+        return false
+    end
+
+    local controller = nil
+    local treeResult = nil
+    local activated, activationError = pcall(function()
+        if spawnPosition == nil then
+            error("canonical spawn position is unavailable")
+        end
+        controller = enemy:GetController()
+        if not isValid(controller) then error("AI controller is unavailable") end
+        local pawn = controller:K2_GetPawn()
+        if not isValid(pawn) or objectKey(pawn) ~= objectKey(enemy) then
+            error("AI controller does not possess the spawned enemy")
+        end
+
+        enemy.ProwlFirstPosition = spawnPosition
+        enemy.ProwlGoalPosition = spawnPosition
+        enemy.ProwlGoalPositionFlag = false
+        controller:StartAI(enemy)
+        controller:ApplyBindFunction()
+        enemy:StartAI(false)
+        treeResult = enemy:StartBehaviorTree()
+    end)
+    if not activated then
+        log("SPAWN ACTIVATION ERROR | " .. tostring(key) .. " | " ..
+            firstErrorLine(activationError))
+        return false
+    end
+
+    dbg(string.format(
+        "SPAWN ACTIVATION | enemy=%s controller=%s tree=%s",
+        tostring(key),
+        tostring(objectKey(controller)),
+        tostring(treeResult)
+    ))
+    return true
+end
+
 -- A deferred spawn produces the pawn and nothing else.
 --
 -- Possession is not the gap: AutoPossessAI is 3 (PlacedInWorldOrSpawned) on
@@ -2332,10 +2403,9 @@ end
 -- there before and after. The enemy still stands inert, because having a
 -- controller is not the same as having started.
 --
--- What the game's own path does and GameplayStatics does not is the rest of
--- FRODSpawnActorOption: IsStartBehaviorTree and the initial state. On
--- ARODEnemyCharacter those are StartAI(DetectFlag) and StartBehaviorTree(), and
--- they are called here, after the enemy reports itself initialized rather than
+-- The deferred spawn does not start the enemy's authored behavior. On
+-- ARODEnemyCharacter that requires StartAI and StartBehaviorTree, and they are
+-- called here after the enemy reports itself initialized rather than
 -- straight after creation — an enemy whose assets are still resolving has
 -- nothing for a behaviour tree to run yet.
 -- Both contracts are reported when both fail. The physical one used to win and
@@ -2363,8 +2433,8 @@ local registryProbeReported = false
 -- ManagerEnemyGroup.EnemyList, which URODAIEnemyGroup uses to hand out attack
 -- slots (PartnerAttackEnemyTimesLimit, VisitorAttackEnemyTimesLimit,
 -- EnemyTargetingDatas). An actor created through UGameplayStatics is a
--- well-formed enemy, but nothing adds it to those lists: the game registers a
--- spawn inside its own entry point, ARODGameState:RODSpawnActor. If an
+-- well-formed enemy, but nothing adds it to those lists. The native bridge
+-- registers the exact direct actor in both arrays before admission. If an
 -- admitted extra is absent from them while natural enemies are present, that
 -- is why a partner never engages it, and no collision channel or AI flag on
 -- the actor itself can change that.
@@ -2526,29 +2596,6 @@ local function streamingIsSettled()
     return completed == true, nil
 end
 
--- No C++ STL value crosses the UE4SS DLL boundary. Seven ASCII bytes fit in a
--- positive 56-bit Lua integer, so the native bridge receives the canonical
--- class path as exact integer chunks and reconstructs it under its own CRT.
-local function packNativeClassPath(path)
-    if type(path) ~= "string" or #path == 0 or #path > 1024 then
-        return nil, "class path length is outside the native contract"
-    end
-    local chunks = {}
-    for first = 1, #path, 7 do
-        local last = math.min(first + 6, #path)
-        local chunk = 0
-        for index = last, first, -1 do
-            local byte = string.byte(path, index)
-            if byte == nil or byte == 0 or byte > 0x7F then
-                return nil, "class path is not canonical ASCII"
-            end
-            chunk = chunk * 256 + byte
-        end
-        chunks[#chunks + 1] = chunk
-    end
-    return chunks, nil
-end
-
 local function processSpawnRequest()
     if elapsedMs < lastSpawnMs + SPAWN_PACING_MS then return end
     local request = table.remove(spawnQueue, 1)
@@ -2599,18 +2646,6 @@ local function processSpawnRequest()
             "spawn class resolution failed: " ..
                 firstErrorLine(classResolveError)
         )
-        return
-    end
-    local spawnClassPath = request.classKey:match("^%S+%s+(.+)$")
-    if type(spawnClassPath) ~= "string" or spawnClassPath == "" then
-        pauseForSpawnContractFailure(
-            "spawn class has no canonical object path: " .. request.classKey)
-        return
-    end
-    local packedClassPath, packError = packNativeClassPath(spawnClassPath)
-    if packedClassPath == nil then
-        pauseForSpawnContractFailure(
-            "spawn class path packing failed: " .. tostring(packError))
         return
     end
 
@@ -2681,38 +2716,89 @@ local function processSpawnRequest()
     end
     request.position = position
 
-    local gameState = FindFirstOf("RODGameState")
-    if not isValid(gameState) then
-        pauseForSpawnContractFailure("RODGameState is unavailable for native spawn")
-        return
-    end
-
-    -- The pending ticket exists before ProcessEvent because RODSpawnActor can
-    -- synchronously run OnFinishedInitialize. The hook is consumed next tick,
-    -- after the bridge has stored the exact address and weak identity.
-    request.expiresAtMs = elapsedMs + SPAWN_INITIALIZE_MS
-    pendingSpawns[#pendingSpawns + 1] = request
-    local nativeArguments = {
-        gameState:GetAddress(),
-        request.level,
-        request.position.X,
-        request.position.Y,
-        request.position.Z,
-        #spawnClassPath,
+    local transform = {
+        Rotation = { X = 0.0, Y = 0.0, Z = 0.0, W = 1.0 },
+        Translation = request.position,
+        Scale3D = { X = 1.0, Y = 1.0, Z = 1.0 },
     }
-    for _, chunk in ipairs(packedClassPath) do
-        nativeArguments[#nativeArguments + 1] = chunk
-    end
-    local callOk, accepted, detail, actorAddress, weakIndex, weakSerial = pcall(
-        WEDNativeSpawn,
-        table.unpack(nativeArguments, 1, #nativeArguments)
-    )
-    local identityValid = callOk
-        and accepted == true
-        and finiteNumber(actorAddress) and actorAddress > 0
-        and finiteNumber(weakIndex) and weakIndex >= 0
-        and finiteNumber(weakSerial) and weakSerial > 0
-    if not identityValid then
+    local spawned = nil
+    local insertedPending = false
+    local spawnOk, spawnError = pcall(function()
+        spawned = gameplayStatics:BeginDeferredActorSpawnFromClass(
+            owner,
+            spawnClass,
+            transform,
+            SPAWN_COLLISION_ADJUST_OR_REJECT,
+            nil,
+            SPAWN_SCALE_MULTIPLY_ROOT
+        )
+        if not isValid(spawned) then
+            error("BeginDeferredActorSpawnFromClass returned no actor")
+        end
+
+        request.actorKey = objectKey(spawned)
+        if request.actorKey == nil then
+            error("created actor has no canonical object key")
+        end
+        request.actorAddress = spawned:GetAddress()
+        if not finiteNumber(request.actorAddress) or request.actorAddress <= 0 then
+            error("created actor has no canonical address")
+        end
+        request.object = spawned
+        request.expiresAtMs = elapsedMs + SPAWN_INITIALIZE_MS
+        pendingSpawns[#pendingSpawns + 1] = request
+        insertedPending = true
+
+        local tags = spawned.Tags
+        if tags == nil then error("deferred actor Tags array is unavailable") end
+        if spawned:ActorHasTag(FName(OWNED_ACTOR_TAG)) ~= true then
+            tags[#tags + 1] = FName(OWNED_ACTOR_TAG)
+        end
+        if spawned:ActorHasTag(FName(OWNED_ACTOR_TAG)) ~= true then
+            error("deferred actor ownership tag did not persist")
+        end
+
+        local finished = gameplayStatics:FinishSpawningActor(
+            spawned,
+            transform,
+            SPAWN_SCALE_MULTIPLY_ROOT
+        )
+        if not isValid(finished) then
+            error("FinishSpawningActor returned no actor")
+        end
+        if objectKey(finished) ~= request.actorKey
+            or finished:GetAddress() ~= request.actorAddress then
+            error("FinishSpawningActor returned a different actor")
+        end
+        if finished:ActorHasTag(FName(OWNED_ACTOR_TAG)) ~= true then
+            error("ownership tag did not survive FinishSpawningActor")
+        end
+        request.object = finished
+        finished:SetEnemyLevel(request.level, false)
+
+        local gameState = FindFirstOf("RODGameState")
+        if not isValid(gameState) then
+            error("RODGameState is unavailable for native registration")
+        end
+        local callOk, registered, detail, actorAddress, weakIndex, weakSerial =
+            pcall(
+                WEDNativeRegisterEnemy,
+                gameState:GetAddress(),
+                request.actorAddress
+            )
+        local identityValid = callOk
+            and registered == true
+            and actorAddress == request.actorAddress
+            and finiteNumber(weakIndex) and weakIndex >= 0
+            and finiteNumber(weakSerial) and weakSerial > 0
+        if not identityValid then
+            error("native registry injection rejected the issued actor: " ..
+                (callOk and tostring(detail) or firstErrorLine(registered)))
+        end
+        request.weakIndex = math.floor(weakIndex)
+        request.weakSerial = math.floor(weakSerial)
+    end)
+    if not spawnOk then
         for index = #pendingSpawns, 1, -1 do
             if pendingSpawns[index] == request then
                 table.remove(pendingSpawns, index)
@@ -2720,15 +2806,12 @@ local function processSpawnRequest()
             end
         end
         pauseForSpawnContractFailure(
-            "native RODSpawnActor rejected the request: " ..
-            (callOk and tostring(detail) or firstErrorLine(accepted)))
+            "direct spawn contract failed: " .. summarizeSpawnCallError(spawnError) ..
+            (isValid(spawned) and " | issued actor retained" or ""))
         return
     end
-    request.actorAddress = actorAddress
-    request.weakIndex = math.floor(weakIndex)
-    request.weakSerial = math.floor(weakSerial)
     dbg(string.format(
-        "SPAWN CREATED NATIVE | origin=%s slot=%d class=%s address=%s weak=%d:%d",
+        "SPAWN CREATED DIRECT | origin=%s slot=%d class=%s address=%s weak=%d:%d",
         request.originKey,
         request.slot,
         request.classKey,
