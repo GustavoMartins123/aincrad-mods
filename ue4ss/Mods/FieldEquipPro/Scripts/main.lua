@@ -32,9 +32,6 @@ local EQUIPMENT_CLOSE_SETTLE_MS = 900
 -- Applied after the rail is rebuilt, late enough that every other mod has had
 -- its own construction notification and appended its row.
 local EQUIPMENT_REFOCUS_DELAY_MS = 600
--- The forced camera can interpolate its values over its own Speed/Duration, so
--- the height nudge is written once more after that settles.
-local CAMERA_HEIGHT_REAPPLY_MS = 500
 
 local MAX_NATIVE_MENU_ITEMS = 7
 local ACCEPT_BUTTON = 1
@@ -55,6 +52,8 @@ local equipmentSubmenuOpen = false
 -- manager fires EndMenu for the start menu it closes on the way there, and that
 -- must not be mistaken for the player leaving Equipment.
 local equipmentSessionArmed = false
+local equipmentSessionWidgetKey = nil
+local resumePlayableCameraPending = false
 local mainMenuSubmenuActive = false
 local submenuTransitionSerial = 0
 local pendingEquipmentFocus = false
@@ -415,11 +414,7 @@ end
 -- Any one alone leaves the screen worse than not touching the camera at all.
 local previousViewTarget = nil
 local suppressedHiddenKeys = {}
-local previousCameraRootLocation = nil
-local previousBoomTargetOffset = nil
-local previousBoomSocketOffset = nil
-local baseEquipmentTargetOffset = nil
-local baseEquipmentSocketOffset = nil
+local originalCameraState = nil
 
 local function describeCameraState(widget)
     local enabled = nil
@@ -490,6 +485,67 @@ end
 -- CAMERA_HEIGHT raises the boom's origin, which lowers the character in frame
 -- and shows more above them. Moving CameraRoot (USceneComponent) adjusts the
 -- base transform of the camera rig directly without being overwritten by native ticks.
+local function captureOriginalCameraState(hero)
+    if not isValidObject(hero) then
+        return false, "hero is unavailable"
+    end
+
+    local rootLocation = nil
+    local rootRotation = nil
+    local targetOffset = nil
+    local socketOffset = nil
+    local targetArmLength = nil
+    local boomRotation = nil
+
+    pcall(function()
+        local root = hero.CameraRoot
+        if isValidObject(root) then
+            local relLoc = root.RelativeLocation
+            rootLocation = { X = relLoc.X, Y = relLoc.Y, Z = relLoc.Z }
+            local rotation = root.RelativeRotation
+            rootRotation = {
+                Pitch = rotation.Pitch,
+                Yaw = rotation.Yaw,
+                Roll = rotation.Roll,
+            }
+        end
+    end)
+
+    pcall(function()
+        local boom = hero.CameraBoom
+        if isValidObject(boom) then
+            local target = boom.TargetOffset
+            targetOffset = { X = target.X, Y = target.Y, Z = target.Z }
+            local socket = boom.SocketOffset
+            socketOffset = { X = socket.X, Y = socket.Y, Z = socket.Z }
+            targetArmLength = boom.TargetArmLength
+            local rotation = boom.RelativeRotation
+            boomRotation = {
+                Pitch = rotation.Pitch,
+                Yaw = rotation.Yaw,
+                Roll = rotation.Roll,
+            }
+        end
+    end)
+
+    if rootLocation == nil or rootRotation == nil
+        or targetOffset == nil or socketOffset == nil
+        or targetArmLength == nil or boomRotation == nil then
+        originalCameraState = nil
+        return false, "camera components are unavailable"
+    end
+
+    originalCameraState = {
+        rootLocation = rootLocation,
+        rootRotation = rootRotation,
+        targetOffset = targetOffset,
+        socketOffset = socketOffset,
+        targetArmLength = targetArmLength,
+        boomRotation = boomRotation,
+    }
+    return true, nil
+end
+
 local function raiseEquipmentCamera(hero)
     if not isValidObject(hero) then return end
 
@@ -497,10 +553,7 @@ local function raiseEquipmentCamera(hero)
         local root = hero.CameraRoot
         if isValidObject(root) then
             local relLoc = root.RelativeLocation
-            if previousCameraRootLocation == nil then
-                previousCameraRootLocation = { X = relLoc.X, Y = relLoc.Y, Z = relLoc.Z }
-            end
-            relLoc.Z = previousCameraRootLocation.Z + CONFIG.CAMERA_HEIGHT
+            relLoc.Z = relLoc.Z + CONFIG.CAMERA_HEIGHT
             root.RelativeLocation = relLoc
         end
     end)
@@ -510,14 +563,8 @@ local function raiseEquipmentCamera(hero)
         if isValidObject(boom) then
             local target = boom.TargetOffset
             local socket = boom.SocketOffset
-            if previousBoomTargetOffset == nil then
-                previousBoomTargetOffset = { X = target.X, Y = target.Y, Z = target.Z }
-            end
-            if previousBoomSocketOffset == nil then
-                previousBoomSocketOffset = { X = socket.X, Y = socket.Y, Z = socket.Z }
-            end
-            target.Z = previousBoomTargetOffset.Z + CONFIG.CAMERA_HEIGHT
-            socket.Z = previousBoomSocketOffset.Z + CONFIG.CAMERA_HEIGHT
+            target.Z = target.Z + CONFIG.CAMERA_HEIGHT
+            socket.Z = socket.Z + CONFIG.CAMERA_HEIGHT
             boom.TargetOffset = target
             boom.SocketOffset = socket
         end
@@ -525,42 +572,95 @@ local function raiseEquipmentCamera(hero)
 end
 
 local function restoreEquipmentCamera(hero)
-    if isValidObject(hero) then
+    local state = originalCameraState
+    if isValidObject(hero) and state ~= nil then
+        local stopped, stopError = pcall(function()
+            hero:StopCameraAnimation()
+        end)
+        if not stopped then
+            log("could not stop the Equipment camera animation: "
+                .. tostring(stopError))
+        end
         pcall(function()
             local root = hero.CameraRoot
-            if isValidObject(root) and previousCameraRootLocation ~= nil then
+            if isValidObject(root) then
                 local relLoc = root.RelativeLocation
-                relLoc.X = previousCameraRootLocation.X
-                relLoc.Y = previousCameraRootLocation.Y
-                relLoc.Z = previousCameraRootLocation.Z
+                relLoc.X = state.rootLocation.X
+                relLoc.Y = state.rootLocation.Y
+                relLoc.Z = state.rootLocation.Z
                 root.RelativeLocation = relLoc
+                local rotation = root.RelativeRotation
+                rotation.Pitch = state.rootRotation.Pitch
+                rotation.Yaw = state.rootRotation.Yaw
+                rotation.Roll = state.rootRotation.Roll
+                root.RelativeRotation = rotation
             end
         end)
         pcall(function()
             local boom = hero.CameraBoom
             if isValidObject(boom) then
-                if previousBoomTargetOffset ~= nil then
-                    local target = boom.TargetOffset
-                    target.X = previousBoomTargetOffset.X
-                    target.Y = previousBoomTargetOffset.Y
-                    target.Z = previousBoomTargetOffset.Z
-                    boom.TargetOffset = target
-                end
-                if previousBoomSocketOffset ~= nil then
-                    local socket = boom.SocketOffset
-                    socket.X = previousBoomSocketOffset.X
-                    socket.Y = previousBoomSocketOffset.Y
-                    socket.Z = previousBoomSocketOffset.Z
-                    boom.SocketOffset = socket
-                end
+                boom.TargetArmLength = state.targetArmLength
+                local rotation = boom.RelativeRotation
+                rotation.Pitch = state.boomRotation.Pitch
+                rotation.Yaw = state.boomRotation.Yaw
+                rotation.Roll = state.boomRotation.Roll
+                boom.RelativeRotation = rotation
+                local target = boom.TargetOffset
+                target.X = state.targetOffset.X
+                target.Y = state.targetOffset.Y
+                target.Z = state.targetOffset.Z
+                boom.TargetOffset = target
+                local socket = boom.SocketOffset
+                socket.X = state.socketOffset.X
+                socket.Y = state.socketOffset.Y
+                socket.Z = state.socketOffset.Z
+                boom.SocketOffset = socket
             end
         end)
+        local updated, updateError = pcall(function()
+            local boom = hero.CameraBoom
+            if isValidObject(boom) then
+                boom:BP_UpdateDesiredArmLocation(0.016)
+            end
+        end)
+        if not updated then
+            log("could not refresh the restored camera transform: "
+                .. tostring(updateError))
+        end
     end
-    previousCameraRootLocation = nil
-    previousBoomTargetOffset = nil
-    previousBoomSocketOffset = nil
-    baseEquipmentTargetOffset = nil
-    baseEquipmentSocketOffset = nil
+    originalCameraState = nil
+end
+
+local function resumePlayableCamera(hero)
+    if not isValidObject(hero) then return end
+
+    local cameraProcess = nil
+    local readOk, readError = pcall(function()
+        cameraProcess = hero.CameraAdjustComponent
+    end)
+    if not readOk or not isValidObject(cameraProcess) then
+        log("could not resume playable camera follow: " .. tostring(readError))
+        return
+    end
+
+    local resumed, resumeError = pcall(function()
+        hero:StopCameraAnimation()
+        cameraProcess:EnableCameraFollow()
+        cameraProcess:OnEnablePlayableFollowCamera()
+    end)
+    if not resumed then
+        log("could not resume playable camera follow: "
+            .. tostring(resumeError))
+        return
+    end
+
+    pcall(function()
+        local boom = hero.CameraBoom
+        if isValidObject(boom) then
+            boom:BP_UpdateDesiredArmLocation(0.016)
+        end
+    end)
+    log("playable camera follow resumed")
 end
 
 local function takeViewTarget(controller, hero)
@@ -622,7 +722,7 @@ local function restoreMenuCharacterState(startMenuIsUp)
         if not isValidObject(target) then target = hero end
         if isValidObject(target) then
             local restored = pcall(function()
-                controller:SetViewTargetWithBlend(target, 0.25, 0, 0.0, false)
+                controller:SetViewTargetWithBlend(target, 0.0, 0, 0.0, false)
             end)
             log("view target returned to " .. objectName(target)
                 .. "; success=" .. tostring(restored))
@@ -632,16 +732,18 @@ local function restoreMenuCharacterState(startMenuIsUp)
 
     if not isValidObject(hero) then
         suppressedHiddenKeys = {}
-        previousBoomTargetOffset = nil
+        originalCameraState = nil
         return
     end
     restoreEquipmentCamera(hero)
     if startMenuIsUp then
+        resumePlayableCameraPending = true
         restoreHeroHide(hero)
     else
         -- No menu to hide behind. Drop what was recorded rather than reapplying
         -- it; being visible is the only safe end state out here.
         suppressedHiddenKeys = {}
+        resumePlayableCamera(hero)
     end
 end
 
@@ -651,6 +753,7 @@ local function verifyEquipmentMounted()
     local widget, presentation, owner = findLiveEquipmentWidget()
     if isValidObject(widget) then
         equipmentSessionArmed = true
+        equipmentSessionWidgetKey = objectName(widget)
         log("Equipment screen is live via " .. tostring(presentation)
             .. ": widget=" .. objectName(widget)
             .. " actor=" .. objectName(owner)
@@ -661,6 +764,7 @@ local function verifyEquipmentMounted()
 
     log("Equipment screen never appeared; resetting state")
     equipmentSessionArmed = false
+    equipmentSessionWidgetKey = nil
     equipmentSubmenuOpen = false
     mainMenuSubmenuActive = false
     local context = activeEquipmentContext
@@ -691,6 +795,7 @@ local function selectInjectedEquipment()
 
         equipmentSubmenuOpen = true
         equipmentSessionArmed = false
+        equipmentSessionWidgetKey = nil
         mainMenuSubmenuActive = true
         submenuTransitionSerial = submenuTransitionSerial + 1
         pendingFocusRedirects[context.listKey] = nil
@@ -716,6 +821,16 @@ local function selectInjectedEquipment()
             widget.MenuKind = MENU_KIND_CHEST_EQUIP
             if CONFIG.SHOW_CHARACTER then
                 widget.IsOpenCameraEnable = true
+            end
+
+            if CONFIG.SHOW_CHARACTER then
+                local hero = resolveHero()
+                local captured, captureError = captureOriginalCameraState(hero)
+                if not captured then
+                    error("could not capture the original camera state: "
+                        .. tostring(captureError))
+                end
+                log("captured original camera state before native Equipment open")
             end
 
             local handle = rodLibrary:DebugOpenMenu(controller, widget)
@@ -1048,7 +1163,9 @@ local function focusRailRow(context, row, index)
     -- row was selected still lit, so two entries appear selected at once.
     for nativeIndex = 0, context.nativeCount - 1 do
         pcall(function()
-            context.mainList["Item_" .. tostring(nativeIndex)]:SetDefaultAnimation()
+            local item = context.mainList["Item_" .. tostring(nativeIndex)]
+            item:StopAllAnimations()
+            item:SetDefaultAnimation()
         end)
     end
 
@@ -1068,7 +1185,9 @@ focusEquipment = function(context)
     -- controller wrap boundaries (Pouch and the current final native row).
     for index = 0, context.nativeCount - 1 do
         pcall(function()
-            context.mainList["Item_" .. tostring(index)]:SetDefaultAnimation()
+            local item = context.mainList["Item_" .. tostring(index)]
+            item:StopAllAnimations()
+            item:SetDefaultAnimation()
         end)
     end
     focusMenuIcon(context, context.equipmentIcon, context.equipmentIndex)
@@ -1360,6 +1479,7 @@ local function finishMainMenuReturn(returnState)
             rearmEquipmentEntry(context, true)
             if returnState.returningFromEquipment then
                 equipmentSessionArmed = false
+                equipmentSessionWidgetKey = nil
                 focusEquipment(context)
                 restoreMenuCharacterState(true)
                 log("finishMainMenuReturn | Equipment return completed")
@@ -1388,11 +1508,18 @@ local function recoverEquipmentAfterNativeBack(context)
             or not isValidObject(context.mainMenu) then
             return
         end
+        local returningFromEquipment = equipmentSessionArmed
+        equipmentSessionArmed = false
+        equipmentSessionWidgetKey = nil
         mainMenuSubmenuActive = false
         context.activeNativeSubmenuIndex = nil
         pendingFocusRedirects[context.listKey] = nil
         setNativeMenuPanelsVisibility(context, VISIBLE)
         rearmEquipmentEntry(context, emitLog)
+        if returningFromEquipment then
+            restoreMenuCharacterState(true)
+            log("recovered Equipment camera and character state after native Back")
+        end
     end
 
     ExecuteWithDelay(700, function()
@@ -1547,16 +1674,16 @@ local function startMenuSurvivedEquipment()
         and objectName(mounted) == objectName(context.mainMenu)
 end
 
--- Equipment return is handled entirely by the native EndSubMenu path, which
--- fires finishMainMenuReturn. This fallback only exists for the edge case
--- where the Equipment widget closes without triggering EndSubMenu (e.g. if a
--- force-close bypasses the submenu flow).
+-- This catches a close that bypasses the main-menu EndSubMenu path. The normal
+-- Equipment widget close is handled by its ClosedMenu hook below; this helper
+-- remains for a manager-level close where the widget is already gone.
 local function recoverFromEquipmentClose()
     if equipmentScreenIsPresented() then return end
     log("recoverFromEquipmentClose | resetting flags")
     equipmentSubmenuOpen = false
     mainMenuSubmenuActive = false
     equipmentSessionArmed = false
+    equipmentSessionWidgetKey = nil
     equipmentReturnBusy = false
     local context = activeEquipmentContext
     if context ~= nil and isValidObject(context.mainMenu) then
@@ -1570,7 +1697,86 @@ local function recoverFromEquipmentClose()
     end
 end
 
--- Legacy entry point kept as a no-op for any remaining callers.
+local function completeEquipmentWidgetClose(widgetKey)
+    if not equipmentSessionArmed
+        or equipmentSessionWidgetKey == nil
+        or equipmentSessionWidgetKey ~= widgetKey then
+        return
+    end
+
+    equipmentSubmenuOpen = false
+    mainMenuSubmenuActive = false
+    equipmentSessionArmed = false
+    equipmentSessionWidgetKey = nil
+    equipmentReturnBusy = false
+    nativeBackRecoveryBusy = false
+
+    local hero = resolveHero()
+    if isValidObject(hero) then
+        local returned, returnError = pcall(function()
+            hero:ReturnChestCamera()
+        end)
+        log("ClosedMenu | native ReturnChestCamera success="
+            .. tostring(returned)
+            .. (returned and "" or (" error=" .. tostring(returnError))))
+    end
+
+    local context = activeEquipmentContext
+    local startMenuIsUp = startMenuSurvivedEquipment()
+    if startMenuIsUp and context ~= nil and isValidObject(context.mainMenu) then
+        context.activeNativeSubmenuIndex = nil
+        pendingFocusRedirects[context.listKey] = nil
+        setNativeMenuPanelsVisibility(context, VISIBLE)
+        rearmEquipmentEntry(context, true)
+        restoreMenuCharacterState(true)
+    else
+        restoreMenuCharacterState(false)
+    end
+
+    log("ClosedMenu | Equipment camera and character state restored")
+end
+
+local function completeEquipmentWidgetClose(widgetKey)
+    if not equipmentSessionArmed
+        or equipmentSessionWidgetKey == nil
+        or equipmentSessionWidgetKey ~= widgetKey then
+        return
+    end
+
+    equipmentSubmenuOpen = false
+    mainMenuSubmenuActive = false
+    equipmentSessionArmed = false
+    equipmentSessionWidgetKey = nil
+    equipmentReturnBusy = false
+    nativeBackRecoveryBusy = false
+
+    local hero = resolveHero()
+    if isValidObject(hero) then
+        local returned, returnError = pcall(function()
+            hero:ReturnChestCamera()
+        end)
+        log("ClosedMenu | native ReturnChestCamera success="
+            .. tostring(returned)
+            .. (returned and "" or (" error=" .. tostring(returnError))))
+    end
+
+    local context = activeEquipmentContext
+    local startMenuIsUp = startMenuSurvivedEquipment()
+    if startMenuIsUp and context ~= nil and isValidObject(context.mainMenu) then
+        context.activeNativeSubmenuIndex = nil
+        pendingFocusRedirects[context.listKey] = nil
+        setNativeMenuPanelsVisibility(context, VISIBLE)
+        rearmEquipmentEntry(context, true)
+        restoreMenuCharacterState(true)
+    else
+        restoreMenuCharacterState(false)
+    end
+
+    log("ClosedMenu | Equipment camera and character state restored")
+end
+
+-- Kept as a no-op for callers from the old bridge; the native Equipment close
+-- event now owns the return transition.
 beginEquipmentReturnToMain = function()
     -- The native EndSubMenu flow handles the full return. Nothing to do here.
     log("beginEquipmentReturnToMain called (no-op; EndSubMenu handles return)")
@@ -1720,8 +1926,9 @@ scheduleMenuInjection = function()
     end)
 end
 
--- EndMenu fires for every menu close (not just Equipment). Use it only as a
--- lightweight flag-reset in case EndSubMenu did not fire for some reason.
+-- EndMenu fires for every menu close (not just Equipment). Keep its delayed
+-- check for manager-level teardown; the Equipment widget's ClosedMenu hook is
+-- the canonical return event for the normal Back path.
 safeHook("/Script/ROD.RODWidgetBPFunctionLibrary:EndMenu",
     function()
         if not equipmentSubmenuOpen then return end
@@ -1733,6 +1940,58 @@ safeHook("/Script/ROD.RODWidgetBPFunctionLibrary:EndMenu",
                 if equipmentSubmenuOpen or mainMenuSubmenuActive then
                     recoverFromEquipmentClose()
                 end
+            end)
+        end)
+    end,
+    function()
+        if not resumePlayableCameraPending then return end
+        ExecuteWithDelay(0, function()
+            ExecuteInGameThread(function()
+                if startMenuSurvivedEquipment() then return end
+                resumePlayableCameraPending = false
+                resumePlayableCamera(resolveHero())
+            end)
+        end)
+    end)
+
+safeHook("/Script/ROD.RODMenuWidgetBase:ClosedMenu",
+    function(self)
+        local widget = unwrap(self)
+        local widgetKey = objectName(widget)
+        if not contains(widgetKey, EQUIPMENT_CLASS_FRAGMENT)
+            or equipmentSessionWidgetKey ~= widgetKey then
+            return
+        end
+        log("observed Equipment ClosedMenu; camera recovery armed")
+    end,
+    function(self)
+        local widget = unwrap(self)
+        local widgetKey = objectName(widget)
+        if not contains(widgetKey, EQUIPMENT_CLASS_FRAGMENT) then return end
+        ExecuteWithDelay(0, function()
+            ExecuteInGameThread(function()
+                completeEquipmentWidgetClose(widgetKey)
+            end)
+        end)
+    end)
+
+safeHook("/Script/ROD.RODMenuWidgetBase:ClosedMenu",
+    function(self)
+        local widget = unwrap(self)
+        local widgetKey = objectName(widget)
+        if not contains(widgetKey, EQUIPMENT_CLASS_FRAGMENT)
+            or equipmentSessionWidgetKey ~= widgetKey then
+            return
+        end
+        log("observed Equipment ClosedMenu; camera recovery armed")
+    end,
+    function(self)
+        local widget = unwrap(self)
+        local widgetKey = objectName(widget)
+        if not contains(widgetKey, EQUIPMENT_CLASS_FRAGMENT) then return end
+        ExecuteWithDelay(0, function()
+            ExecuteInGameThread(function()
+                completeEquipmentWidgetClose(widgetKey)
             end)
         end)
     end)

@@ -1,6 +1,6 @@
 # World Enemy Director
 
-World Enemy Director is a UE4SS Lua mod for **Echoes of Aincrad**. It can add
+World Enemy Director is a UE4SS Lua/C++ mod for **Echoes of Aincrad**. It can add
 extra enemies beside the game's natural spawns and alter their visible scale,
 material colour, health, attack, defence, movement speed, and experience value.
 
@@ -16,7 +16,9 @@ Place this directory at:
 EchoesofAincrad\Binaries\Win64\ue4ss\Mods\WorldEnemyDirector
 ```
 
-Keep `enabled.txt` in the mod root, then restart the game. When the integrated
+Keep `enabled.txt`, `Scripts`, and `dlls/main.dll` in the mod root, then restart
+the game. The native bridge is mandatory; if it cannot validate the installed
+UE4SS/reflection ABI, enemy spawning fails closed. When the integrated
 ModMenu is installed, open the game's Start Menu, choose **Mods**, and expand
 **Enemy Director**.
 
@@ -40,30 +42,46 @@ ModMenu is installed, open the game's Start Menu, choose **Mods**, and expand
 live overrides to `Scripts/runtime.lua`. Unknown keys, missing required keys,
 wrong types, out-of-range values, and malformed Lua disable all director
 operations explicitly. Existing natural mutations are rolled back and owned
-extras are destroyed when a live configuration is rejected.
+extras are returned through the game's native enemy-pool lifecycle when a live
+configuration is rejected.
 
 ## Spawn and randomisation model
 
 The director listens for `RODEnemyCharacter` construction and pool reuse. For
 each eligible natural enemy, it creates up to `SPAWN_MULTIPLIER - 1` actors
-through `GameplayStatics::BeginDeferredActorSpawnFromClass` and
-`FinishSpawningActor`. The destination is first accepted by the live navigation
+through the game's own `ARODGameState::RODSpawnActor` entry point. Lua retains
+the existing population, species, cap, radius, navigation, streaming, and queue
+policy. A C++ bridge constructs the otherwise unmarshalable
+`FRODSpawnActorOption`, including the ownership tag, level, `Prowl` initial
+state, and `IsStartBehaviorTree`, then invokes the reflected native function on
+the game thread. The destination is first accepted by the live navigation
 system and lifted above the surface for capsule placement. Creation is deferred
 while World Partition reports incomplete streaming.
+
+The bridge is bound to the exported ABI of UE4SS c838a8ac. It reads parameter
+offsets from the live `UFunction` and requires the header sizes
+`FTransform=0x60`, `FRODSpawnActorOption=0x88`, and
+`FRODSpawnActorResult=0x10` before calling `ProcessEvent`. The exact actor is
+returned as a validated `TWeakObjectPtr`; Lua claims lifecycle events by its
+resolved address, never by class or proximity.
 
 Extra enemies retain the collision profiles authored by their Blueprints. The
 director does not replace channel responses. After initialization it verifies
 that the actor has collision enabled and that its capsule has query collision,
 a named profile, and a blocking Pawn response. The same exact contract is
-audited on every director tick, every 500 ms with the shipped configuration, for
-every live owned extra. An extra that fails initially or loses collision later
-is destroyed instead of remaining in the world without working collision.
+audited every 500 ms only while admission is pending. After admission, dynamic
+combat changes belong to the game and are not reclassified as spawn failures.
+An extra that fails admission is returned to the native enemy pool.
 
-After `OnFinishedInitialize`, the director binds the automatically created AI
-controller, starts enemy AI and its behavior tree, and verifies collision before
-admitting the actor. Every extra receives the persistent
+`RODSpawnActor` performs the game's native controller, behavior-tree, minimap,
+targeting, and GameState registration path. The director does not repair an
+actor after creation. Admission requires stable collision, running AI,
+membership in `RODEnemies`, and membership in
+`ManagerEnemyGroup.EnemyList`. A rejected registration returns the actor to the
+native pool; an
+unregistered actor is never kept as a usable extra. Every extra receives the persistent
 `WorldEnemyDirectorOwned` actor tag. If a same-world teleport releases Lua
-references, the next scan removes tagged orphans instead of misclassifying them
+references, the next scan returns tagged orphans to the pool instead of misclassifying them
 as natural enemies. Natural actors remain unowned and are never destroyed by
 this ownership cleanup.
 
@@ -72,7 +90,7 @@ the active world. The mod does not synchronously load arbitrary Blueprint
 assets during streaming, because native asset loads in that phase can crash the
 process.
 
-Reducing the multiplier removes only extras above the new target. Killed extras
+Reducing the multiplier returns only extras above the new target to the pool. Killed extras
 are not recreated indefinitely. A confirmed map-travel signal immediately
 releases all outgoing-world Lua references without racing Unreal's asynchronous
 actor teardown. Processing resumes only after the matching `ClientRestart`
@@ -170,10 +188,10 @@ logging.
 Implementation contracts were checked against the public
 [`toeofcharmander/mod_template`](https://github.com/toeofcharmander/mod_template)
 headers, enemy curve tables, navigation declarations, and
-`FRODSpawnActorOption` schema for Echoes of Aincrad. The UE4SS parameter
-contract used for `FGameplayAttribute` enumeration was also checked against the
-official
+`FRODSpawnActorOption` schema for Echoes of Aincrad. The native bridge ABI and
+the UE4SS parameter contract used for `FGameplayAttribute` enumeration were
+also checked against the exact c838a8ac source and the official
 [`UE4SS-RE/RE-UE4SS`](https://github.com/UE4SS-RE/RE-UE4SS) Lua binding source
-and documentation. Every returned struct element is read once through its
+and documentation. Every returned Lua struct element is read once through its
 canonical parameter wrapper's `get()`.
 No code or assets are loaded from either repository at runtime.

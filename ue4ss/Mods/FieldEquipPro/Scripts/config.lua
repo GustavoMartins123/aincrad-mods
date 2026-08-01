@@ -25,5 +25,5 @@ return {
     -- above them; negative values do the opposite. Adjust it from the Mods menu
     -- with the screen open and you can see each step. Ignored when
     -- SHOW_CHARACTER is off, and 0 leaves the boom exactly where the game put it.
-    CAMERA_HEIGHT = 50.0,
+    CAMERA_HEIGHT = 80.0,
 }

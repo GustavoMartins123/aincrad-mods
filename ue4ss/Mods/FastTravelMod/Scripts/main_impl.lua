@@ -1600,8 +1600,9 @@ end
 local function resetNativeRows(context)
     for index = 0, context.nativeCount - 1 do
         local resetOk, resetError = pcall(function()
-            context.mainList["Item_" .. tostring(index)]
-                :SetDefaultAnimation()
+            local item = context.mainList["Item_" .. tostring(index)]
+            item:StopAllAnimations()
+            item:SetDefaultAnimation()
         end)
         if not resetOk then
             return nil, "native row " .. tostring(index) ..

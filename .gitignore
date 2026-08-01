@@ -30,6 +30,7 @@
 # Written by the in-game Mods menu. Per-machine state, not source: config.lua
 # holds the defaults worth committing, runtime.lua is whatever you last set.
 /ue4ss/Mods/*/Scripts/runtime.lua
+/ue4ss/Mods/*/Scripts/runtime.rev*
 
 # Logs and dumps produced at runtime.
 *.log

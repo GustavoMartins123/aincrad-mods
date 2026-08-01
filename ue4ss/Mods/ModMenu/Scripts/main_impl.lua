@@ -742,8 +742,49 @@ end
 --                        FOCUS                           --
 --========================================================--
 
+local function resetNativeSelection(context)
+    if context == nil or not isValid(context.mainList) then return end
+
+    local function resetItem(item)
+        if not isValid(item) then return end
+        pcall(function()
+            item:StopAllAnimations()
+            item:SetDefaultAnimation()
+        end)
+    end
+
+    for index = 0, context.nativeCount - 1 do
+        local item = nil
+        pcall(function() item = context.mainList["Item_" .. tostring(index)] end)
+        resetItem(item)
+    end
+
+    -- The authored blueprint also caches those icons in MenuIconArray. Reset
+    -- that owner list so its current animation cannot repaint a native row
+    -- after the live list item was cleared.
+    pcall(function()
+        context.mainMenu.MenuIconArray:ForEach(function(_, element)
+            resetItem(unwrap(element))
+        end)
+    end)
+
+    for index = 0, context.nativeCount - 1 do
+        pcall(function()
+            local item = context.mainList["Item_" .. tostring(index)]
+            if isValid(item) then item:SetDefaultAnimation() end
+        end)
+    end
+end
+
 local function focusIcon(context, icon, index)
     if context == nil or not isValid(icon) then return end
+    -- Keep the focus tracker aligned with injected rows as well as authored rows.
+    -- The native list never receives a custom index, but the previous focus still
+    -- needs to know that the live rail is currently on Mods when the next native
+    -- FocusEvent arrives.
+    if type(index) == "number" and context.listKey ~= nil then
+        listFocusIndexes[context.listKey] = index
+    end
     -- CurrentIndex is the cursor into the currently active authored rows, not
     -- every compiled Item_0..Item_6 slot. Equipment starts at nativeCount and
     -- Mods follows it, so neither custom index may enter the native cursor.
@@ -768,9 +809,7 @@ local function focusMods(context)
     if context == nil or not isValid(context.icon) then return end
     -- The Mods row is outside the native animation array, so selecting it cannot
     -- make the list deselect its own current row.
-    for index = 0, context.nativeCount - 1 do
-        pcall(function() context.mainList["Item_" .. tostring(index)]:SetDefaultAnimation() end)
-    end
+    resetNativeSelection(context)
     focusIcon(context, context.icon, context.modsIndex)
     enforceIconLetter(context)
 end
@@ -794,7 +833,9 @@ local function focusRowAbove(context)
     -- direction from which Mods was entered.
     for index = 0, context.nativeCount - 1 do
         pcall(function()
-            context.mainList["Item_" .. tostring(index)]:SetDefaultAnimation()
+            local item = context.mainList["Item_" .. tostring(index)]
+            item:StopAllAnimations()
+            item:SetDefaultAnimation()
         end)
     end
 
@@ -938,12 +979,28 @@ local function buildPanelNow()
     -- physical Accept press continues through native callbacks after this hook;
     -- capturing first prevents it from advancing the menu underneath.
     setNativeMenuInputEnabled(context, false)
+    -- A mouse click can open Mods without passing through focusMods. Clear the
+    -- last authored selection before the panel is shown, otherwise the native
+    -- CurrentIndex animation remains lit beside the custom Mods row.
+    resetNativeSelection(context)
 
     if not panel.open() then
         setNativeMenuInputEnabled(context, true)
         log("panel could not be opened; outer menu input was restored")
         return
     end
+
+    -- Opening the panel can make the authored menu run one last focus pass.
+    -- Clear the native cursor after that pass as well as before construction;
+    -- otherwise the old CurrentIndex animation can reappear beside Mods.
+    resetNativeSelection(context)
+    ExecuteWithDelay(100, function()
+        onGameThread(function()
+            if panel.isOpen() and activeContext == context then
+                resetNativeSelection(context)
+            end
+        end)
+    end)
 
     warnedFocusWhilePanelOpen = false
     dbg("panel opened")
