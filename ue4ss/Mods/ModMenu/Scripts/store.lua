@@ -297,6 +297,10 @@ function Store.enabledPathFor(modName)
     return Store.scriptDirFor(modName) .. "../enabled.txt"
 end
 
+function Store.enabledOffPathFor(modName)
+    return Store.scriptDirFor(modName) .. "../enabled.txt.off"
+end
+
 function Store.isModEnabled(modName)
     local path = Store.enabledPathFor(modName)
     local contents, readError = bridge.readFile(path)
@@ -307,27 +311,48 @@ function Store.isModEnabled(modName)
 end
 
 function Store.setModEnabled(modName, enabled)
-    local path = Store.enabledPathFor(modName)
+    local enabledPath = Store.enabledPathFor(modName)
+    local disabledPath = Store.enabledOffPathFor(modName)
     if type(enabled) ~= "boolean" then return false, "enabled state must be boolean" end
 
     if enabled then
-        local existing, readError = bridge.readFile(path)
+        local existingEnabled, readError = bridge.readFile(enabledPath)
         if readError ~= nil then
             return false, "enabled.txt state read failed: " .. tostring(readError)
         end
-        if existing ~= nil then return true, nil end
-        return writeFile(path, "enabled\n")
+        if existingEnabled == nil then
+            local ok, writeError = writeFile(enabledPath, "enabled\n")
+            if not ok then
+                return false, "could not create enabled.txt: " .. tostring(writeError)
+            end
+        end
+        local existingDisabled, offReadError = bridge.readFile(disabledPath)
+        if offReadError == nil and existingDisabled ~= nil then
+            os.remove(disabledPath)
+        end
+        return true, nil
     end
 
-    local existing, readError = bridge.readFile(path)
-    if readError ~= nil then
-        return false, "enabled.txt state read failed: " .. tostring(readError)
+    local existingDisabled, offReadError = bridge.readFile(disabledPath)
+    if offReadError ~= nil then
+        return false, "enabled.txt.off state read failed: " .. tostring(offReadError)
     end
-    if existing == nil then return true, nil end
+    if existingDisabled == nil then
+        local ok, writeError = writeFile(disabledPath, "disabled\n")
+        if not ok then
+            return false, "could not create enabled.txt.off: " .. tostring(writeError)
+        end
+    end
 
-    local removed, removeError = os.remove(path)
-    if removed == true then return true, nil end
-    return false, "could not remove enabled.txt: " .. tostring(removeError)
+    local existingEnabled, readError = bridge.readFile(enabledPath)
+    if readError == nil and existingEnabled ~= nil then
+        local removed, removeError = os.remove(enabledPath)
+        if not removed then
+            return false, "could not remove enabled.txt: " .. tostring(removeError)
+        end
+    end
+
+    return true, nil
 end
 
 -- Changes the launch marker and, for a mod that has a settings contract, its

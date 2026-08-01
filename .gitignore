@@ -36,3 +36,5 @@
 *.log
 /ue4ss/*.txt
 /ue4ss/Mods/**/dumps/
+
+runtime.rev

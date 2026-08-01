@@ -628,15 +628,27 @@ local function toggleBool(row)
             enabledKey = row.enabledSetting.key
         end
 
+        local nextState = not loaded
         local ok, err = store.setEnabledState(
             row.entry.mod,
             enabledKey,
-            not loaded
+            nextState
         )
         if not ok then
             log("could not switch " .. row.entry.mod .. ": " .. tostring(err))
             return false
         end
+
+        if nextState == true then
+            local scriptPath = store.scriptDirFor(row.entry.mod) .. "main.lua"
+            local loadOk, loadErr = pcall(dofile, scriptPath)
+            if loadOk then
+                log("Dynamically loaded " .. row.entry.mod .. " main.lua at runtime")
+            else
+                log("Dynamic load of " .. row.entry.mod .. " returned: " .. tostring(loadErr))
+            end
+        end
+
         buildRows()
         Panel.render()
         return true
