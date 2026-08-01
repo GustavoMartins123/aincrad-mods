@@ -680,58 +680,6 @@ namespace
             weak.object_serial_number);
     }
 
-    int native_return_to_pool(const Lua& lua)
-    {
-        if (!g_api.unreal_ready())
-        {
-            return push_result(lua, false, "UE4SS native ABI is incomplete: " + g_api.missing_symbols);
-        }
-        if (g_api.get_stack_size(&lua) != 2)
-        {
-            return push_result(lua, false, "WEDNativeReturnToPool requires exactly 2 arguments");
-        }
-
-        std::int64_t weak_index{};
-        std::int64_t weak_serial{};
-        // Consume right-to-left because each LuaMadeSimple getter removes its
-        // stack value.
-        if (!require_integer(lua, 2, weak_serial)
-            || !require_integer(lua, 1, weak_index))
-        {
-            return push_result(lua, false, "WEDNativeReturnToPool argument types are invalid");
-        }
-        if (weak_index < 0 || weak_index > std::numeric_limits<std::int32_t>::max()
-            || weak_serial <= 0 || weak_serial > std::numeric_limits<std::int32_t>::max())
-        {
-            return push_result(lua, false, "WEDNativeReturnToPool received an invalid identity");
-        }
-
-        const WeakObjectPtr weak{
-            static_cast<std::int32_t>(weak_index),
-            static_cast<std::int32_t>(weak_serial)};
-        void* actor = g_api.get_weak_object(&weak);
-        if (actor == nullptr)
-        {
-            return push_result(lua, true, "enemy is already absent from the pool lifecycle");
-        }
-
-        void* function = g_api.get_function_by_name_in_chain(actor, L"EnemyReturnToPool");
-        if (function == nullptr)
-        {
-            return push_result(lua, false, "spawned actor does not expose EnemyReturnToPool");
-        }
-        const std::uint16_t* parms_size_ref = g_api.get_parms_size(function);
-        if (parms_size_ref == nullptr || *parms_size_ref != 0)
-        {
-            return push_result(lua, false, "EnemyReturnToPool unexpectedly has parameters");
-        }
-        if (!guarded_process_event(actor, function, nullptr))
-        {
-            return push_result(lua, false, "EnemyReturnToPool raised a native exception");
-        }
-        return push_result(lua, true, "enemy returned through the native pool lifecycle");
-    }
-
     class WorldEnemyDirectorNative final : public RC::CppUserModBase
     {
       public:
@@ -750,9 +698,7 @@ namespace
             if (!g_api.lua_ready()) return;
 
             const LuaFunction spawn = &native_spawn;
-            const LuaFunction return_to_pool = &native_return_to_pool;
             const std::string spawn_name = "WEDNativeSpawn";
-            const std::string return_to_pool_name = "WEDNativeReturnToPool";
 
             std::vector<Lua*> states{&lua, &main_lua, &async_lua};
             if (hook_lua != nullptr) states.push_back(hook_lua);
@@ -769,8 +715,6 @@ namespace
                 }
                 if (duplicate) continue;
                 g_api.register_function(states[index], spawn_name, spawn);
-                g_api.register_function(
-                    states[index], return_to_pool_name, return_to_pool);
             }
         }
     };

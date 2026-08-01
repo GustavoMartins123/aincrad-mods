@@ -42,8 +42,8 @@ ModMenu is installed, open the game's Start Menu, choose **Mods**, and expand
 live overrides to `Scripts/runtime.lua`. Unknown keys, missing required keys,
 wrong types, out-of-range values, and malformed Lua disable all director
 operations explicitly. Existing natural mutations are rolled back and owned
-extras are returned through the game's native enemy-pool lifecycle when a live
-configuration is rejected.
+extras remain alive under the game's lifecycle when a live configuration is
+rejected; the director stops issuing new actors.
 
 ## Spawn and randomisation model
 
@@ -71,27 +71,30 @@ that the actor has collision enabled and that its capsule has query collision,
 a named profile, and a blocking Pawn response. The same exact contract is
 audited every 500 ms only while admission is pending. After admission, dynamic
 combat changes belong to the game and are not reclassified as spawn failures.
-An extra that fails admission is returned to the native enemy pool.
+An extra that fails admission remains unmutated and the director pauses
+fail-closed. It is never forcibly destroyed or returned to a pool.
 
 `RODSpawnActor` performs the game's native controller, behavior-tree, minimap,
 targeting, and GameState registration path. The director does not repair an
 actor after creation. Admission requires stable collision, running AI,
 membership in `RODEnemies`, and membership in
-`ManagerEnemyGroup.EnemyList`. A rejected registration returns the actor to the
-native pool; an
-unregistered actor is never kept as a usable extra. Every extra receives the persistent
+`ManagerEnemyGroup.EnemyList`. If registration is rejected, the director pauses
+and the actor remains unmutated; no lifecycle call is attempted. Every extra
+receives the persistent
 `WorldEnemyDirectorOwned` actor tag. If a same-world teleport releases Lua
-references, the next scan returns tagged orphans to the pool instead of misclassifying them
-as natural enemies. Natural actors remain unowned and are never destroyed by
-this ownership cleanup.
+references, the next scan adopts tagged orphans instead of misclassifying them
+as natural enemies. Natural actors remain unowned, and the director never ends
+the lifecycle of either category.
 
 Random species are selected only from natural enemy classes already loaded in
 the active world. The mod does not synchronously load arbitrary Blueprint
 assets during streaming, because native asset loads in that phase can crash the
 process.
 
-Reducing the multiplier returns only extras above the new target to the pool. Killed extras
-are not recreated indefinitely. A confirmed map-travel signal immediately
+Reducing the multiplier cancels only queued work that has not created an actor;
+already-issued extras stay alive and the lower cap prevents replacements until
+the population falls naturally. Killed extras are not recreated indefinitely.
+A confirmed map-travel signal immediately
 releases all outgoing-world Lua references without racing Unreal's asynchronous
 actor teardown. Processing resumes only after the matching `ClientRestart`
 signal and the fixed settlement period.

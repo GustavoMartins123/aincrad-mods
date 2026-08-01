@@ -58,9 +58,6 @@ local NAV_ATTEMPTS_PER_PASS = 1
 local NAV_MAX_ATTEMPTS = 12
 local NAV_MIN_SEPARATION_CM = 150.0
 local MAX_DISCOVERY_PER_TICK = 2
--- Pool returns execute the game's full enemy lifecycle. Bound the work so a
--- large cap/radius change cannot produce a single-frame teardown spike.
-local MAX_POOL_RETURNS_PER_TICK = 2
 -- 32 attempts, 250 ms apart: eight seconds of grace for a streaming enemy to
 -- finish initialising before it is reported as broken.
 local SNAPSHOT_RETRY_LIMIT = 32
@@ -997,8 +994,7 @@ local function resolveSpawnApi()
         navigationSystem = nav
     end
 
-    if type(WEDNativeSpawn) ~= "function"
-        or type(WEDNativeReturnToPool) ~= "function" then
+    if type(WEDNativeSpawn) ~= "function" then
         return false, "WorldEnemyDirector native C++ bridge is not loaded"
     end
 
@@ -1587,68 +1583,14 @@ local function applyMutation(state)
     return true
 end
 
-local function destroyOwned(state, reason)
-    if state.weakIndex == nil or state.weakSerial == nil then
-        log("POOL RETURN ERROR | " .. state.key ..
-            " | owned enemy has no canonical weak identity")
-        return false
-    end
-    local ok, returned, detail = pcall(
-        WEDNativeReturnToPool,
-        state.weakIndex,
-        state.weakSerial
-    )
-    if not ok or returned ~= true then
-        log("POOL RETURN ERROR | " .. state.key .. " | " ..
-            (ok and tostring(detail) or firstErrorLine(returned)))
-        return false
-    end
-    states[state.key] = nil
-    dbg("EXTRA RETURNED TO POOL | " .. state.key .. " | " .. reason)
-    return true
-end
-
--- A pending request keeps the FWeakObjectPtr identity returned by RODSpawnActor.
--- The native bridge resolves that weak identity before rollback, so a recycled
--- UObject address can never be destroyed by mistake.
-local function destroyPending(request, reason)
-    local label = request.actorKey or (request.classKey or "unclaimed ticket")
-    if request.weakIndex == nil or request.weakSerial == nil then
-        log("POOL RETURN ERROR | pending " .. label ..
-            " | request has no canonical weak identity")
-        return false
-    end
-    local ok, returned, detail = pcall(
-        WEDNativeReturnToPool,
-        request.weakIndex,
-        request.weakSerial
-    )
-    if not ok or returned ~= true then
-        log("POOL RETURN ERROR | pending " .. label .. " | " ..
-            (ok and tostring(detail) or firstErrorLine(returned)))
-        return false
-    end
-    dbg("PENDING EXTRA RETURNED TO POOL | " .. label .. " | " .. reason)
-    return true
-end
-
-local function removeOrigin(originKey, destroyActors)
+-- Once RODSpawnActor has issued an actor, only the game may end its lifecycle.
+-- Forcing EnemyReturnToPool from the director raced the render/physics threads,
+-- deleted valid enemies, and produced a dangling RHI resource. Origin removal
+-- therefore cancels only requests that have not created an actor yet.
+local function removeOrigin(originKey)
     origins[originKey] = nil
     for index = #spawnQueue, 1, -1 do
         if spawnQueue[index].originKey == originKey then table.remove(spawnQueue, index) end
-    end
-    for index = #pendingSpawns, 1, -1 do
-        if pendingSpawns[index].originKey == originKey then
-            local request = table.remove(pendingSpawns, index)
-            destroyPending(request, "origin removed")
-        end
-    end
-    if destroyActors then
-        local owned = {}
-        for _, state in pairs(states) do
-            if state.owned and state.originKey == originKey then owned[#owned + 1] = state end
-        end
-        for _, state in ipairs(owned) do destroyOwned(state, "origin removed") end
     end
 end
 
@@ -1674,31 +1616,13 @@ local function enforceGlobalCap()
         ))
     end
 
-    local destroyedThisTick = 0
-    while activeExtraCount() > CONFIG.MAX_ACTIVE_EXTRAS
-        and #pendingSpawns > 0
-        and destroyedThisTick < MAX_POOL_RETURNS_PER_TICK do
-        local request = table.remove(pendingSpawns)
-        if destroyPending(request, "global cap reduced") then
-            destroyedThisTick = destroyedThisTick + 1
-        end
-    end
-
-    if activeExtraCount() <= CONFIG.MAX_ACTIVE_EXTRAS then return end
-    local owned = {}
-    for _, state in pairs(states) do
-        if state.owned and isValid(state.object) then owned[#owned + 1] = state end
-    end
-    table.sort(owned, function(a, b)
-        if a.slot == b.slot then return a.key > b.key end
-        return a.slot > b.slot
-    end)
-    for _, state in ipairs(owned) do
-        if activeExtraCount() <= CONFIG.MAX_ACTIVE_EXTRAS
-            or destroyedThisTick >= MAX_POOL_RETURNS_PER_TICK then break end
-        if destroyOwned(state, "global cap reduced") then
-            destroyedThisTick = destroyedThisTick + 1
-        end
+    local active = activeExtraCount()
+    if active > CONFIG.MAX_ACTIVE_EXTRAS then
+        log(string.format(
+            "SPAWN CAP | %d already-issued extra(s) retained above cap=%d; no new actors will be created",
+            active,
+            CONFIG.MAX_ACTIVE_EXTRAS
+        ))
     end
 end
 
@@ -1999,21 +1923,12 @@ local function reconcileOrigin(origin)
                 table.remove(spawnQueue, index)
             end
         end
-        for index = #pendingSpawns, 1, -1 do
-            local request = pendingSpawns[index]
-            if request.originKey == origin.key and request.slot > desired then
-                table.remove(pendingSpawns, index)
-                destroyPending(request, "multiplier reduced")
-            end
-        end
-        local removals = {}
-        for _, state in pairs(states) do
-            if state.owned and state.originKey == origin.key and state.slot > desired then
-                removals[#removals + 1] = state
-            end
-        end
-        for _, state in ipairs(removals) do destroyOwned(state, "multiplier reduced") end
-        origin.issued = desired
+        dbg(string.format(
+            "SPAWN LAYOUT | origin=%s retains %d already-issued slot(s) after multiplier target changed to %d",
+            origin.key,
+            origin.issued,
+            desired
+        ))
     end
     if origin.issued >= desired then
         origin.completed = true
@@ -2022,7 +1937,7 @@ local function reconcileOrigin(origin)
     for slot = origin.issued + 1, desired do
         if not queueExtra(origin, slot) then break end
     end
-    origin.completed = true
+    origin.completed = origin.issued >= desired
 end
 
 local function addClass(classObject, classKey, physicalContract)
@@ -2192,6 +2107,7 @@ local function registerEnemy(enemy, reused, queued)
     end
 
     local request = (queued and queued.request) or takePendingSpawn(enemy, key)
+    local ownedOrphan = false
     local tagOk, ownedTag = pcall(function()
         return enemy:ActorHasTag(FName(OWNED_ACTOR_TAG))
     end)
@@ -2199,30 +2115,24 @@ local function registerEnemy(enemy, reused, queued)
         log("ENEMY ERROR | " .. key ..
             " | ownership tag contract is unreadable")
         if request ~= nil then
-            destroyPending(request, "ownership tag contract was unreadable")
+            spawnQueue = {}
+            pendingSpawns = {}
+            worldFault = "issued actor has an unreadable ownership tag: " .. key
+            log("WORLD ERROR | " .. worldFault .. " | director paused")
         end
         return
     end
     if request ~= nil and ownedTag ~= true then
-        destroyPending(request, "spawned actor lost its ownership tag")
-        log("SPAWN ERROR | " .. key ..
-            " | canonical ownership tag is absent")
+        spawnQueue = {}
+        pendingSpawns = {}
+        worldFault = "issued actor lost its canonical ownership tag: " .. key
+        log("WORLD ERROR | " .. worldFault .. " | director paused")
         return
     end
     if request == nil and ownedTag == true then
-        local returned, returnError = pcall(function()
-            enemy:EnemyReturnToPool()
-        end)
-        if not returned then
-            log("ORPHAN POOL RETURN ERROR | " .. key .. " | " ..
-                tostring(returnError))
-            disableWorld("orphan pool return rejected")
-            worldFault = "owned orphan rejected EnemyReturnToPool: " .. key
-        else
-            log("ORPHAN EXTRA RETURNED | " .. key ..
-                " | ownership survived reference quarantine")
-        end
-        return
+        ownedOrphan = true
+        dbg("ORPHAN EXTRA ADOPTED | " .. key ..
+            " | ownership survived reference quarantine")
     end
     local previous = states[key]
     if previous ~= nil and not reused then return end
@@ -2241,7 +2151,7 @@ local function registerEnemy(enemy, reused, queued)
             end
             states[key] = nil
         else
-            removeOrigin(key, true)
+            removeOrigin(key)
             states[key] = nil
         end
     end
@@ -2257,9 +2167,11 @@ local function registerEnemy(enemy, reused, queued)
         return
     end
     if request ~= nil and request.classKey ~= classKey then
-        destroyPending(request, "spawned class did not match the requested class")
-        log("SPAWN ERROR | created class " .. classKey ..
-            " does not match requested class " .. request.classKey)
+        spawnQueue = {}
+        pendingSpawns = {}
+        worldFault = "created class " .. classKey ..
+            " does not match requested class " .. request.classKey
+        log("WORLD ERROR | " .. worldFault .. " | director paused")
         return
     end
     local baseline, snapshotError = snapshotEnemy(enemy)
@@ -2278,13 +2190,19 @@ local function registerEnemy(enemy, reused, queued)
                 " retries over " ..
                 (SNAPSHOT_RETRY_LIMIT * SNAPSHOT_RETRY_BACKOFF_MS) .. " ms")
             if request ~= nil then
-                destroyPending(request, "required enemy state was unavailable")
+                spawnQueue = {}
+                pendingSpawns = {}
+                worldFault = "issued actor never exposed its required enemy state: " .. key
+                log("WORLD ERROR | " .. worldFault .. " | director paused")
             end
             return
         end
         log("ENEMY ERROR | " .. key .. " | " .. snapshotError)
         if request ~= nil then
-            destroyPending(request, "required enemy state was unavailable")
+            spawnQueue = {}
+            pendingSpawns = {}
+            worldFault = "issued actor rejected its required enemy state: " .. key
+            log("WORLD ERROR | " .. worldFault .. " | director paused")
         end
         return
     end
@@ -2299,17 +2217,13 @@ local function registerEnemy(enemy, reused, queued)
         end
     end
 
-    if request ~= nil and activeExtraCount() >= CONFIG.MAX_ACTIVE_EXTRAS then
-        destroyPending(request, "completed above the current cap")
-        return
-    end
     local state = {
         key = key,
         object = enemy,
         classObject = classObject,
         classKey = classKey,
         baseline = baseline,
-        owned = request ~= nil,
+        owned = request ~= nil or ownedOrphan,
         originKey = request and request.originKey or nil,
         slot = request and request.slot or nil,
         spawnPosition = request and request.position or nil,
@@ -2383,7 +2297,7 @@ local function cleanupInvalidStates()
             if not state.owned then invalidNatural[#invalidNatural + 1] = key end
         end
     end
-    for _, key in ipairs(invalidNatural) do removeOrigin(key, true) end
+    for _, key in ipairs(invalidNatural) do removeOrigin(key) end
 end
 
 local function expirePendingSpawns()
@@ -2392,8 +2306,8 @@ local function expirePendingSpawns()
         if request.generation ~= generation or elapsedMs >= request.expiresAtMs then
             table.remove(pendingSpawns, index)
             if request.generation == generation then
-                destroyPending(request, "initialization timeout")
-                disableWorld("native spawn initialization timeout")
+                spawnQueue = {}
+                pendingSpawns = {}
                 worldFault = string.format(
                     "native RODSpawnActor result %s did not enter the enemy lifecycle",
                     tostring(request.actorKey or request.actorAddress))
@@ -2511,7 +2425,7 @@ local function auditOwnedEnemyCollision()
         end
     end
 
-    local rejected = {}
+    local rejected = nil
     for _, state in pairs(states) do
         if state.owned and isValid(state.object) and not state.retired
             and state.admitted ~= true then
@@ -2548,7 +2462,7 @@ local function auditOwnedEnemyCollision()
                     rejectionReason = rejectionReason ..
                         " | native registry: " .. tostring(registryDetail)
                 end
-                rejected[#rejected + 1] = {
+                rejected = {
                     state = state,
                     reason = rejectionReason,
                 }
@@ -2564,11 +2478,16 @@ local function auditOwnedEnemyCollision()
         end
     end
 
-    for _, rejection in ipairs(rejected) do
-        local state = rejection.state
+    if rejected ~= nil then
+        local state = rejected.state
+        spawnQueue = {}
+        pendingSpawns = {}
+        worldFault = "spawn admission failed for " .. tostring(state.key) ..
+            ": " .. tostring(rejected.reason)
         log("SPAWN ADMISSION REJECTED | " .. tostring(state.key) .. " | " ..
-            tostring(rejection.reason) .. " | returning owned extra to pool")
-        destroyOwned(state, "owned enemy contract rejected")
+            tostring(rejected.reason) ..
+            " | actor retained; director paused without lifecycle mutation")
+        log("WORLD ERROR | " .. worldFault .. " | director paused")
     end
 end
 
@@ -2839,20 +2758,16 @@ end
 
 disableWorld = function(reason)
     spawnQueue = {}
-    for index = #pendingSpawns, 1, -1 do
-        local request = table.remove(pendingSpawns, index)
-        destroyPending(request, reason)
-    end
-    local owned = {}
+    local issued = #pendingSpawns
+    pendingSpawns = {}
     for _, state in pairs(states) do
-        if state.owned then
-            owned[#owned + 1] = state
-        else
-            restoreState(state)
-        end
+        restoreState(state)
     end
-    for _, state in ipairs(owned) do destroyOwned(state, reason) end
-    for _, origin in pairs(origins) do origin.issued = 0 end
+    dbg(string.format(
+        "DIRECTOR DISABLED | %s | retained %d already-issued actor request(s); game owns every live lifecycle",
+        tostring(reason),
+        issued
+    ))
 end
 
 -- The outgoing world is about to be destroyed. Calling K2_DestroyActor here
@@ -2961,60 +2876,9 @@ local function checkSettings(force)
     applyNewSettings(settings, digest)
 end
 
--- Distance recycling.
---
--- Origins here are actors placed in the persistent level, so they never become
--- invalid and cleanupInvalidStates never fires for them. Without this, extras
--- created in one place stay alive forever: MAX_ACTIVE_EXTRAS stays saturated by
--- enemies the player has long left behind, and no new area ever gets any.
---
--- It also bounds how many owned actors are alive when a mission ends, which is
--- when the engine's fatal world-leak check runs. That check has already been
--- seen firing on a spawned enemy's AI controller.
-
-local function recycleDistantExtras()
-    local heroLocation = resolveHeroLocation()
-    if heroLocation == nil then return false end
-
-    local limitSquared = CONFIG.DESPAWN_RADIUS * CONFIG.DESPAWN_RADIUS
-    local distant = {}
-    for _, state in pairs(states) do
-        -- Retired extras are corpses mid-despawn; the game removes them.
-        if state.owned and not state.retired then
-            local location = isValid(state.object) and actorLocation(state.object)
-                or state.spawnPosition
-            if location ~= nil
-                and planarDistanceSquared(location, heroLocation) > limitSquared then
-                distant[#distant + 1] = state
-            end
-        end
-    end
-
-    local released = 0
-    for _, state in ipairs(distant) do
-        if released >= MAX_POOL_RETURNS_PER_TICK then break end
-        local originKey = state.originKey
-        if destroyOwned(state, "player left the area") then
-            released = released + 1
-            -- The slot is handed back so the same origin can re-issue it if the
-            -- player returns, instead of the origin being permanently spent.
-            local origin = originKey ~= nil and origins[originKey] or nil
-            if origin ~= nil and origin.issued > 0 then
-                origin.issued = origin.issued - 1
-            end
-        end
-    end
-    if released > 0 then
-        dbg(string.format(
-            "RECYCLE | released %d extra(s), %d remain beyond %.0f cm",
-            released, #distant - released, CONFIG.DESPAWN_RADIUS))
-    end
-    return released > 0
-end
-
--- Origins are only reconciled when their natural enemy is rediscovered, and a
--- persistent-level enemy is discovered once per world. After recycling frees
--- slots, the origins near the player have to be revisited or nothing refills.
+-- Persistent origins that were outside the configured radius remain pending.
+-- The sweep may issue them after the player approaches, but it never revokes a
+-- live actor: death, despawn, pooling, and world teardown belong to the game.
 local function reconcileNearbyOrigins()
     local heroLocation = resolveHeroLocation()
     if heroLocation == nil then return end
@@ -3151,12 +3015,7 @@ local function tick(stepMs)
     expirePendingSpawns()
     auditOwnedEnemyCollision()
     if not discoveryBatch then
-        -- reconcileNearbyOrigins is O(origins x states); running it every tick
-        -- alongside recycling was the other half of the stutter. It only has
-        -- anything to do after a slot is freed, so it runs then, or on a slow
-        -- cadence to pick up an origin that came into range on its own.
-        local freed = recycleDistantExtras()
-        if freed or elapsedMs >= nextOriginSweepMs then
+        if elapsedMs >= nextOriginSweepMs then
             nextOriginSweepMs = elapsedMs + ORIGIN_SWEEP_MS
             reconcileNearbyOrigins()
         end
