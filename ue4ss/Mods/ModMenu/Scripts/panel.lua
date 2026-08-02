@@ -68,6 +68,15 @@ local scrollOffset = 0
 local rows = {}
 local isOpen = false
 
+-- GaugeNumbers owns the native HUD preview. ModMenu only publishes the
+-- transient lease that tells it when that mod's settings are actually open.
+-- The lease is refreshed while the panel remains open so a crashed menu cannot
+-- leave the world HUD forced visible on the next frame.
+local GAUGE_PREVIEW_MOD = "GaugeNumbers"
+local PREVIEW_HEARTBEAT_MS = 750
+local previewHeartbeatScheduled = false
+local lastPreviewError = nil
+
 local function isValid(object)
     if object == nil then return false end
     local ok, valid = pcall(function() return object:IsValid() end)
@@ -86,6 +95,48 @@ function Panel.init(dependencies)
     log = dependencies.log or log
     resolveController = dependencies.resolveController or resolveController
     resolveUmgLibrary = dependencies.resolveUmgLibrary or resolveUmgLibrary
+end
+
+local function publishGaugePreview(active)
+    local called, written, writeError = pcall(function()
+        return store.setPreview(GAUGE_PREVIEW_MOD, active)
+    end)
+    if not called then
+        writeError = written
+        written = false
+    end
+    if written ~= true then
+        local message = tostring(writeError or "preview state publication failed")
+        if lastPreviewError ~= message then
+            lastPreviewError = message
+            log("GaugeNumbers preview unavailable: " .. message)
+        end
+        return false
+    end
+    lastPreviewError = nil
+    return true
+end
+
+local function scheduleGaugePreviewHeartbeat()
+    if not isOpen or expandedMod ~= GAUGE_PREVIEW_MOD
+        or previewHeartbeatScheduled then
+        return
+    end
+    previewHeartbeatScheduled = true
+    local scheduled, scheduleError = pcall(function()
+        ExecuteWithDelay(PREVIEW_HEARTBEAT_MS, function()
+            previewHeartbeatScheduled = false
+            if isOpen and expandedMod == GAUGE_PREVIEW_MOD then
+                publishGaugePreview(true)
+                scheduleGaugePreviewHeartbeat()
+            end
+        end)
+    end)
+    if not scheduled then
+        previewHeartbeatScheduled = false
+        log("GaugeNumbers preview heartbeat could not be scheduled: " ..
+            tostring(scheduleError))
+    end
 end
 
 -- The panel draws into the start menu that is already on screen.
@@ -701,11 +752,13 @@ function Panel.activate()
         end
 
         local opening = expandedMod ~= row.entry.mod
-        if opening then
-            expandedMod = row.entry.mod
-        else
-            expandedMod = nil
+        local nextExpanded = opening and row.entry.mod or nil
+        if nextExpanded ~= expandedMod then
+            if not publishGaugePreview(nextExpanded == GAUGE_PREVIEW_MOD) then
+                return
+            end
         end
+        expandedMod = nextExpanded
         buildRows()
         -- Opening lands on the first actual setting. Keeping the cursor on the
         -- header made the next Left/Right press disable the whole mod when the
@@ -729,6 +782,7 @@ function Panel.activate()
         end
         ensureSelectionVisible()
         Panel.render()
+        scheduleGaugePreviewHeartbeat()
         return
     end
 
@@ -768,6 +822,7 @@ function Panel.open()
 end
 
 function Panel.close()
+    publishGaugePreview(false)
     isOpen = false
     destroyPanel()
     expandedMod = nil

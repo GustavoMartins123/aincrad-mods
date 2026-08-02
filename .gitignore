@@ -31,6 +31,7 @@
 # holds the defaults worth committing, runtime.lua is whatever you last set.
 /ue4ss/Mods/*/Scripts/runtime.lua
 /ue4ss/Mods/*/Scripts/runtime.rev*
+/ue4ss/Mods/*/Scripts/preview.lua*
 
 # Logs and dumps produced at runtime.
 *.log

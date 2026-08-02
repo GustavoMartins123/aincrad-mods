@@ -182,6 +182,13 @@ end
 store.init(SCRIPT_DIR, bridge)
 
 do
+    local cleared, clearError = store.clearPreview("GaugeNumbers")
+    if not cleared then
+        log("GaugeNumbers preview cleanup failed: " .. tostring(clearError))
+    end
+end
+
+do
     local ok, external = pcall(function() return dofile(SCRIPT_DIR .. "config.lua") end)
     if not ok then error("config.lua load failed: " .. tostring(external)) end
     if type(external) ~= "table" then error("config.lua must return a table") end

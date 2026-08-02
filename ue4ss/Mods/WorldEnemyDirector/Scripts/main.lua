@@ -43,7 +43,6 @@ local SPAWN_INITIALIZE_MS = 8000
 -- collision check; this was in the mod originally and its removal is what
 -- silently stopped multiplication.
 local SPAWN_Z_OFFSET_CM = 40.0
-local OWNED_ACTOR_TAG = "WorldEnemyDirectorOwned"
 -- Requests allowed to expire unmatched, in a row, before multiplication is
 -- declared non-functional for this session.
 -- How often origins near the hero are revisited when nothing was freed.
@@ -52,6 +51,10 @@ local ORIGIN_SWEEP_MS = 3000
 -- check. Re-validate every owned actor after activation so an actor cannot stay
 -- in the world after losing its physical Pawn collision.
 local COLLISION_AUDIT_MS = 500
+-- Distance bands are re-scanned faster than the audit runs because a sprinting
+-- player crosses a band edge quickly. The scan is native and reports only
+-- changes, so a short interval costs almost nothing when nothing moved bands.
+local BAND_SCAN_MS = 250
 local OWNED_ADMISSION_SAMPLES_REQUIRED = 3
 local OWNED_ADMISSION_TIMEOUT_MS = 4000
 local NAV_ATTEMPTS_PER_PASS = 1
@@ -146,6 +149,10 @@ local SCHEMA = {
         { kind = "number", minimum = 0.0, maximum = 10.0 },
     POLL_MS = { kind = "number", minimum = 100, maximum = 2000, integer = true },
     DESPAWN_RADIUS = { kind = "number", minimum = 1500.0, maximum = 30000.0 },
+    COMBAT_RADIUS = { kind = "number", minimum = 1000.0, maximum = 30000.0 },
+    LOD_ENABLED = { kind = "boolean" },
+    LOD_DORMANT_TICK_S = { kind = "number", minimum = 0.0, maximum = 5.0 },
+    LOD_HYSTERESIS_CM = { kind = "number", minimum = 0.0, maximum = 5000.0 },
     SPAWN_IN_EMPTY_AREAS = { kind = "boolean" },
     DEBUG_LOGS = { kind = "boolean" },
 }
@@ -609,6 +616,17 @@ do
                 actual.radius,
                 actual.halfHeight)
         end
+        -- Channel responses are compared on every capsule, including the extra
+        -- per-body-part hitboxes.
+        --
+        -- These were briefly excluded on the theory that the game re-profiles
+        -- them at runtime and the mismatch was harmless. It is not harmless.
+        -- The extras are what the player's attack traces hit, and one of the
+        -- observed differences was an extra dropping a trace channel from
+        -- Overlap to Ignore -- an enemy that is physically there but that
+        -- attacks pass through. Excluding the comparison did not fix those
+        -- enemies, it only stopped reporting them, and the director then kept
+        -- producing more of them.
         for _, field in ipairs(PHYSICAL_COLLISION_FIELDS) do
             if actual.responses[field] ~= expected.responses[field] then
                 note("channel " .. field .. " response",
@@ -821,7 +839,27 @@ local worldPaused = true
 local resumeAtMs = STARTUP_SETTLE_MS
 local rescanRequested = false
 local worldFault = nil
+-- A world fault used to be permanent: one rejected spawn stopped multiplication
+-- for the rest of the session, and the only way back was a world transition.
+-- A single bad actor is not evidence that the next one is bad, so a fault now
+-- stops the work, waits, and lets the director try again. Repeated faults back
+-- off so a genuinely broken world reports itself instead of looping.
+local WORLD_FAULT_RETRY_MS = 15000
+local WORLD_FAULT_RETRY_CEILING_MS = 120000
+local worldFaultRetryMs = WORLD_FAULT_RETRY_MS
+local worldFaultResumeAtMs = nil
 local awaitingTravelRestart = false
+
+local function recordWorldFault(reason)
+    spawnQueue = {}
+    pendingSpawns = {}
+    worldFault = reason
+    worldFaultResumeAtMs = elapsedMs + worldFaultRetryMs
+    log(string.format(
+        "WORLD ERROR | %s | spawning paused, retrying in %ds",
+        tostring(reason),
+        math.floor(worldFaultRetryMs / 1000)))
+end
 
 local materialLibrary = nil
 local materialInterface = nil
@@ -832,6 +870,8 @@ local cachedHero = nil
 local nativeContractReported = false
 local nextOriginSweepMs = 0
 local nextCollisionAuditMs = 0
+local nextBandScanMs = 0
+local bandScanFaultReported = false
 local SPAWN_PACING_MS = 350
 local lastSpawnMs = 0
 local AMBIENT_CHECK_INTERVAL_MS = 4000
@@ -872,6 +912,8 @@ local function clearWorldReferences()
     discoveryBatch = false
     discoveryReadyAtMs = nil
     worldFault = nil
+    worldFaultResumeAtMs = nil
+    worldFaultRetryMs = WORLD_FAULT_RETRY_MS
     navigationSystem = nil
     gameplayStatics = nil
     worldPartitionSubsystem = nil
@@ -879,6 +921,10 @@ local function clearWorldReferences()
     cachedHero = nil
     nextOriginSweepMs = 0
     nextCollisionAuditMs = 0
+    -- Band state lives on the states table, which is being dropped with the
+    -- world; the native side re-classifies every surviving identity from
+    -- scratch on the next scan.
+    nextBandScanMs = 0
     lastSpawnMs = 0
     nextAmbientCheckMs = 0
     ambientCounter = 0
@@ -1107,7 +1153,8 @@ local function resolveSpawnApi()
         gameplayStatics = library
     end
 
-    if type(WEDNativeTrackOwnedEnemy) ~= "function"
+    if type(WEDNativeIdentifyOwnedEnemy) ~= "function"
+        or type(WEDNativeTrackOwnedEnemy) ~= "function"
         or type(WEDNativeRegisterEnemy) ~= "function"
         or type(WEDNativeReleaseOwnedWorld) ~= "function" then
         return false,
@@ -2259,26 +2306,32 @@ local function registerEnemy(enemy, reused, queued)
     end
 
     local request = (queued and queued.request) or takePendingSpawn(enemy, key)
+    -- Ownership comes from the native weak-identity registry, which is the
+    -- same record the spawn path wrote. Nothing is stored on the actor.
     local ownedOrphan = false
-    local tagOk, ownedTag = pcall(function()
-        return enemy:ActorHasTag(FName(OWNED_ACTOR_TAG))
+    local identifyOk, identified, identifyDetail, ownedFlag = pcall(function()
+        return WEDNativeIdentifyOwnedEnemy(enemy:GetAddress())
     end)
-    if not tagOk or type(ownedTag) ~= "boolean" then
-        log("ENEMY ERROR | " .. key ..
-            " | ownership tag contract is unreadable")
+    local ownedTag = nil
+    if identifyOk and identified == true and (ownedFlag == 0 or ownedFlag == 1) then
+        ownedTag = ownedFlag == 1
+    end
+    if ownedTag == nil then
+        -- An unreadable identity is only a problem for an actor this mod just
+        -- issued. For anything else it simply means "not ours", which is the
+        -- safe reading, and the enemy is left entirely to the game.
         if request ~= nil then
-            spawnQueue = {}
-            pendingSpawns = {}
-            worldFault = "issued actor has an unreadable ownership tag: " .. key
-            log("WORLD ERROR | " .. worldFault .. " | director paused")
+            recordWorldFault(
+                "issued actor has no readable native identity: " .. key ..
+                " | " .. (identifyOk and tostring(identifyDetail)
+                    or firstErrorLine(identified)))
+        else
+            dbg("ENEMY IDENTITY UNREADABLE | " .. key .. " | treated as not owned")
         end
         return
     end
     if request ~= nil and ownedTag ~= true then
-        spawnQueue = {}
-        pendingSpawns = {}
-        worldFault = "issued actor lost its canonical ownership tag: " .. key
-        log("WORLD ERROR | " .. worldFault .. " | director paused")
+        recordWorldFault("issued actor lost its native weak identity: " .. key)
         return
     end
     if request == nil and ownedTag == true then
@@ -2396,11 +2449,15 @@ local function registerEnemy(enemy, reused, queued)
     -- controller and behavior tree.
     if state.owned then
         if activateSpawnedEnemy(enemy, key, state.spawnPosition) ~= true then
-            spawnQueue = {}
-            pendingSpawns = {}
-            worldFault = "direct spawn activation failed for " .. tostring(key)
-            log("WORLD ERROR | " .. worldFault ..
-                " | actor retained; director paused")
+            -- One actor that could not be activated is quarantined and left to
+            -- the game, exactly like one that fails admission. It is never
+            -- destroyed, never mutated, and does not hold a slot under the cap.
+            -- Stopping the whole director for it meant a single bad actor
+            -- ended multiplication for the session.
+            state.quarantined = true
+            if type(key) == "string" then quarantinedActorKeys[key] = true end
+            log("SPAWN ACTIVATION QUARANTINED | " .. tostring(key) ..
+                " | extra left to the game; director continues")
             return
         end
     end
@@ -2509,6 +2566,26 @@ activateSpawnedEnemy = function(enemy, key, spawnPosition)
         log("SPAWN ACTIVATION ERROR | " .. tostring(key) ..
             " | same-class natural collision contract is unavailable")
         return false
+    end
+
+    -- Hand collision setup back to the game before the enemy starts acting.
+    --
+    -- A deferred GameplayStatics spawn produces the components but never runs
+    -- the enemy's own collision setup, which is why extras could arrive with
+    -- their per-body-part hitboxes on the wrong channels -- physically present
+    -- but with attacks passing through them. SetCollisonEnableCpp is the
+    -- game's own entry point for exactly this, so the authored responses come
+    -- from the game rather than being reconstructed here.
+    --
+    -- Best-effort on purpose: the admission contract is still the gate that
+    -- decides whether the extra is acceptable, so a failure here is reported
+    -- and left for that contract to catch rather than failing activation.
+    local collisionOk, collisionError = pcall(function()
+        enemy:SetCollisonEnableCpp(true, false)
+    end)
+    if not collisionOk then
+        dbg("SPAWN COLLISION SETUP | " .. tostring(key) .. " | " ..
+            firstErrorLine(collisionError))
     end
 
     local controller = nil
@@ -2651,7 +2728,7 @@ local function auditOwnedEnemyCollision()
     local auditStartTime = os.clock()
     for _, state in pairs(states) do
         if state.owned and isValid(state.object) and not state.retired
-            and state.admitted ~= true then
+            and state.quarantined ~= true and state.admitted ~= true then
             local physical, physicalDetail =
                 enemyContracts.comparePhysical(
                     state.object,
@@ -2668,6 +2745,9 @@ local function auditOwnedEnemyCollision()
                     if state.admissionStableSamples
                         >= OWNED_ADMISSION_SAMPLES_REQUIRED then
                         state.admitted = true
+                        -- A spawn that reached admission proves the pipeline
+                        -- works, so the retry delay goes back to its floor.
+                        worldFaultRetryMs = WORLD_FAULT_RETRY_MS
                         log("SPAWN ADMITTED | " .. tostring(state.key) ..
                             " | " .. tostring(physicalDetail) ..
                             " | controller=" .. tostring(controlDetail) ..
@@ -2702,15 +2782,20 @@ local function auditOwnedEnemyCollision()
         end
     end
 
+    -- One extra failing its contract says something about that extra, not about
+    -- the world. It is quarantined and left entirely to the game -- never
+    -- mutated, never destroyed -- and the director carries on with the rest.
+    -- This used to stop multiplication for the whole session.
     if rejected ~= nil then
         local state = rejected.state
-        spawnQueue = {}
-        worldFault = "spawn admission failed for " .. tostring(state.key) ..
-            ": " .. tostring(rejected.reason)
+        state.quarantined = true
+        state.admitted = false
+        if type(state.key) == "string" then
+            quarantinedActorKeys[state.key] = true
+        end
         log("SPAWN ADMISSION REJECTED | " .. tostring(state.key) .. " | " ..
             tostring(rejected.reason) ..
-            " | actor retained; director paused without lifecycle mutation")
-        log("WORLD ERROR | " .. worldFault .. " | director paused")
+            " | extra quarantined and left to the game; director continues")
     end
 end
 
@@ -2920,15 +3005,11 @@ local function processSpawnRequest()
         pendingSpawns[#pendingSpawns + 1] = request
         insertedPending = true
 
-        local tags = spawned.Tags
-        if tags == nil then error("deferred actor Tags array is unavailable") end
-        if spawned:ActorHasTag(FName(OWNED_ACTOR_TAG)) ~= true then
-            tags[#tags + 1] = FName(OWNED_ACTOR_TAG)
-        end
-        if spawned:ActorHasTag(FName(OWNED_ACTOR_TAG)) ~= true then
-            error("deferred actor ownership tag did not persist")
-        end
-
+        -- Ownership is recorded natively, by weak identity, before the actor is
+        -- finished. It used to be written onto the actor as an FName in its
+        -- Tags array, but appending to a native TArray from Lua corrupts the
+        -- array instead of appending to it, so the tag never read back and
+        -- every spawn failed its own ownership check.
         local finished = gameplayStatics:FinishSpawningActor(
             spawned,
             transform,
@@ -2940,9 +3021,6 @@ local function processSpawnRequest()
         if objectKey(finished) ~= request.actorKey
             or finished:GetAddress() ~= request.actorAddress then
             error("FinishSpawningActor returned a different actor")
-        end
-        if finished:ActorHasTag(FName(OWNED_ACTOR_TAG)) ~= true then
-            error("ownership tag did not survive FinishSpawningActor")
         end
         request.object = finished
         finished:SetEnemyLevel(request.level, false)
@@ -3182,6 +3260,196 @@ local function reconcileNearbyOrigins()
     end
 end
 
+-- Distance banding.
+--
+-- An enemy that is far away still costs an AI controller, a running behaviour
+-- tree, perception, movement and a full ability system. Unreal's visual culling
+-- removes none of that, so a multiplied population keeps paying for every extra
+-- it has ever created no matter where the player is. This puts distant extras
+-- to sleep and wakes them when the player returns.
+--
+-- The scan itself is native: reading a position through reflection costs one
+-- Lua boundary crossing per enemy, and the native side reads it directly and
+-- reports only the extras whose band actually changed. In steady state there
+-- are no transitions and this costs a single call.
+--
+-- Everything here is best-effort by design. Banding is an optimisation, not a
+-- correctness contract, so a failure downgrades that one enemy to full
+-- simulation and is never allowed to set worldFault: a performance feature must
+-- not be able to stop enemy multiplication.
+local enemyLod = {}
+do
+local ZONE_ACTIVE = 1
+local ZONE_DORMANT = 2
+
+-- There is no release tier yet: everything past the combat radius is simply
+-- asleep, and the scan's outer edge has nothing to separate. Passing an edge
+-- no actor can reach keeps the band ordered for the native contract without
+-- borrowing DESPAWN_RADIUS, which means something else entirely -- it gates
+-- which spawns are issued. Coupling the two would let a saved menu value for
+-- one silently change the other.
+local BAND_NO_RELEASE_CM = 1.0e9
+
+local function lodAvailable()
+    return CONFIG ~= nil
+        and CONFIG.LOD_ENABLED
+        and type(WEDNativeScanOwnedEnemies) == "function"
+        and type(WEDNativeNextZoneTransition) == "function"
+end
+
+-- An extra is only ever put to sleep when every one of these says it is safe.
+-- Each unreadable answer counts as "not safe": the enemy stays fully simulated.
+local function extraMaySleep(state)
+    if state.admitted ~= true or state.retired then return false end
+    local enemy = state.object
+    if not isValid(enemy) then return false end
+    if enemyIsDead(enemy) ~= false then return false end
+
+    local targetOk, target = pcall(function() return enemy.TargetHeroCharacter end)
+    if not targetOk or isValid(target) then return false end
+
+    local renderedOk, rendered = pcall(function()
+        return enemy:WasRecentlyRendered(0.5)
+    end)
+    if not renderedOk or rendered ~= false then return false end
+
+    return true
+end
+
+local function enemyBrainComponent(enemy)
+    local ok, brain = pcall(function()
+        local controller = enemy:GetController()
+        if not isValid(controller) then return nil end
+        return controller.BrainComponent
+    end)
+    if not ok or not isValid(brain) then return nil end
+    return brain
+end
+
+-- The movement component is slowed rather than switched off. A disabled
+-- movement tick can leave a character parked in whatever mid-air state it was
+-- in, and the saving from the interval is nearly the same.
+local function applyTickInterval(state, interval)
+    local enemy = state.object
+    if state.lodOriginalTickInterval == nil then
+        local ok, original = pcall(function() return enemy:GetActorTickInterval() end)
+        state.lodOriginalTickInterval = (ok and finiteNumber(original)) and original or 0.0
+    end
+    pcall(function() enemy:SetActorTickInterval(interval) end)
+    pcall(function()
+        local movement = enemy.EnemyMovementComponent
+        if isValid(movement) then movement:SetComponentTickInterval(interval) end
+    end)
+end
+
+local function sleepExtra(state)
+    local brain = enemyBrainComponent(state.object)
+    if brain == nil then return false, "behaviour tree is unreachable" end
+    local stopped = pcall(function()
+        brain:StopLogic("WorldEnemyDirector distance band")
+    end)
+    if not stopped then return false, "StopLogic was rejected" end
+    applyTickInterval(state, CONFIG.LOD_DORMANT_TICK_S)
+    state.lodZone = ZONE_DORMANT
+    return true, nil
+end
+
+local function wakeExtra(state)
+    local restored = true
+    local brain = enemyBrainComponent(state.object)
+    if brain ~= nil then
+        restored = pcall(function() brain:RestartLogic() end)
+    else
+        restored = false
+    end
+    applyTickInterval(state, state.lodOriginalTickInterval or 0.0)
+    state.lodZone = ZONE_ACTIVE
+    if not restored then return false, "RestartLogic was rejected" end
+    return true, nil
+end
+
+-- A woken enemy whose behaviour tree refused to restart would stand inert and
+-- read as a broken extra, so that single failure is reported loudly even though
+-- it never pauses the director.
+local function applyZoneTransition(state, newZone)
+    -- Anything past the sleep band is also asleep. The furthest band exists so
+    -- that releasing the actor entirely can be added later; until then the
+    -- correct treatment for "even further away" is emphatically not to wake it.
+    if newZone ~= ZONE_ACTIVE then
+        if state.lodZone == ZONE_DORMANT then return end
+        if not extraMaySleep(state) then return end
+        local ok, reason = sleepExtra(state)
+        if ok then
+            dbg("LOD SLEEP | " .. tostring(state.key))
+        else
+            state.lodUnavailable = true
+            dbg("LOD SKIPPED | " .. tostring(state.key) .. " | " .. tostring(reason))
+        end
+        return
+    end
+
+    if state.lodZone ~= ZONE_DORMANT then
+        state.lodZone = ZONE_ACTIVE
+        return
+    end
+    local ok, reason = wakeExtra(state)
+    if ok then
+        dbg("LOD WAKE | " .. tostring(state.key))
+    else
+        state.lodUnavailable = true
+        log("LOD WAKE FAILED | " .. tostring(state.key) .. " | " ..
+            tostring(reason) .. " | extra may stand inert until it is re-engaged")
+    end
+end
+
+function enemyLod.update()
+    if not lodAvailable() then return end
+    if worldPaused or worldFault ~= nil then return end
+    if elapsedMs < nextBandScanMs then return end
+    nextBandScanMs = elapsedMs + BAND_SCAN_MS
+
+    local heroLocation = resolveHeroLocation()
+    if heroLocation == nil then return end
+
+    local scanOk, scanned, detail, transitionCount = pcall(
+        WEDNativeScanOwnedEnemies,
+        heroLocation.X,
+        heroLocation.Y,
+        CONFIG.COMBAT_RADIUS,
+        BAND_NO_RELEASE_CM,
+        CONFIG.LOD_HYSTERESIS_CM)
+    if not scanOk or scanned ~= true then
+        if not bandScanFaultReported then
+            bandScanFaultReported = true
+            log("LOD UNAVAILABLE | native band scan failed: " ..
+                (scanOk and tostring(detail) or firstErrorLine(scanned)) ..
+                " | extras stay fully simulated")
+        end
+        return
+    end
+    if not finiteNumber(transitionCount) or transitionCount <= 0 then return end
+
+    -- Only built when something actually changed band, which is the whole
+    -- reason the native side reports transitions instead of positions.
+    local byAddress = {}
+    for _, state in pairs(states) do
+        if state.owned and isValid(state.object) then
+            local ok, address = pcall(function() return state.object:GetAddress() end)
+            if ok and address ~= nil then byAddress[address] = state end
+        end
+    end
+
+    for _ = 1, transitionCount do
+        local ok, popped, _, address, newZone = pcall(WEDNativeNextZoneTransition)
+        if not ok or popped ~= true or not finiteNumber(address) or address == 0 then
+            break
+        end
+        local state = byAddress[address]
+        if state ~= nil then applyZoneTransition(state, newZone) end
+    end
+end
+end
+
 local function checkAmbientEmptyAreaSpawns()
     if CONFIG == nil or not CONFIG.ENABLED or not CONFIG.SPAWN_IN_EMPTY_AREAS then return end
     if worldPaused or worldFault ~= nil then return end
@@ -3216,9 +3484,21 @@ local function checkAmbientEmptyAreaSpawns()
 
     if nearbyEnemies > 0 then return end
 
-    local chosenClassKey = classOrder[math.random(1, #classOrder)]
-    local classInfo = classCatalog[chosenClassKey]
-    if classInfo == nil or not isValid(classInfo.classObject) then return end
+    -- The catalog is filtered through the same predicate every other spawn
+    -- path uses. Drawing straight out of classOrder only checked that the
+    -- class object was valid, so this path could issue a class whose natural
+    -- collision contract was never captured -- which then failed activation
+    -- with "same-class natural collision contract is unavailable" -- and could
+    -- equally have spawned a boss-protected class that every other path
+    -- refuses.
+    local eligible = {}
+    for _, classKey in ipairs(classOrder) do
+        local entry = classCatalog[classKey]
+        if classEntryIsSpawnable(entry) then eligible[#eligible + 1] = entry end
+    end
+    if #eligible == 0 then return end
+    local classInfo = eligible[math.random(1, #eligible)]
+    local chosenClassKey = classInfo.classKey
 
     local angle = math.random() * math.pi * 2.0
     local dist = AMBIENT_SPAWN_MIN_DIST_CM + math.random() * (AMBIENT_SPAWN_MAX_DIST_CM - AMBIENT_SPAWN_MIN_DIST_CM)
@@ -3297,7 +3577,24 @@ local function tick(stepMs)
             return
         end
     end
-    if worldFault ~= nil then return end
+    -- Recovery is handled here rather than at each fault site so that every
+    -- way of raising a fault, including the ones that only assign worldFault
+    -- directly, becomes recoverable.
+    if worldFault ~= nil then
+        if worldFaultResumeAtMs == nil then
+            worldFaultResumeAtMs = elapsedMs + worldFaultRetryMs
+        elseif elapsedMs >= worldFaultResumeAtMs then
+            log("WORLD RETRY | resuming after: " .. tostring(worldFault))
+            worldFault = nil
+            worldFaultResumeAtMs = nil
+            -- Back off, so a world that faults every attempt stops flooding
+            -- the log while a one-off recovers at full speed once it succeeds.
+            worldFaultRetryMs = math.min(
+                worldFaultRetryMs * 2, WORLD_FAULT_RETRY_CEILING_MS)
+            rescanRequested = true
+        end
+        if worldFault ~= nil then return end
+    end
     if not configHealthy or not CONFIG.ENABLED then
         expirePendingSpawns()
         objectQueue = {}
@@ -3308,6 +3605,7 @@ local function tick(stepMs)
     expirePendingSpawns()
     auditOwnedEnemyCollision()
     if worldFault ~= nil then return end
+    enemyLod.update()
     if not discoveryBatch then
         if elapsedMs >= nextOriginSweepMs then
             nextOriginSweepMs = elapsedMs + ORIGIN_SWEEP_MS

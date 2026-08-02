@@ -48,7 +48,8 @@ ue4ss\Mods\GaugeNumbers\Scripts\main.lua
 
 Fully restart the game after installing or updating the mod.
 
-Do not include `runtime.lua`, `runtime.lua.*` or `runtime.rev` when redistributing the mod.
+Do not include `runtime.lua`, `runtime.lua.*`, `runtime.rev` or the transient
+`preview.lua*` files when redistributing the mod.
 
 ## Main Features
 
@@ -64,6 +65,8 @@ Do not include `runtime.lua`, `runtime.lua.*` or `runtime.rev` when redistributi
 - Falls back to a simple flat experience bar when the native gauge cannot be created safely.
 - Allows the experience display to be anchored to HP, Stamina or SP.
 - Supports live configuration through the optional in-game Mod Menu.
+- Shows the game's native player gauges temporarily while Gauge Numbers is
+  expanded in that menu, then restores their previous visibility.
 - Works without the Mod Menu through `Scripts\config.lua`.
 
 ## Usage

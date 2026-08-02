@@ -119,6 +119,26 @@ namespace
     constexpr int kObjectArraySize = 0x10;
     constexpr std::uint32_t kInternalFlagAsync = 0x04000000;
 
+    // Distance-band scanning reads the actor position directly instead of
+    // crossing the Lua boundary once per enemy. AActor::RootComponent and
+    // USceneComponent::RelativeLocation come from the generated ROD/Engine
+    // headers for this build; every offset is still re-verified through live
+    // reflection before a single byte is read, exactly like the registry
+    // injection path does.
+    //
+    // RelativeLocation is 0x18 wide because UE5 large-world coordinates make
+    // FVector three doubles, not three floats. Reading it as float silently
+    // yields garbage, so the size check below is load-bearing.
+    constexpr int kRootComponentOffset = 0x1A0;
+    constexpr int kAttachParentOffset = 0xB0;
+    constexpr int kRelativeLocationOffset = 0x128;
+    constexpr int kVectorSize = 0x18;
+
+    constexpr std::int32_t kZoneUnknown = 0;
+    constexpr std::int32_t kZoneActive = 1;
+    constexpr std::int32_t kZoneDormant = 2;
+    constexpr std::int32_t kZoneReleased = 3;
+
     struct WeakObjectPtr
     {
         std::int32_t object_index{-1};
@@ -126,6 +146,21 @@ namespace
     };
 
     static_assert(sizeof(WeakObjectPtr) == 0x8);
+
+    // The band an owned actor was last classified into travels with its weak
+    // identity so a scan can report only the actors that actually changed band.
+    struct OwnedActor
+    {
+        WeakObjectPtr weak{};
+        std::int32_t zone{kZoneUnknown};
+    };
+
+    struct ZoneTransition
+    {
+        std::int64_t actor_address{};
+        std::int32_t new_zone{kZoneUnknown};
+        std::int32_t old_zone{kZoneUnknown};
+    };
 
     struct ObjectArray
     {
@@ -267,7 +302,9 @@ namespace
     };
 
     Api g_api{};
-    std::vector<WeakObjectPtr> g_owned_actors{};
+    std::vector<OwnedActor> g_owned_actors{};
+    std::vector<ZoneTransition> g_zone_transitions{};
+    bool g_location_layout_verified{false};
 
     int push_result(
         const Lua& lua,
@@ -302,6 +339,18 @@ namespace
         }
         value = static_cast<std::int64_t>(number);
         return true;
+    }
+
+    bool require_number(const Lua& lua, int index, double& value)
+    {
+        if (g_api.is_number(&lua, index))
+        {
+            value = g_api.get_number(&lua, index);
+            return std::isfinite(value);
+        }
+        if (!g_api.is_integer(&lua, index)) return false;
+        value = static_cast<double>(g_api.get_integer(&lua, index));
+        return std::isfinite(value);
     }
 
     bool guarded_get_weak_object(const WeakObjectPtr& weak, void*& actor)
@@ -494,9 +543,9 @@ namespace
         return std::any_of(
             g_owned_actors.begin(),
             g_owned_actors.end(),
-            [&weak](const WeakObjectPtr& tracked) {
-                return tracked.object_index == weak.object_index
-                    && tracked.object_serial_number == weak.object_serial_number;
+            [&weak](const OwnedActor& tracked) {
+                return tracked.weak.object_index == weak.object_index
+                    && tracked.weak.object_serial_number == weak.object_serial_number;
             });
     }
 
@@ -516,12 +565,47 @@ namespace
         if (!exact_weak_identity(actor, weak))
             return push_result(lua, false, "actor could not be converted to an exact weak identity");
 
-        if (!is_owned_actor_tracked(weak)) g_owned_actors.push_back(weak);
+        if (!is_owned_actor_tracked(weak))
+            g_owned_actors.push_back(OwnedActor{weak, kZoneUnknown});
         return push_result(
             lua,
             true,
             "issued actor retained as a native weak identity until world teardown",
             actor_address,
+            weak.object_index,
+            weak.object_serial_number);
+    }
+
+    // Ownership used to be recorded by appending an FName to the actor's Tags
+    // array from Lua. Appending to a native TArray through the Lua wrapper does
+    // not append: it corrupts the array, and the tag then fails to read back on
+    // the very next call. The weak identity registry already knows exactly
+    // which actors this mod issued, so ownership is answered from that instead
+    // and nothing writes to the actor at all.
+    int native_identify_owned_enemy(const Lua& lua)
+    {
+        if (!g_api.unreal_ready())
+            return push_result(lua, false, "UE4SS native ABI is incomplete: " + g_api.missing_symbols);
+        if (g_api.get_stack_size(&lua) != 1)
+            return push_result(lua, false, "WEDNativeIdentifyOwnedEnemy requires one actor address");
+
+        std::int64_t actor_address{};
+        if (!require_integer(lua, 1, actor_address) || actor_address <= 0)
+            return push_result(lua, false, "WEDNativeIdentifyOwnedEnemy received an invalid Unreal address");
+
+        auto* actor = reinterpret_cast<void*>(static_cast<std::uintptr_t>(actor_address));
+        WeakObjectPtr weak{};
+        if (!exact_weak_identity(actor, weak))
+            return push_result(lua, false, "actor could not be converted to an exact weak identity");
+
+        const bool owned = is_owned_actor_tracked(weak);
+        return push_result(
+            lua,
+            true,
+            owned
+                ? "actor matches an issued native weak identity"
+                : "actor is not an issued native weak identity",
+            owned ? 1 : 0,
             weak.object_index,
             weak.object_serial_number);
     }
@@ -547,7 +631,7 @@ namespace
         std::string failure{};
         std::int32_t object_count = 0;
         std::vector<void*> resolved_actors{};
-        std::vector<WeakObjectPtr> resolved_weak_actors{};
+        std::vector<OwnedActor> resolved_weak_actors{};
         std::vector<void*> async_items{};
 
         if (!guarded_get_num_elements(object_count)
@@ -561,8 +645,9 @@ namespace
         {
             resolved_actors.reserve(g_owned_actors.size());
             resolved_weak_actors.reserve(g_owned_actors.size());
-            for (const WeakObjectPtr& weak : g_owned_actors)
+            for (const OwnedActor& tracked : g_owned_actors)
             {
+                const WeakObjectPtr& weak = tracked.weak;
                 void* item = nullptr;
                 bool serial_matches = false;
                 void* actor = nullptr;
@@ -589,7 +674,9 @@ namespace
                 if (actor != nullptr)
                 {
                     resolved_actors.push_back(actor);
-                    resolved_weak_actors.push_back(weak);
+                    // The band travels with the identity: a same-world teleport
+                    // sanitizes without invalidating what the scan already knows.
+                    resolved_weak_actors.push_back(tracked);
                 }
             }
         }
@@ -723,6 +810,208 @@ namespace
             value = nullptr;
             return false;
         }
+    }
+
+    // Every offset used by the band scan is confirmed against live reflection
+    // once per session before any raw read happens. A layout that disagrees
+    // with the generated headers disables the scan instead of reading the
+    // wrong bytes: Lua then simply receives no transitions and leaves every
+    // enemy at full simulation, which is the pre-LOD behaviour.
+    bool verify_location_layout(void* actor)
+    {
+        if (g_location_layout_verified) return true;
+
+        void* root_property = nullptr;
+        if (!guarded_get_property(actor, L"RootComponent", root_property)
+            || root_property == nullptr
+            || g_api.get_property_offset(root_property) != kRootComponentOffset
+            || g_api.get_property_size(root_property) != static_cast<int>(sizeof(void*)))
+        {
+            return false;
+        }
+
+        void* root = nullptr;
+        if (!guarded_read_object(actor, kRootComponentOffset, root) || root == nullptr)
+            return false;
+
+        void* location_property = nullptr;
+        if (!guarded_get_property(root, L"RelativeLocation", location_property)
+            || location_property == nullptr
+            || g_api.get_property_offset(location_property) != kRelativeLocationOffset
+            || g_api.get_property_size(location_property) != kVectorSize)
+        {
+            return false;
+        }
+
+        void* attach_property = nullptr;
+        if (!guarded_get_property(root, L"AttachParent", attach_property)
+            || attach_property == nullptr
+            || g_api.get_property_offset(attach_property) != kAttachParentOffset
+            || g_api.get_property_size(attach_property) != static_cast<int>(sizeof(void*)))
+        {
+            return false;
+        }
+
+        g_location_layout_verified = true;
+        return true;
+    }
+
+    bool guarded_read_location(void* root, double& x, double& y, double& z)
+    {
+        __try
+        {
+            const auto* location = reinterpret_cast<const double*>(
+                static_cast<std::byte*>(root) + kRelativeLocationOffset);
+            x = location[0];
+            y = location[1];
+            z = location[2];
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            x = 0.0;
+            y = 0.0;
+            z = 0.0;
+            return false;
+        }
+    }
+
+    // Hysteresis is applied to the band the actor is already in: leaving costs
+    // radius + hysteresis, entering costs radius - hysteresis. Without this an
+    // enemy parked exactly on a radius flips band every scan and thrashes its
+    // behaviour tree.
+    std::int32_t classify_zone(
+        double distance,
+        std::int32_t previous,
+        double combat_radius,
+        double despawn_radius,
+        double hysteresis)
+    {
+        const double combat_edge = previous == kZoneActive
+            ? combat_radius + hysteresis
+            : combat_radius - hysteresis;
+        const double despawn_edge = previous == kZoneReleased
+            ? despawn_radius - hysteresis
+            : despawn_radius + hysteresis;
+
+        if (distance <= combat_edge) return kZoneActive;
+        if (distance <= despawn_edge) return kZoneDormant;
+        return kZoneReleased;
+    }
+
+    int native_scan_owned_enemies(const Lua& lua)
+    {
+        if (!g_api.unreal_ready())
+            return push_result(lua, false, "UE4SS native ABI is incomplete: " + g_api.missing_symbols);
+        if (g_api.get_stack_size(&lua) != 5)
+        {
+            return push_result(lua, false,
+                "WEDNativeScanOwnedEnemies requires hero X, hero Y, combat radius, despawn radius and hysteresis");
+        }
+
+        double hero_x{};
+        double hero_y{};
+        double combat_radius{};
+        double despawn_radius{};
+        double hysteresis{};
+        if (!require_number(lua, 1, hero_x)
+            || !require_number(lua, 2, hero_y)
+            || !require_number(lua, 3, combat_radius)
+            || !require_number(lua, 4, despawn_radius)
+            || !require_number(lua, 5, hysteresis))
+        {
+            return push_result(lua, false, "WEDNativeScanOwnedEnemies received a non-finite argument");
+        }
+        if (combat_radius <= 0.0 || despawn_radius <= combat_radius || hysteresis < 0.0)
+            return push_result(lua, false, "WEDNativeScanOwnedEnemies received an invalid radius band");
+
+        g_zone_transitions.clear();
+
+        std::vector<OwnedActor> retained{};
+        retained.reserve(g_owned_actors.size());
+        std::int64_t scanned = 0;
+        std::int64_t pruned = 0;
+
+        for (const OwnedActor& tracked : g_owned_actors)
+        {
+            void* actor = nullptr;
+            if (!guarded_get_weak_object(tracked.weak, actor) || actor == nullptr)
+            {
+                // The actor is gone. Dropping it here is what keeps the tracking
+                // list from growing for a whole session.
+                ++pruned;
+                continue;
+            }
+
+            retained.push_back(tracked);
+
+            if (!verify_location_layout(actor)) continue;
+
+            void* root = nullptr;
+            if (!guarded_read_object(actor, kRootComponentOffset, root) || root == nullptr)
+                continue;
+
+            // RelativeLocation only equals world location while the root has no
+            // parent. An attached root is reported as nothing rather than as a
+            // wrong position.
+            void* attach_parent = nullptr;
+            if (!guarded_read_object(root, kAttachParentOffset, attach_parent)) continue;
+            if (attach_parent != nullptr) continue;
+
+            double x{};
+            double y{};
+            double z{};
+            if (!guarded_read_location(root, x, y, z)) continue;
+
+            const double dx = x - hero_x;
+            const double dy = y - hero_y;
+            const double distance = std::sqrt(dx * dx + dy * dy);
+            if (!std::isfinite(distance)) continue;
+
+            ++scanned;
+            const std::int32_t zone = classify_zone(
+                distance, tracked.zone, combat_radius, despawn_radius, hysteresis);
+            if (zone == tracked.zone) continue;
+
+            retained.back().zone = zone;
+            g_zone_transitions.push_back(ZoneTransition{
+                static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(actor)),
+                zone,
+                tracked.zone});
+        }
+
+        g_owned_actors = std::move(retained);
+        return push_result(
+            lua,
+            true,
+            g_location_layout_verified
+                ? "owned enemy bands scanned"
+                : "owned enemy band layout is unavailable; no bands were classified",
+            static_cast<std::int64_t>(g_zone_transitions.size()),
+            scanned,
+            pruned);
+    }
+
+    // The bound UE4SS Lua ABI exposes only scalar setters, so transitions are
+    // drained one per call rather than returned as a table. That costs one
+    // boundary crossing per changed enemy, which is the point of reporting
+    // changes only: in steady state there are none.
+    int native_next_zone_transition(const Lua& lua)
+    {
+        if (g_api.get_stack_size(&lua) != 0)
+            return push_result(lua, false, "WEDNativeNextZoneTransition does not accept arguments");
+        if (g_zone_transitions.empty())
+            return push_result(lua, true, "no queued band transitions", 0, kZoneUnknown, kZoneUnknown);
+
+        const ZoneTransition transition = g_zone_transitions.back();
+        g_zone_transitions.pop_back();
+        return push_result(
+            lua,
+            true,
+            "band transition",
+            transition.actor_address,
+            transition.new_zone,
+            transition.old_zone);
     }
 
     enum class ArrayRegistrationResult
@@ -963,11 +1252,17 @@ namespace
             if (!g_api.lua_ready()) return;
 
             const LuaFunction track_owned_enemy = &native_track_owned_enemy;
+            const LuaFunction identify_owned_enemy = &native_identify_owned_enemy;
             const LuaFunction register_enemy = &native_register_enemy;
             const LuaFunction release_owned_world = &native_release_owned_world;
+            const LuaFunction scan_owned_enemies = &native_scan_owned_enemies;
+            const LuaFunction next_zone_transition = &native_next_zone_transition;
             const std::string track_name = "WEDNativeTrackOwnedEnemy";
+            const std::string identify_name = "WEDNativeIdentifyOwnedEnemy";
             const std::string register_name = "WEDNativeRegisterEnemy";
             const std::string release_name = "WEDNativeReleaseOwnedWorld";
+            const std::string scan_name = "WEDNativeScanOwnedEnemies";
+            const std::string transition_name = "WEDNativeNextZoneTransition";
 
             std::vector<Lua*> states{&lua, &main_lua, &async_lua};
             if (hook_lua != nullptr) states.push_back(hook_lua);
@@ -984,8 +1279,11 @@ namespace
                 }
                 if (duplicate) continue;
                 g_api.register_function(states[index], track_name, track_owned_enemy);
+                g_api.register_function(states[index], identify_name, identify_owned_enemy);
                 g_api.register_function(states[index], register_name, register_enemy);
                 g_api.register_function(states[index], release_name, release_owned_world);
+                g_api.register_function(states[index], scan_name, scan_owned_enemies);
+                g_api.register_function(states[index], transition_name, next_zone_transition);
             }
         }
     };

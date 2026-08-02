@@ -46,9 +46,9 @@ return {
         { key = "TEXT_OFFSET_X", label = "Readout offset X", type = "number", default = -8, min = -400, max = 400, step = 2, format = "%+.0f px" },
         { key = "TEXT_OFFSET_Y", label = "Readout offset Y", type = "number", default = -18, min = -400, max = 400, step = 2, format = "%+.0f px" },
         { key = "FONT_SIZE", label = "Font size", type = "number", default = 11, min = 6, max = 48, step = 1, format = "%.0f" },
-        { key = "SHOW_EXP", label = "Experience block", type = "bool", default = true },
+        { key = "SHOW_EXP", label = "Experience block", type = "bool", default = false },
         { key = "SHOW_EXP_BAR", label = "Experience bar", type = "bool", default = true },
-        { key = "SHOW_EXP_TEXT", label = "Experience numbers", type = "bool", default = true },
+        { key = "SHOW_EXP_TEXT", label = "Experience numbers", type = "bool", default = false },
         { key = "SHOW_EXP_LEVEL", label = "Level prefix", type = "bool", default = true },
         { key = "EXP_STYLE", label = "Experience bar style", type = "choice", default = "native",
           options = {

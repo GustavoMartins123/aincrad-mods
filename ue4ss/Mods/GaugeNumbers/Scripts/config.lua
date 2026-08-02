@@ -81,11 +81,11 @@ return {
     --====================================================--
 
     -- Master switch for the whole experience block.
-    SHOW_EXP = true,
+    SHOW_EXP = false,
 
     -- The three parts of it, individually.
     SHOW_EXP_BAR = true,      -- the bar itself
-    SHOW_EXP_TEXT = true,     -- the numbers beside it
+    SHOW_EXP_TEXT = false,    -- the numbers beside it
     SHOW_EXP_LEVEL = true,    -- the "Lv.52" prefix in those numbers
 
     -- How the bar is drawn.

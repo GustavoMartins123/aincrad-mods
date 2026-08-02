@@ -16,7 +16,27 @@ return {
     -- never unload, so without this the extras from the first area you
     -- visit keep the whole budget forever and no new area gets any.
     -- Freed slots are handed back to their origin, so returning refills.
+    -- This gates which spawns are issued; it is not the sleep distance.
     DESPAWN_RADIUS = 6000.0,
+
+    -- Beyond COMBAT_RADIUS centimetres an extra is put to sleep: its
+    -- behaviour tree stops and its tick slows right down. An enemy costs an
+    -- AI controller, a behaviour tree, perception, movement and a full
+    -- ability system whether or not you can see it, and Unreal's visual
+    -- culling reduces none of that -- only this does.
+    --
+    -- An extra that is fighting, dying, or on screen is never put to sleep,
+    -- whatever the distance, and sleeping never destroys anything.
+    COMBAT_RADIUS = 8000.0,
+
+    -- Set false to keep every extra at full simulation, whatever the distance.
+    LOD_ENABLED = true,
+    -- Seconds between ticks of a sleeping extra.
+    LOD_DORMANT_TICK_S = 0.5,
+    -- Slack around the edge so an extra standing exactly on the boundary does
+    -- not flip state every scan.
+    LOD_HYSTERESIS_CM = 1000.0,
+
     SPAWN_IN_EMPTY_AREAS = true,
     RANDOMIZE_EXTRA_SPECIES = false,
     INCLUDE_BOSSES = false,

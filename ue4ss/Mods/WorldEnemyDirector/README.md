@@ -37,6 +37,10 @@ ModMenu is installed, open the game's Start Menu, choose **Mods**, and expand
 | Health/attack/defence | 0.10x-10x | Applies verified additive deltas through the enemy's Gameplay Ability System |
 | Movement speed | 0.25x-3x | Changes the reflected speed and calls `SetMovingSpeed` |
 | Experience | 0x-10x | Multiplies the reflected experience reward |
+| Combat radius | 1000-30000 cm | Extras closer than this are simulated exactly as authored; beyond it they sleep |
+| Distance banding | On/Off | Puts extras outside the combat radius to sleep |
+| Dormant tick | 0-5 s | Seconds between ticks of a sleeping extra |
+| Band hysteresis | 0-5000 cm | Slack around each band edge so an extra on a boundary does not flip state |
 
 `Scripts/config.lua` is the required canonical configuration. The ModMenu writes
 live overrides to `Scripts/runtime.lua`. Unknown keys, missing required keys,
@@ -128,6 +132,47 @@ flow.
 Before issuing any extra spawn, the initial discovery batch must remain stable
 for two seconds. This gives delayed boss initialization events time to remove
 their Blueprint classes from both the origin list and the randomisation catalog.
+
+## Distance banding
+
+An enemy costs an AI controller, a running behaviour tree, perception, movement
+and a full ability system whether or not it is on screen. Unreal's visual
+culling removes none of that, so without banding a multiplied population keeps
+paying for every extra it has created for as long as that extra exists.
+
+Extras beyond `COMBAT_RADIUS` have their behaviour tree stopped through
+`UBrainComponent::StopLogic` and their actor and movement ticks slowed to
+`LOD_DORMANT_TICK_S`. Coming back inside the radius calls `RestartLogic` and
+restores the exact tick interval that was captured before the first change.
+`LOD_HYSTERESIS_CM` widens whichever band an extra currently occupies, so one
+parked on a boundary cannot flip state on every scan.
+
+`COMBAT_RADIUS` is the only distance banding reads. It is deliberately not
+coupled to `DESPAWN_RADIUS`, which means something else entirely — that one
+gates which spawns are issued — so a saved menu value for one cannot silently
+change the behaviour of the other.
+
+An extra is never put to sleep while it is fighting (`TargetHeroCharacter` is
+set), dead or dying, not yet admitted, or on screen (`WasRecentlyRendered`).
+Every one of those questions counts an unreadable answer as "do not sleep".
+
+The scan is native. Reading a position through reflection costs one Lua
+boundary crossing per enemy, so `WEDNativeScanOwnedEnemies` reads
+`RootComponent`/`RelativeLocation` directly, and reports only the extras whose
+band actually changed; in steady state a scan produces nothing and costs a
+single call. Every offset it reads is re-verified against live reflection
+before the first raw read, and a layout that disagrees with the generated
+headers disables banding rather than reading the wrong bytes. `RelativeLocation`
+is three doubles under UE5 large-world coordinates, and an extra whose root has
+an attach parent is skipped instead of being given a wrong position.
+
+Unlike the rest of the director, banding is deliberately **best-effort**: it is
+an optimisation, not a correctness contract. A failure downgrades that one
+extra to full simulation and is never allowed to set a world fault, because a
+performance feature must not be able to stop enemy multiplication. Set
+`LOD_ENABLED = false` to keep every extra at full simulation. Banding never
+destroys or returns an actor; despawn, death and pooling still belong to the
+game.
 
 ## Combat attributes
 

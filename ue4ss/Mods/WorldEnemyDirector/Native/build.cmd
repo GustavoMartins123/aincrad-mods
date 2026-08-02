@@ -1,6 +1,7 @@
 @echo off
 setlocal enableextensions enabledelayedexpansion
 
+:: 1. Auto-detect Visual Studio installation path using vswhere.exe (Microsoft standard)
 if not defined VSINSTALLDIR (
     set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
     if exist "!VSWHERE!" (
@@ -15,10 +16,11 @@ if not defined VSINSTALLDIR (
     )
 )
 
+:: 2. Check if C++ compiler (cl.exe) is available
 where cl.exe >nul 2>&1
 if errorlevel 1 (
-    echo [ERRO] Compilador C++ ^(cl.exe^) nao encontrado.
-    echo Certifique-se de ter o Visual Studio instalado com a carga de trabalho "Desenvolvimento para Desktop com C++".
+    echo [ERROR] C++ compiler ^(cl.exe^) not found.
+    echo Please ensure Visual Studio is installed with the "Desktop development with C++" workload.
     exit /b 1
 )
 
@@ -40,5 +42,11 @@ cl.exe /nologo /std:c++20 /O2 /GL /MD /EHsc /W4 /permissive- /utf-8 /LD ^
     /PDB:"%WED_BUILD%\main.pdb"
 if errorlevel 1 exit /b %errorlevel%
 
-copy /Y "%WED_BUILD%\main.dll" "%WED_DLLS%\main.dll" >nul
-exit /b %errorlevel%
+copy /Y "%WED_BUILD%\main.dll" "%WED_DLLS%\main.dll" >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] Failed to copy main.dll to destination.
+    echo Please make sure the game is closed and main.dll is not in use by another process.
+    exit /b 1
+)
+echo [SUCCESS] main.dll compiled and updated successfully!
+exit /b 0

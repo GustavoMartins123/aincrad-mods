@@ -40,6 +40,12 @@ end
 
 Store.runtimePathFor = runtimePathFor
 
+local function previewPathFor(modName)
+    return Store.scriptDirFor(modName) .. "preview.lua"
+end
+
+Store.previewPathFor = previewPathFor
+
 -- An integral value is written without a decimal point so the file stays
 -- readable; nothing downstream distinguishes 1 from 1.0, every consumer either
 -- does plain arithmetic on it or runs it through tonumber.
@@ -167,6 +173,92 @@ local function removeFile(path)
     local removed, removeError = os.remove(path)
     if removed == true then return true, nil end
     return false, tostring(removeError)
+end
+
+-- The preview marker is a transient lease, not a user setting. Publish it by
+-- staging the complete file first and then replacing the canonical path. A
+-- missing marker is the closed state, so a short gap during replacement fails
+-- closed and never exposes a half-written Lua table to the other mod's state.
+local function publishPreview(path, contents)
+    local nextPath = path .. ".next"
+    local previousText, previousReadError = bridge.readFile(path)
+    if previousReadError ~= nil then
+        return false, "current preview read failed: " .. tostring(previousReadError)
+    end
+
+    local stagedText, stagedReadError = bridge.readFile(nextPath)
+    if stagedReadError ~= nil then
+        return false, "staged preview read failed: " .. tostring(stagedReadError)
+    end
+    if stagedText ~= nil then
+        return false, "staged preview already exists: " .. nextPath
+    end
+
+    local staged, stageError = writeFile(nextPath, contents)
+    if not staged then
+        return false, "could not stage preview: " .. tostring(stageError)
+    end
+
+    local removed, removeError = removeFile(path)
+    if not removed then
+        local stagedRemoved, stagedRemoveError = removeFile(nextPath)
+        return false, string.format(
+            "current preview removal failed (%s); staged cleanup=%s",
+            tostring(removeError),
+            tostring(stagedRemoved and "ok" or stagedRemoveError)
+        )
+    end
+
+    local published, publishError = os.rename(nextPath, path)
+    if published == true then return true, nil end
+
+    -- This is a transactional rollback of the marker, not an alternate
+    -- preview source. If publication failed, restore the exact previous lease
+    -- or leave the canonical marker absent.
+    local restored = true
+    local restoreError = nil
+    if previousText ~= nil then
+        restored, restoreError = writeFile(path, previousText)
+    end
+    local stagedRemoved, stagedRemoveError = removeFile(nextPath)
+    return false, string.format(
+        "preview publish failed (%s); rollback=%s staged=%s",
+        tostring(publishError),
+        tostring(restored and "ok" or restoreError),
+        tostring(stagedRemoved and "ok" or stagedRemoveError)
+    )
+end
+
+function Store.setPreview(modName, active)
+    if type(active) ~= "boolean" then
+        return false, "preview state must be boolean"
+    end
+
+    local path = previewPathFor(modName)
+    if not active then
+        local removed, removeError = removeFile(path)
+        if not removed then return false, "could not clear preview: " .. tostring(removeError) end
+        local stagedRemoved, stagedRemoveError = removeFile(path .. ".next")
+        if not stagedRemoved then
+            return false, "could not clear staged preview: " ..
+                tostring(stagedRemoveError)
+        end
+        return true, nil
+    end
+
+    local expiresAt = math.floor(os.time()) + 3
+    local contents = table.concat({
+        "return {",
+        "    ACTIVE = true,",
+        "    EXPIRES_AT = " .. tostring(expiresAt) .. ",",
+        "}",
+        "",
+    }, "\n")
+    return publishPreview(path, contents)
+end
+
+function Store.clearPreview(modName)
+    return Store.setPreview(modName, false)
 end
 
 -- runtime.lua is watched from independent Lua states. Writing it directly with

@@ -213,19 +213,32 @@ function Bridge.attach(options)
     local lastRevText = nil
     local lastFailure = nil
 
+    local function runOnGameThread(action)
+        local inGameThread = false
+        pcall(function() inGameThread = IsInGameThread() == true end)
+        if inGameThread then
+            action()
+            return true, nil
+        end
+
+        local scheduled, scheduleError = pcall(function()
+            ExecuteInGameThread(action)
+        end)
+        if not scheduled then return false, scheduleError end
+        return true, nil
+    end
+
     local function dispatchFailure(message)
         local failure = tostring(message)
         if failure ~= lastFailure then
             lastFailure = failure
             logger("CONFIG ERROR | " .. failure .. " | mod disabled")
         end
-        local scheduled, scheduleError = pcall(function()
-            ExecuteInGameThread(function()
-                local ok, failError = pcall(fail, failure)
-                if not ok then
-                    logger("FAIL-CLOSED ERROR | " .. tostring(failError))
-                end
-            end)
+        local scheduled, scheduleError = runOnGameThread(function()
+            local ok, failError = pcall(fail, failure)
+            if not ok then
+                logger("FAIL-CLOSED ERROR | " .. tostring(failError))
+            end
         end)
         if not scheduled then
             logger("SCHEDULING ERROR | " .. tostring(scheduleError))
@@ -260,25 +273,23 @@ function Bridge.attach(options)
             return false
         end
 
-        local scheduled, scheduleError = pcall(function()
-            ExecuteInGameThread(function()
-                local okLoad, loadError = pcall(loadSettings, settings, info)
-                if not okLoad then
-                    dispatchFailure("settings validation failed: " ..
-                        tostring(loadError))
+        local scheduled, scheduleError = runOnGameThread(function()
+            local okLoad, loadError = pcall(loadSettings, settings, info)
+            if not okLoad then
+                dispatchFailure("settings validation failed: " ..
+                    tostring(loadError))
+                return
+            end
+            if activate ~= nil then
+                local okApply, applyError = pcall(activate, settings, info)
+                if not okApply then
+                    dispatchFailure("settings activation failed: " ..
+                        tostring(applyError))
                     return
                 end
-                if activate ~= nil then
-                    local okApply, applyError = pcall(activate, settings, info)
-                    if not okApply then
-                        dispatchFailure("settings activation failed: " ..
-                            tostring(applyError))
-                        return
-                    end
-                end
-                lastFailure = nil
-                if not isInitial then logger("settings reloaded in-game") end
-            end)
+            end
+            lastFailure = nil
+            if not isInitial then logger("settings reloaded in-game") end
         end)
         if not scheduled then
             dispatchFailure("game-thread scheduling failed: " ..
@@ -291,25 +302,38 @@ function Bridge.attach(options)
     refresh(true, true)
 
     local polling = true
-    local function schedulePoll()
+    local pollingHandle = nil
+    local function pollOnGameThread()
         if not polling then return end
-        local scheduled, scheduleError = pcall(function()
-            ExecuteWithDelay(pollMs, function()
-                refresh(false, false)
-                schedulePoll()
-            end)
+        local refreshed, refreshError = pcall(function()
+            refresh(false, false)
         end)
-        if not scheduled then
+        if not refreshed then
             polling = false
-            dispatchFailure("settings poll scheduling failed: " ..
-                tostring(scheduleError))
+            dispatchFailure("settings poll failed: " .. tostring(refreshError))
         end
     end
-    schedulePoll()
+
+    local scheduled, scheduleResult = pcall(function()
+        return LoopInGameThreadWithDelay(pollMs, pollOnGameThread)
+    end)
+    if not scheduled or type(scheduleResult) ~= "number" then
+        polling = false
+        dispatchFailure("settings poll scheduling failed: " ..
+            tostring(scheduleResult))
+    else
+        pollingHandle = scheduleResult
+    end
 
     return {
         reload = function() return refresh(true, false) end,
-        stop = function() polling = false end,
+        stop = function()
+            polling = false
+            if pollingHandle ~= nil then
+                pcall(function() CancelDelayedAction(pollingHandle) end)
+                pollingHandle = nil
+            end
+        end,
         modName = modName,
     }, nil
 end
