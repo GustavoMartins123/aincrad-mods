@@ -864,9 +864,9 @@ do
             if enemy.bAbilitiesInitialized ~= true then
                 error("enemy abilities are not initialized")
             end
-            -- Detection is deliberately off until the extra is fully settled,
-            -- so it is not part of this contract. It is switched on as the last
-            -- activation step and verified there instead.
+            if enemy.DisableDetectFlag ~= false then
+                error("enemy detection is disabled")
+            end
             local controller = enemy:GetController()
             if not isValid(controller) then
                 error("AI controller is unavailable")
@@ -929,6 +929,7 @@ local resumeAtMs = CONST.STARTUP_SETTLE_MS
 local rescanRequested = false
 local worldFault = nil
 local poolBudgetRaised = false
+local spawnRefusedCount = 0
 -- A world fault used to be permanent: one rejected spawn stopped multiplication
 -- for the rest of the session, and the only way back was a world transition.
 -- A single bad actor is not evidence that the next one is bad, so a fault now
@@ -1005,6 +1006,7 @@ local function clearWorldReferences()
     worldFaultResumeAtMs = nil
     worldFaultRetryMs = CONST.WORLD_FAULT_RETRY_MS
     poolBudgetRaised = false
+    spawnRefusedCount = 0
     navigationSystem = nil
     gameplayStatics = nil
     worldPartitionSubsystem = nil
@@ -2837,18 +2839,14 @@ activateSpawnedEnemy = function(enemy, key, spawnPosition)
         enemy.ProwlGoalPositionFlag = false
         controller:StartAI(enemy)
         controller:ApplyBindFunction()
-        -- Started blind on purpose.
+        -- StartAI(false) means IsNodetect = false: the enemy perceives.
         --
-        -- StartAI's argument is the option struct's IsNodetect, so true means
-        -- "do not perceive". The behaviour tree still runs, which is what
-        -- admission checks, but the extra will not hunt the player yet.
-        --
-        -- Extras were charging the player the instant they appeared, before
-        -- their level, attributes and collision had been settled, and those
-        -- were the ones that could not be damaged. Perception is switched on as
-        -- the very last step, once everything else about the enemy is final.
-        enemy:StartAI(true)
-        enemy.DisableDetectFlag = true
+        -- Deferring perception by starting with StartAI(true) was tried and
+        -- reverted: it is the same call MODIFICATIONS.md records as having made
+        -- every extra blind, and holding an enemy in that state left it unable
+        -- to take damage at all rather than merely unaware. Whatever it does,
+        -- it is not a clean "perceive later" switch.
+        enemy:StartAI(false)
         treeResult = enemy:StartBehaviorTree()
     end)
     if not activated then
@@ -3011,19 +3009,13 @@ local function auditOwnedEnemyCollision()
                         if configHealthy and CONFIG.ENABLED then
                             applyMutation(state)
                         end
-                        -- Absolute last step, after mutation: the extra is now
-                        -- exactly what it is going to be, so it may start
-                        -- hunting.
+                        -- Detection is already on from activation; re-asserting
+                        -- it here only confirms nothing since turned it off.
                         local detectOk, detectError =
                             enemyContracts.enableDetection(state.object)
-                        if detectOk then
-                            dbg("SPAWN PERCEPTION | " .. tostring(state.key) ..
-                                " | detection enabled after full configuration")
-                        else
-                            log("SPAWN PERCEPTION FAILED | " ..
-                                tostring(state.key) .. " | " ..
-                                tostring(detectError) ..
-                                " | extra will not notice the player")
+                        if not detectOk then
+                            log("SPAWN PERCEPTION | " .. tostring(state.key) ..
+                                " | " .. tostring(detectError))
                         end
                     end
                 end
@@ -3321,8 +3313,32 @@ local function processSpawnRequest()
                 break
             end
         end
+
+        -- The game refusing a spawn is not a contract failure.
+        --
+        -- Native diagnostics identified this case exactly: the actor no longer
+        -- resolves because the game destroyed it during FinishSpawningActor.
+        -- That is the game declining the spawn, and it is a normal outcome --
+        -- it happens in bursts while an area is streaming in.
+        --
+        -- It used to reach disableWorld, which reverts the mutation of every
+        -- tracked enemy. So one refused spawn stripped the whole population and
+        -- the rescan afterwards rebuilt it from scratch. During an area
+        -- transition that fires repeatedly, which is why crossing into a new
+        -- area could leave every enemy in a wrong state at once. The request is
+        -- now simply dropped and the next cycle picks another spot.
+        local failure = summarizeSpawnCallError(spawnError)
+        if type(failure) == "string"
+            and failure:find("destroyed or marked pending kill", 1, true) then
+            spawnRefusedCount = spawnRefusedCount + 1
+            dbg("SPAWN REFUSED | " .. tostring(request.classKey) ..
+                " | the game destroyed the actor during FinishSpawningActor" ..
+                " | refused so far: " .. tostring(spawnRefusedCount))
+            return
+        end
+
         pauseForSpawnContractFailure(
-            "direct spawn contract failed: " .. summarizeSpawnCallError(spawnError) ..
+            "direct spawn contract failed: " .. failure ..
             (isValid(spawned) and " | issued actor retained" or ""))
         return
     end

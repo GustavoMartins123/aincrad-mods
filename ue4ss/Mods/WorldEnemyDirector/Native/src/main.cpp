@@ -381,6 +381,28 @@ namespace
         return true;
     }
 
+    // Read a numeric argument without trusting the type predicates.
+    //
+    // is_integer/is_number answer reliably for values UE4SS itself pushed, such
+    // as GetAddress results -- which is why the tracking and registry functions
+    // always worked -- but rejected numbers computed in Lua, which silently
+    // disabled distance banding and the pool budget for their whole lives.
+    //
+    // Reading the value and validating the result is safe because every caller
+    // below has a strict range: a non-numeric argument converts to 0 and is
+    // then refused by that range check with a clear message, instead of being
+    // refused here for a reason that was never true.
+    bool read_scalar(const Lua& lua, int index, double& value)
+    {
+        if (g_api.is_integer(&lua, index))
+        {
+            value = static_cast<double>(g_api.get_integer(&lua, index));
+            return std::isfinite(value);
+        }
+        value = g_api.get_number(&lua, index);
+        return std::isfinite(value);
+    }
+
     bool guarded_get_weak_object(const WeakObjectPtr& weak, void*& actor)
     {
         __try
@@ -980,26 +1002,20 @@ namespace
         // tracking and registry functions already use successfully against this
         // UE4SS build, and whole centimetres are far finer than any band edge
         // needs.
-        std::int64_t hero_x_cm{};
-        std::int64_t hero_y_cm{};
-        std::int64_t combat_radius_cm{};
-        std::int64_t despawn_radius_cm{};
-        std::int64_t hysteresis_cm{};
-        if (!require_integer(lua, 1, hero_x_cm)
-            || !require_integer(lua, 2, hero_y_cm)
-            || !require_integer(lua, 3, combat_radius_cm)
-            || !require_integer(lua, 4, despawn_radius_cm)
-            || !require_integer(lua, 5, hysteresis_cm))
+        double hero_x{};
+        double hero_y{};
+        double combat_radius{};
+        double despawn_radius{};
+        double hysteresis{};
+        if (!read_scalar(lua, 1, hero_x)
+            || !read_scalar(lua, 2, hero_y)
+            || !read_scalar(lua, 3, combat_radius)
+            || !read_scalar(lua, 4, despawn_radius)
+            || !read_scalar(lua, 5, hysteresis))
         {
             return push_result(lua, false,
-                "WEDNativeScanOwnedEnemies requires whole-centimetre integers");
+                "WEDNativeScanOwnedEnemies received a non-finite argument");
         }
-
-        const double hero_x = static_cast<double>(hero_x_cm);
-        const double hero_y = static_cast<double>(hero_y_cm);
-        const double combat_radius = static_cast<double>(combat_radius_cm);
-        const double despawn_radius = static_cast<double>(despawn_radius_cm);
-        const double hysteresis = static_cast<double>(hysteresis_cm);
         if (combat_radius <= 0.0 || despawn_radius <= combat_radius || hysteresis < 0.0)
             return push_result(lua, false, "WEDNativeScanOwnedEnemies received an invalid radius band");
 
@@ -1192,14 +1208,17 @@ namespace
         if (g_api.get_stack_size(&lua) != 2)
             return push_result(lua, false, "WEDNativeExpandEnemyPool requires a game config address and a multiplier");
 
-        std::int64_t config_address{};
-        std::int64_t multiplier{};
-        if (!require_integer(lua, 1, config_address) || config_address <= 0
-            || !require_integer(lua, 2, multiplier)
-            || multiplier < 1 || multiplier > 64)
-        {
-            return push_result(lua, false, "WEDNativeExpandEnemyPool received an invalid address or multiplier");
-        }
+        double config_value{};
+        double multiplier_value{};
+        if (!read_scalar(lua, 1, config_value) || !read_scalar(lua, 2, multiplier_value))
+            return push_result(lua, false, "WEDNativeExpandEnemyPool received a non-finite argument");
+
+        const std::int64_t config_address = static_cast<std::int64_t>(config_value);
+        const std::int64_t multiplier = static_cast<std::int64_t>(multiplier_value);
+        if (config_address <= 0)
+            return push_result(lua, false, "WEDNativeExpandEnemyPool received an unusable game config address");
+        if (multiplier < 1 || multiplier > 64)
+            return push_result(lua, false, "WEDNativeExpandEnemyPool multiplier is outside 1-64");
 
         auto* config = reinterpret_cast<void*>(static_cast<std::uintptr_t>(config_address));
         void* map_property = nullptr;

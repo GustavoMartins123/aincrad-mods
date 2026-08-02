@@ -264,7 +264,6 @@ local state = {
     previewRequested = false,
     previewApplied = false,
     previewCockpit = nil,
-    previewMenuSize = nil,
     previewMenuCanvas = nil,
     previewRoot = nil,
     previewRootSlot = nil,
@@ -289,6 +288,7 @@ local readHeroValues
 local createNativeGaugeForPreview
 local resolveHero
 local mountPreviewReadouts
+local mountPreviewExperience
 
 -- `StaticConstructObject(..., Template=UnitGauge)` only copied the CanvasPanel
 -- properties. Its children still belonged to the live HUD, so it was correctly
@@ -308,40 +308,6 @@ local function resolvePreviewCanvas()
     local read = pcall(function() canvas = menu.SubMenu end)
     if not read or not isValid(canvas) then return nil end
     return canvas
-end
-
--- Read the live UMG design space. Preview slots use these units directly, so
--- the bars track the game's DPI/layout scale instead of a physical monitor
--- resolution.
-local function readViewportDesignSize()
-    local layout = nil
-    local controller = nil
-    local width = nil
-    local height = nil
-    local scale = nil
-    local read = pcall(function()
-        layout = StaticFindObject(LAYOUT_LIBRARY)
-        if not isValid(layout) then error("WidgetLayoutLibrary is unavailable") end
-        controller = FindFirstOf("RODInGamePlayerController")
-        if not isValid(controller) then
-            error("RODInGamePlayerController is unavailable")
-        end
-        local viewport = layout:GetViewportSize(controller)
-        width = tonumber(viewport.X)
-        height = tonumber(viewport.Y)
-        scale = tonumber(layout:GetViewportScale(controller))
-    end)
-    if not read or not finiteNumber(width) or not finiteNumber(height)
-        or not finiteNumber(scale) or width <= 0.0 or height <= 0.0
-        or scale <= 0.0 then
-        return nil
-    end
-    return {
-        width = width / scale,
-        height = height / scale,
-        note = string.format("viewport %.0fx%.0f @ dpi %.3f",
-            width, height, scale),
-    }
 end
 
 local function discardPreviewWidgetState()
@@ -416,13 +382,6 @@ capturePreviewMount = function(cockpit)
         return false
     end
 
-    local viewportSize = readViewportDesignSize()
-    if viewportSize == nil then
-        reportOnce("PREVIEW-MOUNT",
-            "PREVIEW ERROR | viewport design geometry is unavailable")
-        return false
-    end
-
     destroyPreviewWidgets()
     local swept, sweepError = sweepOrphanedPreviewClones(menuCanvas)
     if not swept then
@@ -433,28 +392,59 @@ capturePreviewMount = function(cockpit)
     end
     state.previewCockpit = cockpit
     state.previewMenuCanvas = menuCanvas
-    state.previewMenuSize = viewportSize
     state.previewFailed = false
     clearReport("PREVIEW-MOUNT")
     return true
 end
 
-local function placePreviewWidget(canvas, widget, geometry, zOrder)
+local function mountPreviewRoot(canvas, widget, sourceLayout)
     local slot = nil
     local ok = pcall(function()
         slot = canvas:AddChildToCanvas(widget)
-        slot:SetAutoSize(false)
-        slot:SetMinimum({ X = 0.0, Y = 0.0 })
-        slot:SetMaximum({ X = 0.0, Y = 0.0 })
-        slot:SetAlignment({ X = 0.0, Y = 0.0 })
-        slot:SetPosition({ X = geometry.x, Y = geometry.y })
-        slot:SetSize({ X = geometry.width, Y = geometry.height })
-        slot:SetZOrder(zOrder)
+        slot:SetLayout(sourceLayout.layout)
+        slot:SetAutoSize(sourceLayout.autoSize)
+        slot:SetZOrder(1000)
         widget:SetVisibility(HIT_TEST_INVISIBLE)
         widget:SetRenderOpacity(1.0)
     end)
     if not ok or not isValid(slot) then return nil end
     return slot
+end
+
+local function readPreviewRootLayout(cockpit)
+    local sourceRoot = nil
+    local slot = nil
+    local parent = nil
+    local layout = nil
+    local autoSize = nil
+    local zOrder = nil
+    local read = pcall(function()
+        sourceRoot = cockpit.UnitGauge
+        slot = sourceRoot.Slot
+        parent = slot.Parent
+        layout = slot:GetLayout()
+        autoSize = slot:GetAutoSize()
+        zOrder = slot:GetZOrder()
+    end)
+    if not read or not isValid(sourceRoot) or not isValid(slot)
+        or not isValid(parent) or layout == nil or type(autoSize) ~= "boolean"
+        or not finiteNumber(tonumber(zOrder)) then
+        return nil, nil, "live UnitGauge root layout is unavailable"
+    end
+
+    local note = "geometry unreadable"
+    pcall(function()
+        local position = slot:GetPosition()
+        local size = slot:GetSize()
+        note = string.format("x=%.0f y=%.0f w=%.0f h=%.0f",
+            position.X, position.Y, size.X, size.Y)
+    end)
+    return sourceRoot, {
+        layout = layout,
+        autoSize = autoSize,
+        zOrder = tonumber(zOrder),
+        note = note,
+    }, nil
 end
 
 local function requireDistinctPreviewObject(live, copied, label)
@@ -540,6 +530,7 @@ local function readPreviewAssemblyLayout(sourceRoot, sourceUnit, key)
     local autoSize = nil
     local zOrder = nil
     local parentName = nil
+    local sourceRootName = nil
     local read = pcall(function()
         slot = sourceUnit.Slot
         parent = slot.Parent
@@ -553,10 +544,14 @@ local function readPreviewAssemblyLayout(sourceRoot, sourceUnit, key)
         return nil, "live " .. key .. " gauge layout is unavailable"
     end
     pcall(function() parentName = parent:GetFullName() end)
-    -- The generated gauge assemblies are not guaranteed to be direct children
-    -- of UnitGauge. Their own CanvasPanelSlot is the authoritative geometry;
-    -- copying that slot into the full-screen preview wrapper preserves the
-    -- original assembly position without reparenting the live widget.
+    pcall(function() sourceRootName = sourceRoot:GetFullName() end)
+    if type(parentName) ~= "string" or parentName ~= sourceRootName then
+        return nil, "live " .. key ..
+            " gauge is not mounted in the canonical UnitGauge canvas"
+    end
+    -- The preview root carries UnitGauge's own slot layout. Its child slots
+    -- therefore retain their original local coordinate space without ever
+    -- reparenting the live canvas.
     return {
         layout = layout,
         autoSize = autoSize,
@@ -634,12 +629,10 @@ local function setPreviewAssemblyValues(units, values)
     return true, nil
 end
 
-local function createPreviewAssemblies(liveCockpit, root, values)
-    local sourceRoot = nil
+local function createPreviewAssemblies(liveCockpit, sourceRoot, root, values)
     local widgets = nil
     local owningPlayer = nil
     local resolved = pcall(function()
-        sourceRoot = liveCockpit.UnitGauge
         widgets = StaticFindObject(WIDGET_LIBRARY)
         owningPlayer = liveCockpit:GetOwningPlayer()
     end)
@@ -706,11 +699,11 @@ mountPreviewUnitGauge = function()
         return false
     end
 
-    local viewport = state.previewMenuSize
-    if type(viewport) ~= "table" or not finiteNumber(viewport.width)
-        or not finiteNumber(viewport.height) then
+    local sourceRoot, sourceRootLayout, sourceRootError =
+        readPreviewRootLayout(cockpit)
+    if sourceRoot == nil then
         reportOnce("PREVIEW-MOUNT",
-            "PREVIEW ERROR | preview viewport geometry is unavailable")
+            "PREVIEW ERROR | " .. tostring(sourceRootError))
         return false
     end
 
@@ -721,12 +714,7 @@ mountPreviewUnitGauge = function()
             tostring(rootError))
         return false
     end
-    local rootSlot = placePreviewWidget(menuCanvas, root, {
-        x = 0.0,
-        y = 0.0,
-        width = viewport.width,
-        height = viewport.height,
-    }, 1000)
+    local rootSlot = mountPreviewRoot(menuCanvas, root, sourceRootLayout)
     if rootSlot == nil then
         pcall(function() root:RemoveFromParent() end)
         reportOnce("PREVIEW-MOUNT",
@@ -734,7 +722,8 @@ mountPreviewUnitGauge = function()
         return false
     end
 
-    local units, assemblyError = createPreviewAssemblies(cockpit, root, values)
+    local units, assemblyError = createPreviewAssemblies(cockpit, sourceRoot,
+        root, values)
     if units == nil then
         pcall(function() root:RemoveFromParent() end)
         reportOnce("PREVIEW-MOUNT",
@@ -759,16 +748,35 @@ mountPreviewUnitGauge = function()
         return false
     end
 
+    if type(mountPreviewExperience) ~= "function" then
+        pcall(function() root:RemoveFromParent() end)
+        reportOnce("PREVIEW-MOUNT",
+            "PREVIEW ERROR | preview experience builder is unavailable")
+        return false
+    end
+    local previewExperience, experienceError =
+        mountPreviewExperience(cockpit, units)
+    if previewExperience == nil then
+        pcall(function() root:RemoveFromParent() end)
+        reportOnce("PREVIEW-MOUNT",
+            "PREVIEW ERROR | preview experience clone failed: " ..
+            tostring(experienceError))
+        return false
+    end
+
     state.previewRoot = root
     state.previewRootSlot = rootSlot
     state.previewUnits = units
     state.previewClone = nil
     state.previewCloneSlot = nil
-    state.previewLabels = previewLabels
+    state.previewLabels = {
+        readouts = previewLabels,
+        experience = previewExperience,
+    }
     state.previewMounted = true
     log(string.format(
-        "PREVIEW | independent gauge assemblies mounted | viewport=%.0fx%.0f",
-        viewport.width, viewport.height))
+        "PREVIEW | independent gauge assemblies mounted | UnitGauge=%s",
+        sourceRootLayout.note))
     clearReport("PREVIEW-MOUNT")
     return true
 end
@@ -800,7 +808,6 @@ restorePreviewVisibility = function(restore, resetFailure)
     restorePreviewMount(restore)
     state.previewApplied = false
     state.previewCockpit = nil
-    state.previewMenuSize = nil
     state.previewMenuCanvas = nil
     if resetFailure ~= false then state.previewFailed = false end
     clearReport("PREVIEW-APPLIED")
@@ -1087,33 +1094,18 @@ local function measure(widget)
     return geometry
 end
 
--- Gauge widgets are not CanvasPanel children on this build. Their slot therefore
--- cannot provide a size, and their cached geometry becomes zero when the game's
--- menu collapses the cockpit. The widget's desired size remains the authoritative
--- design-space size in that state.
-local function measureWidgetDesiredSize(widget)
+-- The native gauge's intrinsic height is stable before its parent finishes a
+-- layout pass. Width is intentionally not read here: the experience gauge is
+-- horizontally anchored to Health itself, so its width comes from that widget.
+local function measureGaugeHeight(widget)
     if not isValid(widget) then return nil end
-
-    local width = nil
     local height = nil
     local read = pcall(function()
         local size = widget:GetDesiredSize()
-        width = tonumber(size.X)
         height = tonumber(size.Y)
     end)
-    if not read or not finiteNumber(width) or not finiteNumber(height)
-        or width <= 1.0 or height <= 1.0 then
-        return nil
-    end
-    return {
-        width = width,
-        height = height,
-        note = string.format("desired w=%.0f h=%.0f", width, height),
-    }
-end
-
-local function measureGaugeSize(widget)
-    return measureWidgetDesiredSize(widget)
+    if not read or not finiteNumber(height) or height <= 1.0 then return nil end
+    return height
 end
 
 -- Drawing ON a bar means out-ranking everything already in that canvas, and a
@@ -1159,17 +1151,19 @@ local function stopCaching(widget, member)
     pcall(function() widget[member]:SetCanCache(false) end)
 end
 
--- The experience block's surface, and it is deliberately NOT the readouts'.
--- Hanging it off the gauge assembly's own canvas by a normalised edge anchor
--- is the arrangement that landed it correctly above the HUD; the readouts have
--- a different problem (draw order) and chasing it must not move this.
+-- The experience block belongs to the selected gauge assembly Canvas. HPGauge
+-- is the CanvasPanel which already owns the Health bar; its stretch anchors
+-- therefore cover that bar exactly without touching the live gauge root.
 local function experienceSurface(cockpit, definition)
+    if definition == nil then return nil end
     local unit = cockpit[definition.unit]
     if not isValid(unit) then return nil end
+    local gauge = unit[definition.gauge]
+    if not isValid(gauge) then return nil end
     local canvas = unit[definition.canvas]
     if not isValid(canvas) then return nil end
     stopCaching(unit, "InvalidationBox_root")
-    return { canvas = canvas, size = measureGaugeSize(unit[definition.gauge]) }
+    return { canvas = canvas, height = measureGaugeHeight(gauge) }
 end
 
 -- WHERE a readout draws. A readout centred ON its bar has to be painted AFTER
@@ -1383,9 +1377,11 @@ local function place(canvas, widget, placement, zOrder)
     local ok = pcall(function() slot = canvas:AddChildToCanvas(widget) end)
     if not ok or not isValid(slot) then return nil end
     pcall(function()
+        local minimum = placement.minimum or placement.anchor
+        local maximum = placement.maximum or placement.anchor
         slot:SetAutoSize(placement.size == nil)
-        slot:SetMinimum(placement.anchor)
-        slot:SetMaximum(placement.anchor)
+        slot:SetMinimum(minimum)
+        slot:SetMaximum(maximum)
         slot:SetAlignment(placement.align)
         slot:SetPosition(placement.position)
         if placement.size ~= nil then slot:SetSize(placement.size) end
@@ -1730,6 +1726,9 @@ createNativeGaugeForPreview = function(cockpit, donor, outer)
     if not isValid(widget) then
         return nil, "native gauge copy was not created"
     end
+    local distinct, distinctError = requireDistinctPreviewObject(donor, widget,
+        "native gauge")
+    if not distinct then return nil, distinctError end
     return widget, nil
 end
 
@@ -1795,21 +1794,15 @@ local function ensureExperience(cockpit, surfaces)
     end
     local canvas = surface.canvas
 
-    local width = nil
-    if CONFIG.EXP_BAR_WIDTH > 0.0 then
-        width = CONFIG.EXP_BAR_WIDTH
-    elseif surface.size ~= nil then
-        width = surface.size.width
+    local stretchToGauge = CONFIG.EXP_BAR_WIDTH <= 0.0
+    local width = stretchToGauge and 0.0 or CONFIG.EXP_BAR_WIDTH
+    local height = CONFIG.EXP_BAR_HEIGHT > 0.0
+        and CONFIG.EXP_BAR_HEIGHT or surface.height
+    if not finiteNumber(height) or height <= 1.0 then
+        return nil, "experience Health gauge height is unavailable"
     end
-    local height = nil
-    if CONFIG.EXP_BAR_HEIGHT > 0.0 then
-        height = CONFIG.EXP_BAR_HEIGHT
-    elseif surface.size ~= nil then
-        height = surface.size.height
-    end
-    if not finiteNumber(width) or width <= 1.0
-        or not finiteNumber(height) or height <= 1.0 then
-        return nil, "experience anchor gauge geometry is unavailable"
+    if wantBar and CONFIG.EXP_STYLE == "flat" and stretchToGauge then
+        return nil, "flat experience bar requires an explicit width"
     end
 
     -- Always the normalised edge anchor, never a measured rectangle. This is
@@ -1826,6 +1819,18 @@ local function ensureExperience(cockpit, surfaces)
     local built = {}
 
     local function boxPlacement(x, w)
+        if stretchToGauge then
+            return {
+                anchor = anchor,
+                minimum = { X = 0.0, Y = anchor.Y },
+                maximum = { X = 1.0, Y = anchor.Y },
+                align = boxAlign,
+                -- Stretch anchors use left/right margins. Opposite values
+                -- translate the bar without changing its Health-bar width.
+                position = { X = x, Y = originY },
+                size = { X = -x, Y = height },
+            }
+        end
         return {
             anchor = anchor,
             align = boxAlign,
@@ -1897,12 +1902,30 @@ local function ensureExperience(cockpit, surfaces)
         styleLabel(label, cockpit)
 
         local placement
-        if CONFIG.READOUT_PLACEMENT == "center" then
+        if CONFIG.READOUT_PLACEMENT == "center" and stretchToGauge then
+            placement = {
+                anchor = { X = 0.5, Y = anchor.Y },
+                align = { X = 0.5, Y = 0.5 },
+                position = {
+                    X = originX + CONFIG.TEXT_OFFSET_X,
+                    Y = centreY + CONFIG.TEXT_OFFSET_Y,
+                },
+            }
+        elseif CONFIG.READOUT_PLACEMENT == "center" then
             placement = {
                 anchor = anchor,
                 align = { X = 0.5, Y = 0.5 },
                 position = {
                     X = originX + width * 0.5 + CONFIG.TEXT_OFFSET_X,
+                    Y = centreY + CONFIG.TEXT_OFFSET_Y,
+                },
+            }
+        elseif stretchToGauge then
+            placement = {
+                anchor = { X = 1.0, Y = anchor.Y },
+                align = { X = 0.0, Y = 0.5 },
+                position = {
+                    X = originX + CONFIG.TEXT_OFFSET_X,
                     Y = centreY + CONFIG.TEXT_OFFSET_Y,
                 },
             }
@@ -1924,11 +1947,11 @@ local function ensureExperience(cockpit, surfaces)
 
     state.exp = exp
     log(string.format(
-        "EXPERIENCE | %s bar %s %s | at %+.0f,%+.0f (%.0fx%.0f) | z=%d | " ..
-        "size from %s",
+        "EXPERIENCE | %s bar %s %s | at %+.0f,%+.0f (%s x %.0f) | z=%d | " ..
+        "gauge-canvas anchor",
         exp.style, CONFIG.EXP_PLACEMENT, CONFIG.EXP_ANCHOR,
-        originX, originY, width, height, zOrder,
-        (surface.size ~= nil and surface.size.note) or "configured"))
+        originX, originY, stretchToGauge and "stretch" or
+            string.format("%.0f", width), height, zOrder))
     return exp
 end
 
@@ -2018,6 +2041,203 @@ local function stampExperience(exp, reading)
             exp.fillSlot:SetSize({ X = filled, Y = exp.height })
         end)
     end
+end
+
+-- The menu preview owns a separate experience gauge. It is deliberately built
+-- inside the copied assembly canvas: the live experience widget is never
+-- reused, and the real HUD is not rebuilt while its menu layer is collapsed.
+mountPreviewExperience = function(liveCockpit, previewUnits)
+    if not CONFIG.SHOW_EXP then return {}, nil end
+
+    local wantBar = CONFIG.SHOW_EXP_BAR
+    local wantText = CONFIG.SHOW_EXP_TEXT
+    if not wantBar and not wantText then return {}, nil end
+
+    local definition = BAR_BY_ANCHOR[CONFIG.EXP_ANCHOR]
+    if definition == nil then
+        return nil, "preview experience anchor is unavailable"
+    end
+    local anchorUnit = definition ~= nil and previewUnits[definition.key] or nil
+    local canvas = isValid(anchorUnit) and anchorUnit[definition.canvas] or nil
+    if not isValid(canvas) then
+        return nil, "preview experience anchor canvas is unavailable"
+    end
+
+    local liveUnit = nil
+    local liveGauge = nil
+    pcall(function()
+        liveUnit = liveCockpit[definition.unit]
+        liveGauge = liveUnit[definition.gauge]
+    end)
+    local stretchToGauge = CONFIG.EXP_BAR_WIDTH <= 0.0
+    local width = stretchToGauge and 0.0 or CONFIG.EXP_BAR_WIDTH
+    local height = CONFIG.EXP_BAR_HEIGHT > 0.0
+        and CONFIG.EXP_BAR_HEIGHT or measureGaugeHeight(liveGauge)
+    if not finiteNumber(height) or height <= 1.0 then
+        return nil, "preview Health gauge height is unavailable"
+    end
+    if wantBar and CONFIG.EXP_STYLE == "flat" and stretchToGauge then
+        return nil, "flat preview experience bar requires an explicit width"
+    end
+
+    local donorUnit = previewUnits.STAMINA
+    local donor = isValid(donorUnit) and donorUnit.Stamina or nil
+    if not isValid(donor) then
+        return nil, "preview native experience donor is unavailable"
+    end
+
+    local above = CONFIG.EXP_PLACEMENT ~= "below"
+    local anchor = { X = 0.0, Y = above and 0.0 or 1.0 }
+    local boxAlign = { X = 0.0, Y = above and 1.0 or 0.0 }
+    local originX = CONFIG.EXP_OFFSET_X
+    local originY = CONFIG.EXP_OFFSET_Y
+    local centreY = originY + (above and -height * 0.5 or height * 0.5)
+    local zOrder = math.max(topZOrder(canvas) + 10, MINIMUM_Z_ORDER)
+    local built = {}
+
+    local function unwind(message)
+        for _, widget in ipairs(built) do
+            if isValid(widget) then
+                pcall(function() widget:RemoveFromParent() end)
+            end
+        end
+        return nil, message
+    end
+
+    local function boxPlacement(x, w)
+        if stretchToGauge then
+            return {
+                anchor = anchor,
+                minimum = { X = 0.0, Y = anchor.Y },
+                maximum = { X = 1.0, Y = anchor.Y },
+                align = boxAlign,
+                position = { X = x, Y = originY },
+                size = { X = -x, Y = height },
+            }
+        end
+        return {
+            anchor = anchor,
+            align = boxAlign,
+            position = { X = x, Y = originY },
+            size = { X = w, Y = height },
+        }
+    end
+
+    local exp = {
+        style = "none",
+        wantBar = wantBar,
+        wantText = wantText,
+        width = width,
+        height = height,
+    }
+
+    if wantBar then
+        if CONFIG.EXP_STYLE == "native" then
+            local native, createError =
+                createNativeGaugeForPreview(liveCockpit, donor, canvas)
+            if native == nil then
+                return unwind("preview native experience gauge unavailable: " ..
+                    tostring(createError))
+            end
+            built[#built + 1] = native
+            pcall(function() native:SetGaugeColor(EXP_FILL_COLOR) end)
+            if place(canvas, native, boxPlacement(originX, width), zOrder) == nil then
+                return unwind("preview experience gauge was rejected")
+            end
+            exp.style = "native"
+            exp.native = native
+        elseif CONFIG.EXP_STYLE == "flat" then
+            local back, backError = constructWidget(IMAGE_CLASS, canvas)
+            if back == nil then return unwind(backError) end
+            built[#built + 1] = back
+            pcall(function() back:SetColorAndOpacity(EXP_BACK_COLOR) end)
+            if place(canvas, back, boxPlacement(originX, width), zOrder) == nil then
+                return unwind("preview experience backing was rejected")
+            end
+
+            local fill, fillError = constructWidget(IMAGE_CLASS, canvas)
+            if fill == nil then return unwind(fillError) end
+            built[#built + 1] = fill
+            pcall(function() fill:SetColorAndOpacity(EXP_FILL_COLOR) end)
+            local fillSlot = place(canvas, fill,
+                boxPlacement(originX, 0.0), zOrder + 1)
+            if fillSlot == nil then
+                return unwind("preview experience fill was rejected")
+            end
+            exp.style = "flat"
+            exp.back = back
+            exp.fill = fill
+            exp.fillSlot = fillSlot
+        else
+            return unwind("preview experience style is unavailable")
+        end
+    end
+
+    if wantText then
+        local label, labelError = constructWidget(TEXT_BLOCK_CLASS, canvas)
+        if label == nil then return unwind(labelError) end
+        built[#built + 1] = label
+        styleLabel(label, liveCockpit)
+
+        local placement
+        if CONFIG.READOUT_PLACEMENT == "center" and stretchToGauge then
+            placement = {
+                anchor = { X = 0.5, Y = anchor.Y },
+                align = { X = 0.5, Y = 0.5 },
+                position = {
+                    X = originX + CONFIG.TEXT_OFFSET_X,
+                    Y = centreY + CONFIG.TEXT_OFFSET_Y,
+                },
+            }
+        elseif CONFIG.READOUT_PLACEMENT == "center" then
+            placement = {
+                anchor = anchor,
+                align = { X = 0.5, Y = 0.5 },
+                position = {
+                    X = originX + width * 0.5 + CONFIG.TEXT_OFFSET_X,
+                    Y = centreY + CONFIG.TEXT_OFFSET_Y,
+                },
+            }
+        elseif stretchToGauge then
+            placement = {
+                anchor = { X = 1.0, Y = anchor.Y },
+                align = { X = 0.0, Y = 0.5 },
+                position = {
+                    X = originX + CONFIG.TEXT_OFFSET_X,
+                    Y = centreY + CONFIG.TEXT_OFFSET_Y,
+                },
+            }
+        else
+            placement = {
+                anchor = anchor,
+                align = { X = 0.0, Y = 0.5 },
+                position = {
+                    X = originX + width + CONFIG.TEXT_OFFSET_X,
+                    Y = centreY + CONFIG.TEXT_OFFSET_Y,
+                },
+            }
+        end
+        if place(canvas, label, placement, zOrder + 2) == nil then
+            return unwind("preview experience readout was rejected")
+        end
+        exp.label = label
+    end
+
+    local playerState = resolvePlayerState(liveCockpit)
+    if not isValid(playerState) then
+        return unwind("preview player state is unavailable")
+    end
+    local reading = experienceSpan(playerState, exp)
+    if reading == nil then
+        return unwind("preview experience values are unavailable")
+    end
+    stampExperience(exp, reading)
+    log(string.format(
+        "PREVIEW | experience mounted | %s %s | %s x %.0f",
+        exp.style, CONFIG.EXP_ANCHOR,
+        stretchToGauge and "Health-stretch" or string.format("%.0f", width),
+        height))
+    return exp, nil
 end
 
 --========================================================--
@@ -2146,7 +2366,12 @@ local function tick()
     if cockpit == nil then return end
 
     if state.previewRequested then
+        -- The menu collapses the live cockpit behind its retainer. Building a
+        -- new HUD label or experience gauge in that collapsed tree records the
+        -- wrong geometry and leaks it back into the world. While preview is
+        -- active, only the independent preview tree may be constructed.
         applyPreviewVisibility(cockpit)
+        return
     elseif state.previewApplied or state.previewMounted then
         restorePreviewVisibility(true)
     end

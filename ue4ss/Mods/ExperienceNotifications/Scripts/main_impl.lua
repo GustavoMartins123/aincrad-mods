@@ -128,9 +128,7 @@ local enemyClass = nil
 local function resolveEnemyClass()
     if isValid(enemyClass) then return enemyClass end
     enemyClass = nil
-    local ok, class = pcall(function()
-        return StaticFindObject("/Script/ROD.RODEnemyCharacter")
-    end)
+    local ok, class = pcall(StaticFindObject, "/Script/ROD.RODEnemyCharacter")
     if ok and isValid(class) then enemyClass = class end
     return enemyClass
 end
@@ -200,13 +198,13 @@ local function resolveNotificationUi()
     cachedMessageLog = nil
     cachedWidgetLibrary = nil
 
-    local ok, messageLog, widgetLibrary = pcall(function()
-        return FindFirstOf("RODInfoMessageLogWidget"),
-            StaticFindObject("/Script/UMG.Default__WidgetBlueprintLibrary")
-    end)
-    if not ok then
-        return nil, nil, "native notification UI lookup failed: " ..
-            tostring(messageLog)
+    local okLog, messageLog = pcall(FindFirstOf, "RODInfoMessageLogWidget")
+    if not okLog then
+        return nil, nil, "native notification UI lookup failed: " .. tostring(messageLog)
+    end
+    local okLib, widgetLibrary = pcall(StaticFindObject, "/Script/UMG.Default__WidgetBlueprintLibrary")
+    if not okLib then
+        return nil, nil, "canonical WidgetBlueprintLibrary lookup failed: " .. tostring(widgetLibrary)
     end
     if not isValid(messageLog) then
         return nil, nil, "active RODInfoMessageLogWidget is unavailable"
