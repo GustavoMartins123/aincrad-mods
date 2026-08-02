@@ -922,7 +922,15 @@ local function sanitizeNativeOwnedActors(reason)
 end
 
 local function beginTravel(reason)
-    if awaitingTravelRestart and worldPaused and resumeAtMs == nil then return end
+    if awaitingTravelRestart and worldPaused and resumeAtMs == nil then
+        -- Quest-end/travel emits more than one boundary callback. The first
+        -- callback starts the quarantine, while later callbacks can still
+        -- create Async-owned GameplayEffects during the native teardown.
+        -- Keep the single poll chain armed for the latest callback instead of
+        -- returning with only the pre-transition pass having run.
+        requestNativeSanitize("continued transition: " .. tostring(reason))
+        return
+    end
     local nativeResolved, nativeCleared, nativeTracked, nativeError =
         sanitizeNativeOwnedActors(reason)
     generation = generation + 1
@@ -936,6 +944,11 @@ local function beginTravel(reason)
     end
     clearWorldReferences()
     scheduleReferenceCollection()
+    -- Unreal may create the actor's GameplayEffect graph after the pre-hook
+    -- pass, while the outgoing world is being torn down. The native bridge
+    -- retains the weak identities, so this delayed pass can clear Async from
+    -- that late-created graph without retaining Lua references to the world.
+    requestNativeSanitize("post-transition: " .. tostring(reason))
     if nativeError ~= nil then releaseFailures = releaseFailures + 1 end
     if releaseFailures > 0 then
         log(string.format(
@@ -968,6 +981,7 @@ local function beginRestartSettle()
     if followedTravel then
         clearWorldReferences()
         scheduleReferenceCollection()
+        requestNativeSanitize("post-ClientRestart after travel")
         log(string.format(
             "TRAVEL SETTLE | ClientRestart after travel | waiting %g seconds",
             RESTART_SETTLE_MS / 1000
@@ -985,10 +999,14 @@ local function beginRestartSettle()
         #pendingSpawns,
         #spawnQueue
     ))
+    requestNativeSanitize("post-ClientRestart without travel")
 end
 
 local function beginSameWorldSettle(reason)
-    if awaitingTravelRestart and worldPaused and resumeAtMs == nil then return end
+    if awaitingTravelRestart and worldPaused and resumeAtMs == nil then
+        requestNativeSanitize("continued same-world transition: " .. tostring(reason))
+        return
+    end
     local nativeResolved, nativeCleared, nativeTracked, nativeError =
         sanitizeNativeOwnedActors(reason)
     worldPaused = true
@@ -996,6 +1014,7 @@ local function beginSameWorldSettle(reason)
     if resumeAtMs == nil or resumeAtMs < requestedResumeAtMs then
         resumeAtMs = requestedResumeAtMs
     end
+    requestNativeSanitize("post-same-world transition: " .. tostring(reason))
     if nativeError ~= nil then
         log("WORLD QUARANTINE ERROR | " .. tostring(reason) .. " | " ..
             tostring(nativeError))
@@ -3392,26 +3411,34 @@ for _, travelHook in ipairs({
     { "/Script/ROD.RODGameState:StartQuestEnd", "StartQuestEnd" },
     { "/Script/ROD.RODGameState:QuestEnd", "QuestEnd" },
     { "/Script/ROD.RODGameState:ShowQuestResult", "GameState.ShowQuestResult" },
+    { "/Script/ROD.RODHeroCharacter:ServerRequestQuestEnd", "Hero.ServerRequestQuestEnd" },
+    { "/Script/ROD.RODHeroCharacter:MulticastQuestEnd", "Hero.MulticastQuestEnd" },
     { "/Script/ROD.RODPlayerState:ServerDecideTown", "ServerDecideTown" },
     { "/Script/ROD.RODPlayerState:ServerShowQuestResult", "ServerShowQuestResult" },
 }) do
     local hookPath = travelHook[1]
     local hookLabel = travelHook[2]
-    requireHook(hookPath, function() beginTravel(hookLabel) end)
+    requireHook(
+        hookPath,
+        function() beginTravel(hookLabel) end,
+        function() requestNativeSanitize("post-boundary: " .. hookLabel) end
+    )
 end
 
 requireHook(
     "/Script/ROD.RODPlayerState:ServerDecideFastTravel",
     function()
         beginSameWorldSettle("ServerDecideFastTravel(same-world)")
-    end
+    end,
+    function() requestNativeSanitize("post-boundary: ServerDecideFastTravel") end
 )
 
 requireHook(
     "/Script/ROD.RODPlayerState:ServerDecideStartTerminal",
     function()
         beginTravel("ServerDecideStartTerminal")
-    end
+    end,
+    function() requestNativeSanitize("post-boundary: ServerDecideStartTerminal") end
 )
 
 -- Mod-performed same-world travel does not enter ServerDecideFastTravel.
@@ -3456,15 +3483,21 @@ requireHook(
     "/Script/ROD.RODHeroCharacter:MulticastRestSafeArea",
     function()
         beginTravel("MulticastRestSafeArea (Checkpoint Rest)")
-    end
+    end,
+    function() requestNativeSanitize("post-boundary: MulticastRestSafeArea") end
 )
 
 requireHook(
     "/Script/ROD.RODPlayerState:ServerNotifyQuestTeleportOut",
-    beginQuestTeleportSettle
+    beginQuestTeleportSettle,
+    function() requestNativeSanitize("post-boundary: ServerNotifyQuestTeleportOut") end
 )
 
-requireHook("/Script/Engine.PlayerController:ClientRestart", beginRestartSettle)
+requireHook(
+    "/Script/Engine.PlayerController:ClientRestart",
+    beginRestartSettle,
+    function() requestNativeSanitize("post-boundary: ClientRestart") end
+)
 
 RegisterConsoleCommandGlobalHandler(
     "enemy_director_status",

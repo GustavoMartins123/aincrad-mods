@@ -107,10 +107,12 @@ For those exact actor object graphs only, the bridge clears the internal `Async`
 GC flag that would otherwise keep their Gameplay Effects and outgoing World
 rooted. It verifies each flag removal and retains only weak identities that are
 still live, allowing later same-world passes to sanitize new Gameplay Effects
-without retaining any UObject. On world travel Lua then releases outgoing-world
-references without destroying actors or racing Unreal's asynchronous teardown.
-Processing resumes only after the matching `ClientRestart` signal and settlement
-period.
+without retaining any UObject. The Lua lifecycle runs one pass before the
+boundary and rearms the same poll chain after the native boundary callback and
+after `ClientRestart`, covering effects created during asynchronous teardown.
+On world travel Lua then releases outgoing-world references without destroying
+actors or racing Unreal's asynchronous teardown. Processing resumes only after
+the matching `ClientRestart` signal and settlement period.
 
 The safe lobby and a mission are separate worlds. A `ClientRestart` that follows
 confirmed travel starts a clean scan of the new world. A standalone
@@ -187,8 +189,9 @@ logging.
   has already been issued, the director fails closed and requires a mission
   restart instead of destroying an actor during asynchronous initialization.
 - Quest-end hooks clear verified `Async` roots only from exact issued-actor
-  object graphs, then release outgoing-world Lua references before Unreal begins
-  collection. Unreal remains the authoritative owner of actor teardown.
+  object graphs before and after the boundary, then release outgoing-world Lua
+  references before Unreal begins collection. Unreal remains the authoritative
+  owner of actor teardown.
 - A material that lacks the exact configured colour parameter will keep its
   original appearance and produce an explicit error.
 - A spawn is skipped with an explicit error only after all 12 NavMesh path
