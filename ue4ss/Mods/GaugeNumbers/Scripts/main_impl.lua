@@ -169,10 +169,8 @@ do
 end
 
 -- ModMenu publishes this as an explicit transient marker only while
--- GaugeNumbers is expanded. It is deliberately separate from runtime.lua:
--- preview state must never become a saved player setting. ModMenu clears the
--- marker on startup and on panel close, so editing does not depend on a timer
--- or on repeated parent changes.
+-- GaugeNumbers is expanded. Preview state must never become a saved player
+-- setting; GaugeNumbers resolves the live menu independently from this marker.
 local PREVIEW_PATH = SCRIPT_DIR .. "preview.lua"
 local PREVIEW_POLL_MS = 250
 local previewFingerprint = nil
@@ -298,16 +296,46 @@ local mountPreviewExperience
 local PREVIEW_CLONE_PREFIX = "GaugeNumbers_PreviewUnitGauge_"
 local previewCloneSerial = 0
 
-local function resolvePreviewCanvas()
-    local ok, menu = pcall(function()
-        return FindFirstOf("WBP_Console_MainMenu_C")
-    end)
-    if not ok or not isValid(menu) then return nil end
+local function dereferenceWeakObject(pointer)
+    if isValid(pointer) then return pointer end
+    return weakObject(pointer)
+end
 
-    local canvas = nil
-    local read = pcall(function() canvas = menu.SubMenu end)
-    if not read or not isValid(canvas) then return nil end
-    return canvas
+local function resolvePreviewCanvas()
+    local menus = nil
+    local found = pcall(function()
+        menus = FindAllOf("WBP_Console_MainMenu_C")
+    end)
+    if not found or type(menus) ~= "table" then
+        return nil, "could not enumerate live start menus"
+    end
+
+    local candidates = {}
+    for _, menu in ipairs(menus) do
+        if isValid(menu) then
+            local canvas = nil
+            local parentComponent = nil
+            local parentActor = nil
+            local read = pcall(function()
+                canvas = menu.SubMenu
+                parentComponent = dereferenceWeakObject(menu.ParentComponent)
+                parentActor = dereferenceWeakObject(menu.ParentActor)
+            end)
+            -- The interactive start menu is attached to the game's world-space
+            -- component/actor. Detached preview copies and menu objects left
+            -- over from another world have neither live owner and are not a
+            -- valid target for this mod.
+            if read and isValid(canvas)
+                and (isValid(parentComponent) or isValid(parentActor)) then
+                candidates[#candidates + 1] = canvas
+            end
+        end
+    end
+    if #candidates == 1 then return candidates[1], nil end
+    if #candidates == 0 then
+        return nil, "no canonical live start-menu canvas exists"
+    end
+    return nil, "multiple canonical live start-menu canvases exist"
 end
 
 local function discardPreviewWidgetState()
@@ -375,10 +403,10 @@ local function sweepOrphanedPreviewClones(canvas)
 end
 
 capturePreviewMount = function(cockpit)
-    local menuCanvas = resolvePreviewCanvas()
+    local menuCanvas, menuError = resolvePreviewCanvas()
     if menuCanvas == nil then
         reportOnce("PREVIEW-MOUNT",
-            "PREVIEW ERROR | live menu SubMenu canvas is unavailable")
+            "PREVIEW ERROR | " .. tostring(menuError))
         return false
     end
 
