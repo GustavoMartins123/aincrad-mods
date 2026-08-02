@@ -767,6 +767,67 @@ do
             registeredBodies)
     end
 
+    -- Realign a spawned extra's collision responses with the contract captured
+    -- from a natural enemy of the same class.
+    --
+    -- A deferred GameplayStatics spawn never runs the enemy's own collision
+    -- setup, so its per-body-part hitboxes can come up on the wrong channels.
+    -- The one that matters is the attack trace: an extra whose hitbox stopped
+    -- responding to it is physically present but swings pass through it, while
+    -- thrown weapons and companion attacks still connect. Enemies with every
+    -- multiplier at 1.0 still arrived this way, so it is the spawn path and not
+    -- mutation.
+    --
+    -- PHYSICAL_COLLISION_FIELDS is built in ECollisionChannel order -- the
+    -- eight named channels, then EngineTraceChannel1-6, then
+    -- GameTraceChannel1-18 -- so a field's position is its channel number.
+    -- Nothing is invented here: every value written comes from the natural
+    -- enemy, and the existing contract re-checks the result on the next audit.
+    function enemyContracts.repairCollision(enemy, expected)
+        if type(expected) ~= "table" then return false, "no contract to repair against" end
+
+        local repaired = 0
+        local ok, repairError = pcall(function()
+            local capsule = enemy.CapsuleComponent
+            local multi = enemy.MultiCapsuleComponent
+            if not isValid(capsule) or not isValid(multi) then
+                error("capsule hierarchy is unavailable")
+            end
+
+            local function align(component, contract, label)
+                if component == nil or contract == nil then return end
+                if not isValid(component) then return end
+                for index, field in ipairs(PHYSICAL_COLLISION_FIELDS) do
+                    local want = contract.responses[field]
+                    local have = tonumber(
+                        component.BodyInstance.CollisionResponses
+                            .ResponseToChannels[field])
+                    if want ~= nil and have ~= nil and want ~= have then
+                        component:SetCollisionResponseToChannel(index - 1, want)
+                        repaired = repaired + 1
+                        dbg("COLLISION REPAIR | " .. label .. " " .. field ..
+                            " " .. tostring(have) .. " -> " .. tostring(want))
+                    end
+                end
+            end
+
+            align(capsule, expected.root, "CapsuleComponent")
+            if expected.multiIsRoot ~= true then
+                align(multi, expected.multi, "MultiCapsuleComponent")
+            end
+            local extras = multi.ExtraCapsuleComponents
+            if extras ~= nil and expected.extras ~= nil then
+                for index = 1, math.min(#extras, #expected.extras) do
+                    align(extras[index], expected.extras[index],
+                        "ExtraCapsuleComponents[" .. tostring(index) .. "]")
+                end
+            end
+        end)
+
+        if not ok then return false, firstErrorLine(repairError) end
+        return true, repaired
+    end
+
     function enemyContracts.controlOperational(enemy)
         local operational, lifecycleError = enemyOperational(enemy)
         if not operational then return nil, lifecycleError end
@@ -1283,6 +1344,14 @@ local function snapshotEnemy(enemy)
     if parsedMeshScale == nil then
         return nil, "skeletal mesh RelativeScale3D is invalid"
     end
+    -- Visual size is applied to the actor, so its untouched scale is part of
+    -- the baseline that mutation multiplies and rollback restores.
+    local okActorScale, rawActorScale =
+        pcall(function() return enemy:GetActorScale3D() end)
+    local parsedActorScale = okActorScale and vector(rawActorScale) or nil
+    if parsedActorScale == nil then
+        return nil, "actor scale is unavailable"
+    end
     for key, value in pairs({
         MaxHelth = maxHealth,
         AttackPower = attack,
@@ -1301,8 +1370,10 @@ local function snapshotEnemy(enemy)
     local gas, gasError = snapshotGas(enemy, className)
     if gas == nil then return nil, gasError end
 
-    -- SDK 1.0.3 defines the categories directly. Encounter flags and cinematic
-    -- sequences are not used as substitute classification data.
+    -- EnemyRole is the mutation category and nothing else. It decides which
+    -- multiplier set applies, and it must not decide what may be spawned:
+    -- ordinary field elites carry EnemyRole_Boss too (BP_E001004, a boar), so
+    -- keying spawn protection on it pulls normal elites out of the catalog.
     local tier = "common"
     if enemyRole == ENEMY_ROLE_ELITE then
         tier = "elite"
@@ -1312,9 +1383,33 @@ local function snapshotEnemy(enemy)
         and enemyRole ~= ENEMY_ROLE_MOB then
         return nil, "EnemyRole has no canonical mutation category"
     end
+
+    -- Spawn protection keys on staging only a mission's own boss owns. A field
+    -- elite has none of it, and a mission boss keeps it regardless of how its
+    -- role happens to read.
+    --
+    -- Unreadable staging counts as "mission boss". These fields decide whether
+    -- a class may be duplicated at all, and a boss wrongly admitted to the
+    -- catalog stays there for the rest of the session, so the safe answer to
+    -- "I could not tell" is to refuse the class rather than risk multiplying a
+    -- mission boss.
+    local stagingOk, goldenGate, eventSequence, finisherSequence =
+        pcall(function()
+            return enemy.GoldenGateBoss,
+                enemy.BossEventSequence,
+                enemy.BossFinisherLevelSequence
+        end)
+    local isMissionBoss = true
+    if stagingOk then
+        isMissionBoss = goldenGate == true
+            or isValid(eventSequence)
+            or isValid(finisherSequence)
+    end
+
     return {
         mesh = mesh,
         meshScale = parsedMeshScale,
+        actorScale = parsedActorScale,
         MaxHelth = maxHealth,
         AttackPower = attack,
         DefencePower = defence,
@@ -1323,6 +1418,8 @@ local function snapshotEnemy(enemy)
         enemyRole = enemyRole,
         tier = tier,
         isBoss = tier == "boss",
+        isMissionBoss = isMissionBoss,
+        stagingReadable = stagingOk,
         gas = gas,
     }, nil
 end
@@ -1490,6 +1587,10 @@ local function captureMutationState(state)
     if snapshot.meshScale == nil then
         error("live skeletal mesh RelativeScale3D is invalid")
     end
+    snapshot.actorScale = vector(object:GetActorScale3D())
+    if snapshot.actorScale == nil then
+        error("live actor scale is invalid")
+    end
     snapshot.MaxHelth = object.MaxHelth
     snapshot.AttackPower = object.AttackPower
     snapshot.DefencePower = object.DefencePower
@@ -1518,6 +1619,7 @@ local function rollbackMutation(state, previous)
             error("rollback skeletal mesh is unavailable")
         end
         previous.mesh:SetRelativeScale3D(previous.meshScale)
+        object:SetActorScale3D(previous.actorScale)
         object.MaxHelth = previous.MaxHelth
         object.AttackPower = previous.AttackPower
         object.DefencePower = previous.DefencePower
@@ -1579,6 +1681,7 @@ local function restoreState(state)
             error("baseline skeletal mesh is unavailable")
         end
         base.mesh:SetRelativeScale3D(base.meshScale)
+        state.object:SetActorScale3D(base.actorScale)
         state.object.MaxHelth = base.MaxHelth
         state.object.AttackPower = base.AttackPower
         state.object.DefencePower = base.DefencePower
@@ -1682,10 +1785,18 @@ local function applyMutation(state)
     local scaleFactor = CONFIG.SCALE_MIN
         + (CONFIG.SCALE_MAX - CONFIG.SCALE_MIN) * state.scaleRoll
     local base = state.baseline
+    -- Size is applied to the actor, not to the skeletal mesh.
+    --
+    -- Scaling only the mesh left the collision capsules at their authored size,
+    -- so a 1.5x enemy rendered half again as large as the box that actually
+    -- collides: horizontal swings at the visible body missed, and only an
+    -- attack coming down from above landed, because that is where the
+    -- unscaled capsule still was. Scaling the actor takes the capsules with
+    -- it, so what is drawn and what can be hit are the same size again.
     local newScale = {
-        X = base.meshScale.X * scaleFactor,
-        Y = base.meshScale.Y * scaleFactor,
-        Z = base.meshScale.Z * scaleFactor,
+        X = base.actorScale.X * scaleFactor,
+        Y = base.actorScale.Y * scaleFactor,
+        Z = base.actorScale.Z * scaleFactor,
     }
     local movingSpeed = base.MovingSpeed * profile.moveSpeed
     local actualGas
@@ -1700,7 +1811,9 @@ local function applyMutation(state)
         if not isValid(base.mesh) then
             error("baseline skeletal mesh is unavailable")
         end
-        base.mesh:SetRelativeScale3D(newScale)
+        -- The mesh is held at its authored scale; only the actor carries size.
+        base.mesh:SetRelativeScale3D(base.meshScale)
+        state.object:SetActorScale3D(newScale)
         state.object.MaxHelth = roundedProduct(base.MaxHelth, profile.health)
         state.object.AttackPower = roundedProduct(base.AttackPower, profile.attack)
         state.object.DefencePower = roundedProduct(base.DefencePower, profile.defence)
@@ -2341,6 +2454,21 @@ local function registerEnemy(enemy, reused, queued)
     end
     local previous = states[key]
     if previous ~= nil and not reused then return end
+    -- The baseline is what "before this mod touched it" means, and it is read
+    -- from the live actor. Re-registration therefore re-reads an actor this mod
+    -- may already have mutated, and records the mutated size as the original:
+    -- a 3x enemy re-rolled at 2x becomes 6x, which is how scales outside the
+    -- configured range appear. Carry the first baseline forward instead, so it
+    -- keeps meaning the same thing however often the game recycles the actor.
+    local preservedBaseline = nil
+    local preservedScaleRoll = nil
+    local preservedClassKey = nil
+    if previous ~= nil and previous.applied
+        and type(previous.baseline) == "table" then
+        preservedBaseline = previous.baseline
+        preservedScaleRoll = previous.scaleRoll
+        preservedClassKey = previous.classKey
+    end
     if previous ~= nil then
         if previous.owned then
             if request == nil then
@@ -2379,7 +2507,18 @@ local function registerEnemy(enemy, reused, queued)
         log("WORLD ERROR | " .. worldFault .. " | director paused")
         return
     end
-    local baseline, snapshotError = snapshotEnemy(enemy)
+    -- Only reuse the preserved baseline when the actor is still the same
+    -- species. The game's pool can hand the same actor back as a different
+    -- enemy, and that one is genuinely new: its own untouched state is the
+    -- correct reference.
+    local baseline, snapshotError = nil, nil
+    if preservedBaseline ~= nil and preservedClassKey == classKey then
+        baseline = preservedBaseline
+        dbg("BASELINE PRESERVED | " .. key ..
+            " | kept pre-mutation reference across re-registration")
+    else
+        baseline, snapshotError = snapshotEnemy(enemy)
+    end
     if baseline == nil then
         if queued ~= nil and snapshotErrorIsTransient(snapshotError) then
             local retryCount = (queued.retryCount or 0) + 1
@@ -2411,13 +2550,22 @@ local function registerEnemy(enemy, reused, queued)
         end
         return
     end
-    if baseline.isBoss then
+    if baseline.isMissionBoss then
+        -- protectBossClass logs once per class; this only records the reason
+        -- when the class was refused because its staging could not be read.
+        if not baseline.stagingReadable then
+            dbg("MISSION BOSS ASSUMED | " .. classKey ..
+                " | boss staging was unreadable; refused as a precaution")
+        end
         protectBossClass(classKey)
         if request ~= nil then
-            spawnQueue = {}
-            worldFault = "owned spawn initialized as protected boss " ..
-                key .. "; mission restart required"
-            log("WORLD ERROR | " .. worldFault .. " | director paused")
+            -- An extra that turned out to be a mission boss is quarantined and
+            -- handed back to the game like any other rejected extra. Its class
+            -- is now protected, so the mistake cannot repeat this session.
+            states[key] = nil
+            quarantinedActorKeys[key] = true
+            log("MISSION BOSS QUARANTINED | " .. key ..
+                " | issued extra left to the game; class removed from the catalog")
             return
         end
     end
@@ -2440,6 +2588,9 @@ local function registerEnemy(enemy, reused, queued)
         admissionStableSamples = 0,
         admissionDeadlineMs =
             request and (elapsedMs + OWNED_ADMISSION_TIMEOUT_MS) or nil,
+        -- Carried with the baseline it belongs to. Re-rolling on every
+        -- re-registration is what made one enemy change size on its own.
+        scaleRoll = (baseline == preservedBaseline) and preservedScaleRoll or nil,
         applied = false,
     }
     states[key] = state
@@ -2465,8 +2616,10 @@ local function registerEnemy(enemy, reused, queued)
     -- INCLUDE_BOSSES controls mutation only. Boss classes and boss actors are
     -- never admitted to either spawning structure, so a quest boss cannot be
     -- duplicated by same-species multiplication or by randomisation.
+    -- Only the mission's own boss is kept out of the catalog. Field elites are
+    -- ordinary enemies here and are multiplied and mutated like any other.
     if not state.owned
-        and not baseline.isBoss
+        and not baseline.isMissionBoss
         and protectedBossClasses[classKey] ~= true then
         local physicalContract, physicalError =
             enemyContracts.capturePhysical(enemy)
@@ -2733,6 +2886,19 @@ local function auditOwnedEnemyCollision()
                 enemyContracts.comparePhysical(
                     state.object,
                     state.expectedPhysical)
+            -- One repair attempt per extra, and only for a collision mismatch.
+            -- The comparison above is what verifies it: a repaired extra simply
+            -- passes on the next audit, and one that cannot be repaired still
+            -- reaches its deadline and is quarantined exactly as before.
+            if physical ~= true and state.collisionRepairTried ~= true then
+                state.collisionRepairTried = true
+                local repairOk, repairDetail = enemyContracts.repairCollision(
+                    state.object, state.expectedPhysical)
+                log("COLLISION REPAIR | " .. tostring(state.key) .. " | " ..
+                    (repairOk
+                        and (tostring(repairDetail) .. " channel(s) realigned")
+                        or ("failed: " .. tostring(repairDetail))))
+            end
             local controlled, controlDetail =
                 enemyContracts.controlOperational(state.object)
             local inEnemies, inGroup, registryDetail =
@@ -3870,10 +4036,123 @@ RegisterConsoleCommandGlobalHandler(
     end
 )
 
+-- Diff an issued extra against a natural enemy of the same class.
+--
+-- Both come from the same Blueprint, so anything that differs at runtime was
+-- done to the natural one by the game's own spawn path and not by ours. The
+-- admission contract already covers the capsules; every field below is
+-- deliberately something it does NOT check, because extras have been arriving
+-- that pass the contract and still cannot be hit.
+--
+-- Read-only. Every read is guarded, and an unreadable field prints as "?"
+-- instead of stopping the report.
+RegisterConsoleCommandGlobalHandler(
+    "enemy_director_diff",
+    function()
+        ExecuteInGameThread(function()
+            -- Pick the extra nearest the hero: whoever runs this is standing in
+            -- front of the enemy they are complaining about.
+            local extra, natural = nil, nil
+            local heroPos = resolveHeroLocation()
+            local bestDistance = nil
+            for _, state in pairs(states) do
+                if state.owned and isValid(state.object) then
+                    local distance = nil
+                    if heroPos ~= nil then
+                        local position = actorLocation(state.object)
+                        if position ~= nil then
+                            distance = planarDistanceSquared(heroPos, position)
+                        end
+                    end
+                    if extra == nil
+                        or (distance ~= nil
+                            and (bestDistance == nil or distance < bestDistance)) then
+                        extra = state
+                        bestDistance = distance
+                    end
+                end
+            end
+            if extra == nil then
+                log("DIFF | no issued extra is currently tracked")
+                return
+            end
+            for _, state in pairs(states) do
+                if not state.owned and isValid(state.object)
+                    and state.classKey == extra.classKey then
+                    natural = state
+                    break
+                end
+            end
+            if natural == nil then
+                log("DIFF | no natural enemy of class " ..
+                    tostring(extra.classKey) .. " is loaded to compare against")
+                return
+            end
+
+            local function read(object, reader)
+                local ok, value = pcall(reader, object)
+                if not ok or value == nil then return "?" end
+                if type(value) == "userdata" then return "<obj>" end
+                return tostring(value)
+            end
+
+            local probes = {
+                { "actor.EnableCollision", function(e) return e:GetActorEnableCollision() end },
+                { "actor.CanBeDamaged", function(e) return e:CanBeDamaged() end },
+                { "enemy.bInitialized", function(e) return e.bInitialized end },
+                { "enemy.bAbilitiesInitialized", function(e) return e.bAbilitiesInitialized end },
+                { "enemy.DisableDetectFlag", function(e) return e.DisableDetectFlag end },
+                { "enemy.EnemyRole", function(e) return e.EnemyRole end },
+                { "enemy.EnemyType", function(e) return e.EnemyType end },
+                { "enemy.EnemyCharacterID", function(e) return e.EnemyCharacterID end },
+                { "enemy.MaxHelth", function(e) return e.MaxHelth end },
+                { "enemy.AttackPower", function(e) return e.AttackPower end },
+                { "enemy.DefencePower", function(e) return e.DefencePower end },
+                { "enemy.EnemyLevel", function(e) return e.EnemyLevel end },
+                { "enemy.AbilitySystem", function(e) return e.AbilitySystem end },
+                -- The skeletal mesh is the prime suspect: melee traces hit its
+                -- physics bodies, and the contract never looks at it.
+                { "mesh.CollisionEnabled", function(e) return e.Mesh:GetCollisionEnabled() end },
+                { "mesh.CollisionObjectType", function(e) return e.Mesh:GetCollisionObjectType() end },
+                { "mesh.CollisionProfile", function(e) return e.Mesh:GetCollisionProfileName():ToString() end },
+                { "mesh.SimulatingPhysics", function(e) return e.Mesh:IsSimulatingPhysics() end },
+                { "mesh.IsActive", function(e) return e.Mesh:IsActive() end },
+                { "mesh.Visible", function(e) return e.Mesh:IsVisible() end },
+                { "mesh.GenerateOverlaps", function(e) return e.Mesh.BodyInstance.bGenerateOverlapEvents end },
+                { "mesh.resp.Pawn", function(e) return e.Mesh.BodyInstance.CollisionResponses.ResponseToChannels.Pawn end },
+                { "mesh.resp.Visibility", function(e) return e.Mesh.BodyInstance.CollisionResponses.ResponseToChannels.Visibility end },
+                { "mesh.resp.GameTrace1", function(e) return e.Mesh.BodyInstance.CollisionResponses.ResponseToChannels.GameTraceChannel1 end },
+                { "mesh.resp.GameTrace2", function(e) return e.Mesh.BodyInstance.CollisionResponses.ResponseToChannels.GameTraceChannel2 end },
+                { "mesh.resp.GameTrace3", function(e) return e.Mesh.BodyInstance.CollisionResponses.ResponseToChannels.GameTraceChannel3 end },
+                { "mesh.resp.GameTrace4", function(e) return e.Mesh.BodyInstance.CollisionResponses.ResponseToChannels.GameTraceChannel4 end },
+            }
+
+            log("DIFF | class=" .. tostring(extra.classKey))
+            log("DIFF | extra=" .. tostring(extra.key))
+            log("DIFF | natural=" .. tostring(natural.key))
+            local differences = 0
+            for _, probe in ipairs(probes) do
+                local label, reader = probe[1], probe[2]
+                local extraValue = read(extra.object, reader)
+                local naturalValue = read(natural.object, reader)
+                if extraValue ~= naturalValue then
+                    differences = differences + 1
+                    log(string.format(
+                        "DIFF | %-28s natural=%-14s extra=%s",
+                        label, naturalValue, extraValue))
+                end
+            end
+            log("DIFF | " .. tostring(differences) ..
+                " field(s) differ out of " .. tostring(#probes))
+        end)
+        return true
+    end
+)
+
 math.randomseed(os.time())
 checkSettings(true)
 if not configHealthy or CONFIG == nil then
     error("[" .. MOD_NAME .. "] CONFIG ERROR | initial canonical configuration rejected")
 end
 poll()
-log("READY | waiting for the playable world; console: enemy_director_status")
+log("READY | waiting for the playable world; console: enemy_director_status, enemy_director_diff")

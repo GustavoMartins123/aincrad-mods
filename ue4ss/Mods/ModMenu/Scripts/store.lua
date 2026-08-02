@@ -175,10 +175,10 @@ local function removeFile(path)
     return false, tostring(removeError)
 end
 
--- The preview marker is a transient lease, not a user setting. Publish it by
--- staging the complete file first and then replacing the canonical path. A
--- missing marker is the closed state, so a short gap during replacement fails
--- closed and never exposes a half-written Lua table to the other mod's state.
+-- The preview marker is transient, not a user setting. Publish it by staging
+-- the complete file first and then replacing the canonical path. It is
+-- explicitly cleared by ModMenu on startup and close; it must not expire while
+-- the user is holding an input and editing a value.
 local function publishPreview(path, contents)
     local nextPath = path .. ".next"
     local previousText, previousReadError = bridge.readFile(path)
@@ -213,7 +213,7 @@ local function publishPreview(path, contents)
     if published == true then return true, nil end
 
     -- This is a transactional rollback of the marker, not an alternate
-    -- preview source. If publication failed, restore the exact previous lease
+    -- preview source. If publication failed, restore the exact previous marker
     -- or leave the canonical marker absent.
     local restored = true
     local restoreError = nil
@@ -235,22 +235,9 @@ function Store.setPreview(modName, active)
     end
 
     local path = previewPathFor(modName)
-    if not active then
-        local removed, removeError = removeFile(path)
-        if not removed then return false, "could not clear preview: " .. tostring(removeError) end
-        local stagedRemoved, stagedRemoveError = removeFile(path .. ".next")
-        if not stagedRemoved then
-            return false, "could not clear staged preview: " ..
-                tostring(stagedRemoveError)
-        end
-        return true, nil
-    end
-
-    local expiresAt = math.floor(os.time()) + 3
     local contents = table.concat({
         "return {",
-        "    ACTIVE = true,",
-        "    EXPIRES_AT = " .. tostring(expiresAt) .. ",",
+        "    ACTIVE = " .. tostring(active) .. ",",
         "}",
         "",
     }, "\n")

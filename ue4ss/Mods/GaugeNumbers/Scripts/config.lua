@@ -27,13 +27,14 @@ return {
     -- Both of the latter are painted before the gauge art, so a centred number
     -- lands behind the bar there; they are only useful with
     -- READOUT_PLACEMENT = "right", which puts the number clear of the art.
-    -- Whatever is chosen, the mod falls back to "gauge" if that canvas will not
-    -- take the widget -- attaching is the only honest test that it can.
+    -- The selected layer is strict. If that exact canvas is unavailable, the
+    -- readout reports an injection error instead of silently changing layers.
     READOUT_LAYER = "front",
 
-    -- Where each readout sits on that canvas, in its design-space pixels.
-    -- These are the centre of each bar, and design space does not change with
-    -- resolution, so one set of numbers holds everywhere. With
+    -- Where each readout sits on that canvas, in the HUD's own UI layout
+    -- units. These are not physical monitor pixels: the game supplies the
+    -- canvas's local design space, and the preview scales that space to the
+    -- live menu geometry. With
     -- READOUT_PLACEMENT = "center" the number is centred on the point; with
     -- "right" the point is its left edge.
     -- Tune these live from the in-game Mods menu until they sit right.
@@ -91,8 +92,9 @@ return {
     -- How the bar is drawn.
     --   "native" -> a real copy of the game's own gauge widget, driven by the
     --               game's own gauge setters. Same art, same frame, same shader
-    --               as the HP/Stamina/SP bars, recoloured. Falls back to "flat"
-    --               on its own if the copy cannot be made.
+    --               as the HP/Stamina/SP bars, recoloured. If this canonical
+    --               copy cannot be made, the mod reports an error; choose
+    --               "flat" explicitly when a flat bar is wanted.
     --   "flat"   -> two tinted rectangles drawn by the mod.
     EXP_STYLE = "native",
 
@@ -113,8 +115,9 @@ return {
     EXP_OFFSET_X = 0.0,
     EXP_OFFSET_Y = -4.0,
 
-    -- Experience bar geometry. Zero copies the anchor bar's own width and
-    -- height, which is what keeps all four bars looking like one set.
+    -- Experience bar geometry in the anchor canvas's UI layout units. Zero
+    -- copies the anchor bar's live geometry, which keeps all four bars in the
+    -- same scale. Non-zero values are an explicit custom size.
     EXP_BAR_WIDTH = 0.0,
     EXP_BAR_HEIGHT = 0.0,
 

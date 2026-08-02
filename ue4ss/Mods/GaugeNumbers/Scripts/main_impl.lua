@@ -81,19 +81,19 @@ local BOOLEAN_KEYS = {
 }
 
 local NUMBER_KEYS = {
-    HP_X           = { min = 0.0, max = 1920.0 },
-    HP_Y           = { min = 0.0, max = 1080.0 },
-    STAMINA_X      = { min = 0.0, max = 1920.0 },
-    STAMINA_Y      = { min = 0.0, max = 1080.0 },
-    SP_X           = { min = 0.0, max = 1920.0 },
-    SP_Y           = { min = 0.0, max = 1080.0 },
+    HP_X           = { min = 0.0, max = 10000.0 },
+    HP_Y           = { min = 0.0, max = 10000.0 },
+    STAMINA_X      = { min = 0.0, max = 10000.0 },
+    STAMINA_Y      = { min = 0.0, max = 10000.0 },
+    SP_X           = { min = 0.0, max = 10000.0 },
+    SP_Y           = { min = 0.0, max = 10000.0 },
     TEXT_OFFSET_X  = { min = -400.0, max = 400.0 },
     TEXT_OFFSET_Y  = { min = -400.0, max = 400.0 },
     FONT_SIZE      = { min = 6.0, max = 48.0 },
     EXP_OFFSET_X   = { min = -400.0, max = 400.0 },
     EXP_OFFSET_Y   = { min = -400.0, max = 400.0 },
-    EXP_BAR_WIDTH  = { min = 0.0, max = 1200.0 },
-    EXP_BAR_HEIGHT = { min = 0.0, max = 40.0 },
+    EXP_BAR_WIDTH  = { min = 0.0, max = 10000.0 },
+    EXP_BAR_HEIGHT = { min = 0.0, max = 10000.0 },
     REFRESH_MS     = { min = 100.0, max = 5000.0 },
 }
 
@@ -168,13 +168,15 @@ do
     readSettings(settings)
 end
 
--- ModMenu publishes this as a short-lived lease only while GaugeNumbers is
--- expanded. It is deliberately separate from runtime.lua: preview state must
--- never become a saved player setting.
+-- ModMenu publishes this as an explicit transient marker only while
+-- GaugeNumbers is expanded. It is deliberately separate from runtime.lua:
+-- preview state must never become a saved player setting. ModMenu clears the
+-- marker on startup and on panel close, so editing does not depend on a timer
+-- or on repeated parent changes.
 local PREVIEW_PATH = SCRIPT_DIR .. "preview.lua"
 local PREVIEW_POLL_MS = 250
 local previewFingerprint = nil
-local previewExpiresAt = 0
+local previewActive = false
 local previewValidationError = nil
 
 --========================================================--
@@ -192,11 +194,17 @@ local HIDDEN = 2
 local TEXT_BLOCK_CLASS = "/Script/UMG.TextBlock"
 local IMAGE_CLASS = "/Script/UMG.Image"
 local LAYOUT_LIBRARY = "/Script/UMG.Default__WidgetLayoutLibrary"
+local SLATE_LIBRARY = "/Script/UMG.Default__SlateBlueprintLibrary"
 local WIDGET_LIBRARY = "/Script/UMG.Default__WidgetBlueprintLibrary"
 
 local WHITE = { R = 1.0, G = 1.0, B = 1.0, A = 1.0 }
 local EXP_FILL_COLOR = { R = 1.0, G = 0.78, B = 0.28, A = 1.0 }
 local EXP_BACK_COLOR = { R = 0.02, G = 0.03, B = 0.05, A = 0.55 }
+local PREVIEW_GAUGE_COLORS = {
+    HP = { R = 0.24, G = 1.0, B = 0.30, A = 1.0 },
+    STAMINA = { R = 1.0, G = 0.72, B = 0.02, A = 1.0 },
+    SP = { R = 0.00, G = 0.86, B = 1.0, A = 1.0 },
+}
 
 -- unit     the cockpit member holding the whole bar assembly.
 -- canvas   the CanvasPanel inside it that owns the bar's coordinate space.
@@ -249,12 +257,6 @@ end
 -- behind it.
 local NATIVE_DONOR = { unit = "PlayerUnitGauge_Stamina", gauge = "Stamina" }
 
--- Only used when nothing could be measured at all.
-local FALLBACK_BAR_WIDTH = 320.0
-local FALLBACK_BAR_HEIGHT = 12.0
-local PREVIEW_DESIGN_WIDTH = 1920.0
-local PREVIEW_DESIGN_HEIGHT = 1080.0
-
 --========================================================--
 --                        STATE                           --
 --========================================================--
@@ -266,30 +268,31 @@ local state = {
     fontDonor = nil,
     previewRequested = false,
     previewApplied = false,
-    previewSnapshot = nil,
     previewCockpit = nil,
-    previewGaugeWasVisible = nil,
-    previewCombatUIWasVisible = nil,
-    previewUnitGauge = nil,
-    previewOriginalParent = nil,
-    previewOriginalLayout = nil,
-    previewOriginalAutoSize = nil,
-    previewOriginalZOrder = nil,
+    previewMenuSize = nil,
     previewMenuCanvas = nil,
+    previewWidgets = {},
+    previewNative = {},
+    previewNativeValues = {},
     previewMounted = false,
 }
 
--- Assigned below the widget-lifecycle helpers so releaseWidgets can discard a
--- preview snapshot without reaching into a stale world during teardown.
+-- Assigned below the widget-lifecycle helpers so releaseWidgets can discard
+-- preview copies without reaching into a stale world during teardown.
 local restorePreviewVisibility
 local restorePreviewMount
+local capturePreviewMount
+local mountPreviewUnitGauge
+local capturePreviewVisibility
+local applyPreviewVisibility
+local readHeroValues
+local readPreviewGaugeGeometry
+local createNativeGaugeForPreview
+local refreshPreviewGaugeValues
 
--- The menu is a separate viewport layer from the cockpit. Visibility on the
--- UnitGauge itself is therefore not enough: when the menu is open, the cockpit
--- can be perfectly visible and still be drawn underneath the menu's RetainerBox.
--- The live menu owns a full-screen SubMenu canvas, so the preview temporarily
--- mounts only UnitGauge there. Its original parent and CanvasPanelSlot layout
--- are retained and restored when the preview lease ends.
+-- The menu is a separate viewport layer from the cockpit. The live menu owns a
+-- full-screen SubMenu canvas, so the preview draws independent native gauge
+-- copies there; the original UnitGauge remains in the cockpit tree throughout.
 local function resolvePreviewCanvas()
     local ok, menu = pcall(function()
         return FindFirstOf("WBP_Console_MainMenu_C")
@@ -302,51 +305,62 @@ local function resolvePreviewCanvas()
     return canvas
 end
 
-local function clearPreviewMountState()
-    state.previewUnitGauge = nil
-    state.previewOriginalParent = nil
-    state.previewOriginalLayout = nil
-    state.previewOriginalAutoSize = nil
-    state.previewOriginalZOrder = nil
-    state.previewMenuCanvas = nil
+-- Read the live UMG design space. Preview slots use these units directly, so
+-- the bars track the game's DPI/layout scale instead of a physical monitor
+-- resolution.
+local function readViewportDesignSize()
+    local layout = nil
+    local controller = nil
+    local width = nil
+    local height = nil
+    local scale = nil
+    local read = pcall(function()
+        layout = StaticFindObject(LAYOUT_LIBRARY)
+        if not isValid(layout) then error("WidgetLayoutLibrary is unavailable") end
+        controller = FindFirstOf("RODInGamePlayerController")
+        if not isValid(controller) then
+            error("RODInGamePlayerController is unavailable")
+        end
+        local viewport = layout:GetViewportSize(controller)
+        width = tonumber(viewport.X)
+        height = tonumber(viewport.Y)
+        scale = tonumber(layout:GetViewportScale(controller))
+    end)
+    if not read or not finiteNumber(width) or not finiteNumber(height)
+        or not finiteNumber(scale) or width <= 0.0 or height <= 0.0
+        or scale <= 0.0 then
+        return nil
+    end
+    return {
+        width = width / scale,
+        height = height / scale,
+        note = string.format("viewport %.0fx%.0f @ dpi %.3f",
+            width, height, scale),
+    }
+end
+
+-- The original UnitGauge is part of the game's live animation/state machine.
+-- Reparenting it into SubMenu makes the preview visible, but it also moves the
+-- native gauge widgets away from the tree that owns their sliders. The preview
+-- therefore uses independent native gauge instances and never changes the
+-- original cockpit tree.
+local function discardPreviewWidgetState()
+    state.previewWidgets = {}
+    state.previewNative = {}
+    state.previewNativeValues = {}
     state.previewMounted = false
 end
 
-local function capturePreviewMount(cockpit)
-    local unitGauge = cockpit.UnitGauge
-    if not isValid(unitGauge) then
-        reportOnce("PREVIEW-MOUNT",
-            "PREVIEW ERROR | UnitGauge is unavailable for menu mounting")
-        return false
+local function destroyPreviewWidgets()
+    for _, entry in ipairs(state.previewWidgets or {}) do
+        if type(entry) == "table" and isValid(entry.widget) then
+            pcall(function() entry.widget:RemoveFromParent() end)
+        end
     end
+    discardPreviewWidgetState()
+end
 
-    local parent = nil
-    local slot = nil
-    local readParent = pcall(function()
-        slot = unitGauge.Slot
-        parent = slot.Parent
-    end)
-    if not readParent or not isValid(slot) or not isValid(parent) then
-        reportOnce("PREVIEW-MOUNT",
-            "PREVIEW ERROR | UnitGauge original CanvasPanel parent is unavailable")
-        return false
-    end
-
-    local layout = nil
-    local autoSize = nil
-    local zOrder = nil
-    local readLayout = pcall(function()
-        layout = slot:GetLayout()
-        autoSize = slot:GetAutoSize()
-        zOrder = slot:GetZOrder()
-    end)
-    if not readLayout or layout == nil or type(autoSize) ~= "boolean"
-        or type(zOrder) ~= "number" then
-        reportOnce("PREVIEW-MOUNT",
-            "PREVIEW ERROR | UnitGauge CanvasPanelSlot layout is unavailable")
-        return false
-    end
-
+capturePreviewMount = function(cockpit)
     local menuCanvas = resolvePreviewCanvas()
     if menuCanvas == nil then
         reportOnce("PREVIEW-MOUNT",
@@ -354,353 +368,216 @@ local function capturePreviewMount(cockpit)
         return false
     end
 
-    state.previewUnitGauge = unitGauge
-    state.previewOriginalParent = parent
-    state.previewOriginalLayout = layout
-    state.previewOriginalAutoSize = autoSize
-    state.previewOriginalZOrder = zOrder
+    local viewportSize = readViewportDesignSize()
+    if viewportSize == nil then
+        reportOnce("PREVIEW-MOUNT",
+            "PREVIEW ERROR | viewport design geometry is unavailable")
+        return false
+    end
+
+    destroyPreviewWidgets()
+    state.previewCockpit = cockpit
     state.previewMenuCanvas = menuCanvas
-    state.previewMounted = false
+    state.previewMenuSize = viewportSize
     clearReport("PREVIEW-MOUNT")
     return true
 end
 
-local function restoreOriginalMountAfterFailure(unitGauge)
-    local parent = state.previewOriginalParent
-    if not isValid(parent) or not isValid(unitGauge) then return false end
-
+local function placePreviewWidget(canvas, widget, geometry, zOrder)
     local slot = nil
-    local added = pcall(function()
-        slot = parent:AddChildToCanvas(unitGauge)
+    local ok = pcall(function()
+        slot = canvas:AddChildToCanvas(widget)
+        slot:SetAutoSize(false)
+        slot:SetMinimum({ X = 0.0, Y = 0.0 })
+        slot:SetMaximum({ X = 0.0, Y = 0.0 })
+        slot:SetAlignment({ X = 0.0, Y = 0.0 })
+        slot:SetPosition({ X = geometry.x, Y = geometry.y })
+        slot:SetSize({ X = geometry.width, Y = geometry.height })
+        slot:SetZOrder(zOrder)
+        widget:SetVisibility(HIT_TEST_INVISIBLE)
+        widget:SetRenderOpacity(1.0)
     end)
-    if not added or not isValid(slot) then return false end
-
-    local restored = pcall(function()
-        slot:SetLayout(state.previewOriginalLayout)
-        slot:SetAutoSize(state.previewOriginalAutoSize)
-        slot:SetZOrder(state.previewOriginalZOrder)
-    end)
-    return restored
+    if not ok or not isValid(slot) then return nil end
+    return slot
 end
 
-local function mountPreviewUnitGauge()
+mountPreviewUnitGauge = function()
     if state.previewMounted then return true end
 
-    local unitGauge = state.previewUnitGauge
+    local cockpit = state.previewCockpit
     local menuCanvas = state.previewMenuCanvas
-    if not isValid(unitGauge) or not isValid(menuCanvas) then
+    if not isValid(cockpit) or not isValid(menuCanvas) then
         reportOnce("PREVIEW-MOUNT",
-            "PREVIEW ERROR | preview mount objects became invalid")
+            "PREVIEW ERROR | preview cockpit or menu canvas became invalid")
+        return false
+    end
+    if readPreviewGaugeGeometry == nil
+        or createNativeGaugeForPreview == nil then
+        reportOnce("PREVIEW-MOUNT",
+            "PREVIEW ERROR | native preview geometry or constructor is unavailable")
         return false
     end
 
-    local removed = pcall(function() unitGauge:RemoveFromParent() end)
-    if not removed then
-        reportOnce("PREVIEW-MOUNT",
-            "PREVIEW ERROR | could not detach UnitGauge for menu mounting")
-        return false
+    local built = {}
+    for index, definition in ipairs(BARS) do
+        local geometry, geometryError =
+            readPreviewGaugeGeometry(cockpit, definition)
+        if geometry == nil then
+            for _, entry in ipairs(built) do
+                if isValid(entry.widget) then
+                    pcall(function() entry.widget:RemoveFromParent() end)
+                end
+            end
+            reportOnce("PREVIEW-MOUNT",
+                "PREVIEW ERROR | " .. tostring(geometryError))
+            return false
+        end
+
+        -- All three player gauge blueprints are visually compatible, but HP
+        -- and Soul carry Construct graphs that expect the live avatar. The
+        -- stamina blueprint is the only graph-free native gauge, so every
+        -- preview copy is created from that safe class and receives the
+        -- target bar's colour explicitly.
+        local donorUnit = cockpit[NATIVE_DONOR.unit]
+        local donor = isValid(donorUnit) and donorUnit[NATIVE_DONOR.gauge]
+        local widget, createError =
+            createNativeGaugeForPreview(cockpit, donor, menuCanvas)
+        if widget == nil then
+            for _, entry in ipairs(built) do
+                if isValid(entry.widget) then
+                    pcall(function() entry.widget:RemoveFromParent() end)
+                end
+            end
+            reportOnce("PREVIEW-MOUNT",
+                "PREVIEW ERROR | native " .. definition.key ..
+                " preview unavailable: " .. tostring(createError))
+            return false
+        end
+
+        local colored = pcall(function()
+            widget:SetGaugeColor(PREVIEW_GAUGE_COLORS[definition.key])
+        end)
+        if not colored then
+            pcall(function() widget:RemoveFromParent() end)
+            for _, entry in ipairs(built) do
+                if isValid(entry.widget) then
+                    pcall(function() entry.widget:RemoveFromParent() end)
+                end
+            end
+            reportOnce("PREVIEW-MOUNT",
+                "PREVIEW ERROR | native " .. definition.key ..
+                " preview colour could not be applied")
+            return false
+        end
+
+        local slot = placePreviewWidget(menuCanvas, widget, geometry,
+            1000 + index)
+        if slot == nil then
+            pcall(function() widget:RemoveFromParent() end)
+            for _, entry in ipairs(built) do
+                if isValid(entry.widget) then
+                    pcall(function() entry.widget:RemoveFromParent() end)
+                end
+            end
+            reportOnce("PREVIEW-MOUNT",
+                "PREVIEW ERROR | menu rejected native " ..
+                definition.key .. " preview")
+            return false
+        end
+
+        local entry = { key = definition.key, widget = widget, slot = slot }
+        built[#built + 1] = entry
+        state.previewNative[definition.key] = widget
+        log(string.format(
+            "PREVIEW | %s copy geometry x=%.0f y=%.0f w=%.0f h=%.0f",
+            definition.key, geometry.x, geometry.y,
+            geometry.width, geometry.height))
     end
 
-    local menuSlot = nil
-    local added = pcall(function()
-        menuSlot = menuCanvas:AddChildToCanvas(unitGauge)
-    end)
-    if not added or not isValid(menuSlot) then
-        restoreOriginalMountAfterFailure(unitGauge)
-        reportOnce("PREVIEW-MOUNT",
-            "PREVIEW ERROR | menu SubMenu rejected UnitGauge")
-        return false
-    end
-
-    local configured = pcall(function()
-        -- The original slot is relative to the cockpit's own canvas. Reusing
-        -- that slot on SubMenu applies the cockpit's parent offset a second
-        -- time, which shifts the preview toward the centre of the screen. The
-        -- menu uses the game's 1920x1080 design space, so the temporary slot is
-        -- explicit and top-left anchored.
-        menuSlot:SetAutoSize(false)
-        menuSlot:SetMinimum({ X = 0.0, Y = 0.0 })
-        menuSlot:SetMaximum({ X = 0.0, Y = 0.0 })
-        menuSlot:SetAlignment({ X = 0.0, Y = 0.0 })
-        menuSlot:SetPosition({ X = 0.0, Y = 0.0 })
-        menuSlot:SetSize({
-            X = PREVIEW_DESIGN_WIDTH,
-            Y = PREVIEW_DESIGN_HEIGHT,
-        })
-        menuSlot:SetZOrder(1000)
-        unitGauge:SetVisibility(VISIBLE)
-        unitGauge:SetRenderOpacity(1.0)
-    end)
-    if not configured then
-        pcall(function() unitGauge:RemoveFromParent() end)
-        restoreOriginalMountAfterFailure(unitGauge)
-        reportOnce("PREVIEW-MOUNT",
-            "PREVIEW ERROR | could not configure the menu UnitGauge slot")
-        return false
-    end
-
+    state.previewWidgets = built
     state.previewMounted = true
-    reportOnce("PREVIEW-MOUNTED",
-        string.format(
-            "PREVIEW | UnitGauge mounted into menu SubMenu | origin=0,0 | size=%dx%d | z=1000",
-            PREVIEW_DESIGN_WIDTH,
-            PREVIEW_DESIGN_HEIGHT))
+    log(string.format(
+        "PREVIEW | native gauge copies mounted | widgets=%d | viewport=%.0fx%.0f",
+        #built, state.previewMenuSize.width, state.previewMenuSize.height))
+    if refreshPreviewGaugeValues ~= nil then
+        refreshPreviewGaugeValues(cockpit)
+    end
     clearReport("PREVIEW-MOUNT")
     return true
 end
 
 restorePreviewMount = function(restore)
-    if not state.previewMounted then
-        if not restore then clearPreviewMountState() end
-        return true
+    if restore then
+        destroyPreviewWidgets()
+    else
+        -- World teardown can invalidate a UMG wrapper before the Lua loop sees
+        -- the boundary. Drop ownership without dereferencing that old tree.
+        discardPreviewWidgetState()
     end
-
-    local unitGauge = state.previewUnitGauge
-    local parent = state.previewOriginalParent
-    if not restore or not isValid(unitGauge) or not isValid(parent) then
-        clearPreviewMountState()
-        return false
-    end
-
-    local removed = pcall(function() unitGauge:RemoveFromParent() end)
-    local originalSlot = nil
-    local added = pcall(function()
-        originalSlot = parent:AddChildToCanvas(unitGauge)
-    end)
-    if not removed or not added or not isValid(originalSlot) then
-        reportOnce("PREVIEW-RESTORE-MOUNT",
-            "PREVIEW ERROR | could not restore UnitGauge to its original parent")
-        return false
-    end
-
-    local restored = pcall(function()
-        originalSlot:SetLayout(state.previewOriginalLayout)
-        originalSlot:SetAutoSize(state.previewOriginalAutoSize)
-        originalSlot:SetZOrder(state.previewOriginalZOrder)
-    end)
-    if not restored then
-        reportOnce("PREVIEW-RESTORE-MOUNT",
-            "PREVIEW ERROR | could not restore UnitGauge original layout")
-        return false
-    end
-
-    clearReport("PREVIEW-RESTORE-MOUNT")
-    clearPreviewMountState()
     return true
 end
 
-local function previewTargets(cockpit)
-    local targets = {}
-
-    local function add(widget)
-        if not isValid(widget) then return end
-        for _, existing in ipairs(targets) do
-            if existing == widget then return end
-        end
-        targets[#targets + 1] = widget
-    end
-
-    -- UnitGauge is the common front canvas. The remaining entries cover the
-    -- assembly and gauge nodes that the game's combat fade toggles at runtime.
-    add(cockpit.UnitGauge)
-    for _, definition in ipairs(BARS) do
-        local unit = cockpit[definition.unit]
-        add(unit)
-        if isValid(unit) then
-            add(unit[definition.canvas])
-            add(unit[definition.gauge])
-        end
-    end
-    return targets
-end
-
-restorePreviewVisibility = function(restore)
-    local snapshot = state.previewSnapshot
-    local mountedRestored = true
-    if restore and (snapshot ~= nil or state.previewMounted) then
-        if isValid(state.previewCockpit)
-            and state.previewGaugeWasVisible ~= nil then
-            pcall(function()
-                if state.previewCombatUIWasVisible ~= nil then
-                    state.previewCockpit:SetIsVisibleCombatUIFlag(
-                        state.previewCombatUIWasVisible)
-                end
-                state.previewCockpit:SetUnitGaugeVisibility(
-                    state.previewGaugeWasVisible)
-            end)
-        end
-        if snapshot ~= nil then
-            for _, entry in ipairs(snapshot) do
-                if isValid(entry.widget) then
-                    if entry.visibility ~= nil then
-                        pcall(function()
-                            entry.widget:SetVisibility(entry.visibility)
-                        end)
-                    end
-                    if entry.opacity ~= nil then
-                        pcall(function()
-                            entry.widget:SetRenderOpacity(entry.opacity)
-                        end)
-                    end
-                end
-            end
-        end
-        mountedRestored = restorePreviewMount(true)
-        if not mountedRestored and state.previewMounted then
-            reportOnce("PREVIEW-RESTORE-MOUNT",
-                "PREVIEW ERROR | original UnitGauge remains detached; retrying")
-        elseif mountedRestored then
-            clearReport("PREVIEW-RESTORE-MOUNT")
-            reportOnce("PREVIEW-RESTORED",
-                "PREVIEW | original UnitGauge restored to cockpit")
-        end
-    end
-    if not restore then restorePreviewMount(false) end
-
-    -- Keep the complete snapshot while the live widget is still mounted in
-    -- SubMenu. A later lease tick must retry that same restoration; recapturing
-    -- at this point would incorrectly record SubMenu as the original parent.
-    if restore and not mountedRestored and state.previewMounted then
-        return false
-    end
-
-    state.previewSnapshot = nil
-    state.previewApplied = false
-    state.previewCockpit = nil
-    state.previewGaugeWasVisible = nil
-    state.previewCombatUIWasVisible = nil
-    clearReport("PREVIEW-APPLIED")
-    return mountedRestored
-end
-
-local function capturePreviewVisibility(cockpit)
-    local snapshot = {}
-    for _, widget in ipairs(previewTargets(cockpit)) do
-        local visibility = nil
-        local opacity = nil
-        local read = pcall(function()
-            visibility = widget:GetVisibility()
-            opacity = widget:GetRenderOpacity()
-        end)
-        if read and visibility ~= nil and finiteNumber(opacity) then
-            snapshot[#snapshot + 1] = {
-                widget = widget,
-                visibility = visibility,
-                opacity = opacity,
-            }
-        end
-    end
-
-    if #snapshot == 0 then
-        reportOnce("PREVIEW-NATIVE-STATE",
-            "PREVIEW ERROR | native gauge visibility state is unavailable")
-        return false
-    end
-    state.previewSnapshot = snapshot
+capturePreviewVisibility = function(cockpit)
     state.previewCockpit = cockpit
-    state.previewGaugeWasVisible = nil
-    local unitGauge = cockpit.UnitGauge
-    if isValid(unitGauge) then
-        local visibility = nil
-        local read = pcall(function() visibility = unitGauge:GetVisibility() end)
-        if read and visibility ~= nil then
-            state.previewGaugeWasVisible = visibility == VISIBLE
-        end
-    end
-    if state.previewGaugeWasVisible == nil then
-        state.previewSnapshot = nil
-        state.previewCockpit = nil
-        state.previewGaugeWasVisible = nil
-        reportOnce("PREVIEW-NATIVE-STATE",
-            "PREVIEW ERROR | UnitGauge visibility state is unavailable")
-        return false
-    end
-
-    local combatUIWasVisible = nil
-    local readCombatUI = pcall(function()
-        combatUIWasVisible = cockpit:GetIsVisibleCombatUIFlag()
-    end)
-    if not readCombatUI or type(combatUIWasVisible) ~= "boolean" then
-        state.previewSnapshot = nil
-        state.previewCockpit = nil
-        state.previewGaugeWasVisible = nil
-        clearPreviewMountState()
-        reportOnce("PREVIEW-NATIVE-STATE",
-            "PREVIEW ERROR | combat UI visibility flag is unavailable")
-        return false
-    end
-    state.previewCombatUIWasVisible = combatUIWasVisible
     if not capturePreviewMount(cockpit) then
-        state.previewSnapshot = nil
         state.previewCockpit = nil
-        state.previewGaugeWasVisible = nil
-        state.previewCombatUIWasVisible = nil
-        clearPreviewMountState()
         return false
     end
     state.previewApplied = true
-    clearReport("PREVIEW-NATIVE-STATE")
     return true
 end
 
-local function applyPreviewVisibility(cockpit)
-    if state.previewApplied and state.previewCockpit ~= cockpit then
-        restorePreviewVisibility(isValid(state.previewCockpit))
+restorePreviewVisibility = function(restore)
+    local hadPreview = state.previewApplied or state.previewMounted
+    restorePreviewMount(restore)
+    state.previewApplied = false
+    state.previewCockpit = nil
+    state.previewMenuSize = nil
+    state.previewMenuCanvas = nil
+    clearReport("PREVIEW-APPLIED")
+    if hadPreview then
+        reportOnce("PREVIEW-RESTORED",
+            "PREVIEW | native gauge copies removed; original cockpit tree untouched")
     end
-    if not state.previewApplied then
-        if not capturePreviewVisibility(cockpit) then return false end
+    return true
+end
+
+applyPreviewVisibility = function(cockpit)
+    if state.previewApplied and state.previewCockpit ~= cockpit then
+        restorePreviewVisibility(true)
+    end
+    if not state.previewApplied
+        and not capturePreviewVisibility(cockpit) then
+        return false
     end
 
-    local called, nativeError = pcall(function()
-        -- This is the game's own visibility boundary for the three player
-        -- gauges. Calling it keeps the same parent/animation bookkeeping as
-        -- combat, instead of fighting individual child widgets every frame.
-        cockpit:SetIsVisibleCombatUIFlag(true)
-        cockpit:SetUnitGaugeVisibility(true)
-        -- The menu can leave the children collapsed even after the native
-        -- boundary is opened. Reassert only the captured gauge nodes; their
-        -- exact visibility and opacity are restored when the lease ends.
-        for _, entry in ipairs(state.previewSnapshot or {}) do
-            if isValid(entry.widget) then
-                entry.widget:SetVisibility(VISIBLE)
-                entry.widget:SetRenderOpacity(1.0)
-            end
-        end
+    local mounted, mountError = pcall(function()
         if not mountPreviewUnitGauge() then
-            error("menu UnitGauge mount failed")
+            error("native preview gauge mount failed")
         end
     end)
-    if not called then
+    if not mounted then
         reportOnce("PREVIEW-NATIVE",
-            "PREVIEW ERROR | SetUnitGaugeVisibility failed: " ..
-            tostring(nativeError))
-        restorePreviewVisibility(isValid(cockpit))
+            "PREVIEW ERROR | native preview mount failed: " ..
+            tostring(mountError))
+        restorePreviewVisibility(true)
         return false
     end
     clearReport("PREVIEW-NATIVE")
-    local combatUIVisible = "unreadable"
-    local unitGaugeVisibility = "unreadable"
-    pcall(function()
-        combatUIVisible = tostring(cockpit:GetIsVisibleCombatUIFlag())
-    end)
-    pcall(function()
-        unitGaugeVisibility = tostring(cockpit.UnitGauge:GetVisibility())
-    end)
     reportOnce("PREVIEW-APPLIED", string.format(
-        "PREVIEW | applied | combatUI=%s | UnitGaugeVisibility=%s | widgets=%d",
-        combatUIVisible, unitGaugeVisibility,
-        #(state.previewSnapshot or {})))
+        "PREVIEW | applied without reparenting original UnitGauge | widgets=%d",
+        #(state.previewWidgets or {})))
     return true
 end
 
-local function readPreviewLease()
+local function readPreviewMarker()
     local contents, readError = MOD_MENU_BRIDGE.readFile(PREVIEW_PATH)
     if readError ~= nil then
         return false, "preview state read failed: " .. tostring(readError)
     end
     if contents == nil then
         previewFingerprint = nil
-        previewExpiresAt = 0
+        previewActive = false
         previewValidationError = nil
         return false, nil
     end
@@ -709,32 +586,27 @@ local function readPreviewLease()
         local parsed, parseError = MOD_MENU_BRIDGE.evaluateTable(
             contents, "@" .. PREVIEW_PATH)
         previewFingerprint = contents
-        previewExpiresAt = 0
+        previewActive = false
         previewValidationError = nil
         if parsed == nil then
             previewValidationError = "preview state rejected: " .. tostring(parseError)
             return false, previewValidationError
         end
         for key in pairs(parsed) do
-            if key ~= "ACTIVE" and key ~= "EXPIRES_AT" then
+            if key ~= "ACTIVE" then
                 previewValidationError =
                     "preview state has unknown key: " .. tostring(key)
                 return false, previewValidationError
             end
         end
-        if parsed.ACTIVE ~= true then
-            previewValidationError = "preview state ACTIVE must be true"
+        if type(parsed.ACTIVE) ~= "boolean" then
+            previewValidationError = "preview state ACTIVE must be boolean"
             return false, previewValidationError
         end
-        if not finiteNumber(parsed.EXPIRES_AT) then
-            previewValidationError =
-                "preview state EXPIRES_AT must be finite"
-            return false, previewValidationError
-        end
-        previewExpiresAt = math.floor(parsed.EXPIRES_AT)
+        previewActive = parsed.ACTIVE
     end
 
-    return os.time() <= previewExpiresAt, previewValidationError
+    return previewActive, previewValidationError
 end
 
 -- destroy is only ever true on the settings path, where the world is live and
@@ -743,12 +615,19 @@ end
 -- access violation that pcall cannot catch -- there, references are simply
 -- dropped and the dead cockpit takes its children with it.
 local function releaseWidgets(destroy, reason)
-    -- Settings reloads keep the preview lease and its native visibility
-    -- snapshot alive, so changing a coordinate does not briefly hide the
-    -- original gauges. Every other release path restores them when the object
-    -- is still valid, or discards the snapshot without dereferencing stale UE
-    -- objects during teardown.
-    if reason ~= "settings reloaded" and restorePreviewVisibility ~= nil then
+    -- A settings reload rebuilds the preview copies as well as the readouts.
+    -- The original cockpit tree is never touched by that cleanup. Every other
+    -- release path removes the copies when the object is still live, or simply
+    -- drops their Lua ownership during world teardown.
+    if reason == "world restart" then
+        -- The old world is already entering teardown. Do not even ask UE for
+        -- validity here: a wrapper can still look valid while its native
+        -- widget tree has been freed. Dropping the preview state is safe; the
+        -- next world will capture a fresh live cockpit.
+        if restorePreviewVisibility ~= nil then
+            restorePreviewVisibility(false)
+        end
+    elseif restorePreviewVisibility ~= nil then
         restorePreviewVisibility(isValid(state.cockpit))
     end
     if destroy then
@@ -883,6 +762,67 @@ local function measure(widget)
     return geometry
 end
 
+-- Gauge widgets are not CanvasPanel children on this build, so their slot has
+-- no usable size even though Slate has already laid them out. The cached local
+-- geometry is the authoritative size for a widget in its current design
+-- space; unlike a guessed rectangle it follows the game's DPI/layout rules.
+local function measureCachedWidgetSize(widget)
+    if not isValid(widget) then return nil end
+    local slate = library(SLATE_LIBRARY)
+    if slate == nil then return nil end
+
+    local width = nil
+    local height = nil
+    local read = pcall(function()
+        widget:ForceLayoutPrepass()
+        local geometry = widget:GetCachedGeometry()
+        local size = slate:GetLocalSize(geometry)
+        width = tonumber(size.X)
+        height = tonumber(size.Y)
+    end)
+    if not read or not finiteNumber(width) or not finiteNumber(height)
+        or width <= 1.0 or height <= 1.0 then
+        return nil
+    end
+    return {
+        width = width,
+        height = height,
+        note = string.format("cached w=%.0f h=%.0f", width, height),
+    }
+end
+
+local function measureGaugeSize(widget)
+    return measureCachedWidgetSize(widget)
+end
+
+readPreviewGaugeGeometry = function(cockpit, definition)
+    local unit = cockpit[definition.unit]
+    if not isValid(unit) then
+        return nil, definition.key .. " preview assembly is unavailable"
+    end
+
+    local gauge = unit[definition.gauge]
+    if not isValid(gauge) then
+        return nil, definition.key .. " preview gauge is unavailable"
+    end
+
+    -- The assembly is a direct child of the live UnitGauge canvas. Its slot
+    -- supplies the screen position; the inner native gauge supplies the
+    -- rendered bar size. Both are live UI units, so this follows the game's
+    -- current DPI/layout instead of assuming a monitor resolution.
+    local assembly = measure(unit)
+    local gaugeSize = measureGaugeSize(gauge)
+    if assembly == nil or gaugeSize == nil then
+        return nil, definition.key .. " preview geometry is unavailable"
+    end
+    return {
+        x = assembly.x,
+        y = assembly.y,
+        width = gaugeSize.width,
+        height = gaugeSize.height,
+    }, nil
+end
+
 -- Drawing ON a bar means out-ranking everything already in that canvas, and a
 -- fixed ZOrder is a guess about a layout the mod does not own.
 --
@@ -936,14 +876,13 @@ local function experienceSurface(cockpit, definition)
     local canvas = unit[definition.canvas]
     if not isValid(canvas) then return nil end
     stopCaching(unit, "InvalidationBox_root")
-    return { canvas = canvas, size = measure(unit[definition.gauge]) }
+    return { canvas = canvas, size = measureGaugeSize(unit[definition.gauge]) }
 end
 
--- WHERE a readout draws, in order of preference, because a readout centred ON
--- its bar has to be painted AFTER the gauge art and no ZOrder can achieve that
--- from a canvas that is painted first. Attaching is the only honest test that
--- a candidate is a usable canvas, so ensureLabel walks this list and keeps the
--- first one that accepts the widget.
+-- WHERE a readout draws. A readout centred ON its bar has to be painted AFTER
+-- the gauge art and no ZOrder can achieve that from a canvas painted first.
+-- The selected layer is a strict contract: if that exact canvas cannot accept
+-- the widget, injection reports an error instead of silently changing layers.
 --
 --   inside  the gauge widget's own root panel -- the innermost surface there
 --           is, painted last within the bar.
@@ -980,8 +919,8 @@ local function readoutCandidates(cockpit, definition)
             -- No measuring here. Asking this canvas where each assembly sits
             -- returns the origin for all three -- that is what stacked every
             -- readout in the corner. The point comes from settings instead,
-            -- in the canvas's own design-space pixels, which the HUD's own
-            -- layout is authored in and which do not change with resolution.
+            -- in the canvas's own UI layout units, which the HUD's own layout
+            -- is authored in rather than in physical monitor pixels.
             candidates[#candidates + 1] = {
                 canvas = front,
                 layer = "front",
@@ -992,16 +931,16 @@ local function readoutCandidates(cockpit, definition)
                 },
             }
         end
-    end
-
-    local assembly = unit[definition.canvas]
-    if isValid(assembly) then
-        candidates[#candidates + 1] = {
-            canvas = assembly,
-            layer = "gauge",
-            chain = chain,
-            rectangle = measure(gauge),
-        }
+    elseif CONFIG.READOUT_LAYER == "gauge" then
+        local assembly = unit[definition.canvas]
+        if isValid(assembly) then
+            candidates[#candidates + 1] = {
+                canvas = assembly,
+                layer = "gauge",
+                chain = chain,
+                rectangle = measure(gauge),
+            }
+        end
     end
     return candidates
 end
@@ -1116,9 +1055,9 @@ end
 local function resolveFontDonor(cockpit)
     if isValid(state.fontDonor) then return state.fontDonor end
     state.fontDonor = nil
-    -- The partner name plate is the one text block always mounted in the
-    -- cockpit and styled for it. Without a partner it is absent, and the
-    -- TextBlock CDO's own font is a perfectly readable fallback.
+    -- The partner name plate is the text block mounted in the cockpit and
+    -- styled for it. A missing donor is reported by the caller rather than
+    -- silently changing typography.
     local donor = nil
     pcall(function()
         local partner = cockpit.PartnerUnitGauge
@@ -1132,9 +1071,8 @@ end
 
 local function styleLabel(label, cockpit)
     local donor = resolveFontDonor(cockpit)
-    if donor ~= nil then
-        pcall(function() label:SetFont(donor.Font) end)
-    end
+    if donor == nil then error("partner nameplate font donor is unavailable") end
+    pcall(function() label:SetFont(donor.Font) end)
     pcall(function() label.Font.Size = CONFIG.FONT_SIZE end)
     pcall(function()
         label:SetColorAndOpacity({ SpecifiedColor = WHITE, ColorUseRule = 0 })
@@ -1391,16 +1329,8 @@ end
 -- A real instance of the game's own gauge widget, from the class of a gauge
 -- already mounted in this cockpit -- so no LoadAsset, and no asset path that
 -- could stop resolving after a patch.
-local function cloneNativeGauge(cockpit, outer)
-    local donorUnit = cockpit[NATIVE_DONOR.unit]
-    if not isValid(donorUnit) then
-        return nil, "native gauge donor assembly is unavailable"
-    end
-    local donor = donorUnit[NATIVE_DONOR.gauge]
-    if not isValid(donor) then
-        return nil, "native gauge donor is unavailable"
-    end
-
+createNativeGaugeForPreview = function(cockpit, donor, outer)
+    if not isValid(donor) then return nil, "native gauge donor is unavailable" end
     local class = nil
     pcall(function() class = donor:GetClass() end)
     if not isValid(class) then
@@ -1425,6 +1355,22 @@ local function cloneNativeGauge(cockpit, outer)
     if not isValid(widget) then
         return nil, "native gauge copy was not created"
     end
+    return widget, nil
+end
+
+local function cloneNativeGauge(cockpit, outer)
+    local donorUnit = cockpit[NATIVE_DONOR.unit]
+    if not isValid(donorUnit) then
+        return nil, "native gauge donor assembly is unavailable"
+    end
+    local donor = donorUnit[NATIVE_DONOR.gauge]
+    if not isValid(donor) then
+        return nil, "native gauge donor is unavailable"
+    end
+
+    local widget, createError =
+        createNativeGaugeForPreview(cockpit, donor, outer)
+    if widget == nil then return nil, createError end
     pcall(function() widget:SetGaugeColor(EXP_FILL_COLOR) end)
     return widget, nil
 end
@@ -1474,12 +1420,22 @@ local function ensureExperience(cockpit, surfaces)
     end
     local canvas = surface.canvas
 
-    local width = (surface.size ~= nil and surface.size.width)
-        or FALLBACK_BAR_WIDTH
-    if CONFIG.EXP_BAR_WIDTH > 0.0 then width = CONFIG.EXP_BAR_WIDTH end
-    local height = (surface.size ~= nil and surface.size.height)
-        or FALLBACK_BAR_HEIGHT
-    if CONFIG.EXP_BAR_HEIGHT > 0.0 then height = CONFIG.EXP_BAR_HEIGHT end
+    local width = nil
+    if CONFIG.EXP_BAR_WIDTH > 0.0 then
+        width = CONFIG.EXP_BAR_WIDTH
+    elseif surface.size ~= nil then
+        width = surface.size.width
+    end
+    local height = nil
+    if CONFIG.EXP_BAR_HEIGHT > 0.0 then
+        height = CONFIG.EXP_BAR_HEIGHT
+    elseif surface.size ~= nil then
+        height = surface.size.height
+    end
+    if not finiteNumber(width) or width <= 1.0
+        or not finiteNumber(height) or height <= 1.0 then
+        return nil, "experience anchor gauge geometry is unavailable"
+    end
 
     -- Always the normalised edge anchor, never a measured rectangle. This is
     -- the arrangement that put the bar where it belongs, and a measurement
@@ -1513,7 +1469,7 @@ local function ensureExperience(cockpit, surfaces)
     end
 
     local exp = {
-        style = "flat",
+        style = "none",
         wantBar = wantBar,
         wantText = wantText,
         width = width,
@@ -1523,23 +1479,18 @@ local function ensureExperience(cockpit, surfaces)
     if wantBar then
         if CONFIG.EXP_STYLE == "native" then
             local native, cloneError = cloneNativeGauge(cockpit, canvas)
-            if native ~= nil then
-                built[#built + 1] = native
-                if place(canvas, native,
-                    boxPlacement(originX, width), zOrder) == nil then
-                    return unwind("experience gauge copy was rejected")
-                end
-                exp.style = "native"
-                exp.native = native
-            else
-                -- Falling back rather than failing: a HUD without the game's
-                -- own frame is still a working experience bar.
-                log("EXPERIENCE | native gauge copy unavailable (" ..
-                    tostring(cloneError) .. ") | drawing a flat bar instead")
+            if native == nil then
+                return unwind("native experience gauge unavailable: " ..
+                    tostring(cloneError))
             end
-        end
-
-        if exp.style == "flat" then
+            built[#built + 1] = native
+            if place(canvas, native,
+                boxPlacement(originX, width), zOrder) == nil then
+                return unwind("experience gauge copy was rejected")
+            end
+            exp.style = "native"
+            exp.native = native
+        elseif CONFIG.EXP_STYLE == "flat" then
             local back, backError = constructWidget(IMAGE_CLASS, canvas)
             if back == nil then return unwind(backError) end
             built[#built + 1] = back
@@ -1602,7 +1553,7 @@ local function ensureExperience(cockpit, surfaces)
         "size from %s",
         exp.style, CONFIG.EXP_PLACEMENT, CONFIG.EXP_ANCHOR,
         originX, originY, width, height, zOrder,
-        (surface.size ~= nil and surface.size.note) or "fallback"))
+        (surface.size ~= nil and surface.size.note) or "configured"))
     return exp
 end
 
@@ -1616,14 +1567,7 @@ local function experienceSpan(playerState, exp)
         level = tonumber(playerState.ExperienceData.HeroLevel)
         current = tonumber(playerState.ExperienceData.HeroExperience)
     end)
-    if not ok or level == nil or current == nil then
-        local fallback = pcall(function()
-            local data = playerState:GetExperienceData()
-            level = tonumber(data.HeroLevel)
-            current = tonumber(data.HeroExperience)
-        end)
-        if not fallback then return nil end
-    end
+    if not ok or level == nil or current == nil then return nil end
     if not finiteNumber(level) or not finiteNumber(current) then return nil end
 
     if exp.level ~= level then
@@ -1705,7 +1649,7 @@ end
 --                         TICK                           --
 --========================================================--
 
-local function readHeroValues(hero)
+readHeroValues = function(hero)
     local values = {}
     pcall(function()
         local defensive = hero.DefensiveAttributeSet
@@ -1732,6 +1676,46 @@ local function readHeroValues(hero)
     return values
 end
 
+local function validGaugePair(pair)
+    return type(pair) == "table"
+        and finiteNumber(pair[1])
+        and finiteNumber(pair[2])
+end
+
+refreshPreviewGaugeValues = function(cockpit)
+    if not state.previewMounted or readHeroValues == nil then return false end
+
+    local hero = resolveHero(cockpit)
+    if not isValid(hero) then
+        reportOnce("PREVIEW-NATIVE-VALUES",
+            "PREVIEW ERROR | hero attributes unavailable for preview gauges")
+        return false
+    end
+
+    local values = readHeroValues(hero)
+    if not validGaugePair(values.HP)
+        or not validGaugePair(values.STAMINA)
+        or not validGaugePair(values.SP) then
+        reportOnce("PREVIEW-NATIVE-VALUES",
+            "PREVIEW ERROR | complete hero gauge values unavailable")
+        return false
+    end
+
+    for _, definition in ipairs(BARS) do
+        local pair = values[definition.key]
+        local widget = state.previewNative[definition.key]
+        local previous = state.previewNativeValues[definition.key]
+        if isValid(widget)
+            and (previous == nil or previous[1] ~= pair[1]
+                or previous[2] ~= pair[2]) then
+            driveNativeGauge(widget, pair[1], pair[2])
+            state.previewNativeValues[definition.key] = { pair[1], pair[2] }
+        end
+    end
+    clearReport("PREVIEW-NATIVE-VALUES")
+    return true
+end
+
 local function needsInjection()
     for _, definition in ipairs(BARS) do
         if CONFIG[definition.setting] then
@@ -1754,9 +1738,9 @@ local function updatePreviewMode(active, previewError)
 
     local requested = active == true
     if requested and not state.previewRequested then
-        log("PREVIEW | active lease observed")
+        log("PREVIEW | active marker observed")
     elseif not requested and state.previewRequested then
-        log("PREVIEW | lease closed or expired")
+        log("PREVIEW | marker closed")
     end
     state.previewRequested = requested
     if not state.previewRequested then
@@ -1776,7 +1760,7 @@ local function updatePreviewMode(active, previewError)
     local cockpit = resolveCockpit()
     if cockpit == nil then
         reportOnce("PREVIEW-COCKPIT",
-            "PREVIEW ERROR | no live cockpit while the preview lease is active")
+            "PREVIEW ERROR | no live cockpit while the preview marker is active")
         return
     end
     clearReport("PREVIEW-COCKPIT")
@@ -1785,14 +1769,13 @@ end
 
 -- A self-rescheduling ExecuteWithDelay + ExecuteInGameThread pair creates a
 -- fresh ProcessEvent callback on every pass. On this UE4SS build one invalid
--- callback can be removed while the menu is being rebuilt, leaving the native
--- UnitGauge detached forever. A single persistent game-thread loop owns the
--- lease and its restoration, so closing the marker cannot strand the widget.
+-- callback can be removed while the menu is being rebuilt. A single persistent
+-- game-thread loop owns the marker and its independent preview copies.
 local previewLoopHandle = nil
 local function previewLoop()
     local ok, previewError = xpcall(function()
-        local active, leaseError = readPreviewLease()
-        updatePreviewMode(active, leaseError)
+        local active, markerError = readPreviewMarker()
+        updatePreviewMode(active, markerError)
     end, debug.traceback)
     if not ok then
         reportOnce("PREVIEW-POLL", "PREVIEW ERROR | loop tick failed: " ..
@@ -1877,6 +1860,9 @@ local function tick()
             if definition ~= nil and CONFIG[definition.setting] then
                 stampLabel(state.labels[key], pair[1], pair[2])
             end
+        end
+        if state.previewRequested and refreshPreviewGaugeValues ~= nil then
+            refreshPreviewGaugeValues(cockpit)
         end
     end
     for _, entry in pairs(state.labels) do mirrorVisibility(entry) end
@@ -2094,10 +2080,12 @@ requireHook("/Script/ROD.RODCockpitWidgetBase:OnSoulChangedEvent",
 -- world be reported again in this one.
 requireHook("/Script/Engine.PlayerController:ClientRestart", function()
     lastReport = {}
-    if not state.previewRequested
-        and (state.previewApplied or state.previewMounted) then
-        restorePreviewVisibility(isValid(state.cockpit))
-    end
+    -- ClientRestart is the canonical world boundary. Do not dereference or
+    -- remove the old widget tree here: it may already be in teardown. Drop
+    -- only Lua ownership and let the next stable tick sweep the old prefixed
+    -- widgets from the newly resolved cockpit before rebuilding them.
+    releaseWidgets(false, "world restart")
+    sweptCockpit = nil
 end)
 
 --========================================================--

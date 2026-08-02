@@ -69,12 +69,10 @@ local rows = {}
 local isOpen = false
 
 -- GaugeNumbers owns the native HUD preview. ModMenu only publishes the
--- transient lease that tells it when that mod's settings are actually open.
--- The lease is refreshed while the panel remains open so a crashed menu cannot
--- leave the world HUD forced visible on the next frame.
+-- transient marker that tells it when that mod's settings are actually open.
+-- ModMenu clears stale markers during startup and on panel close; no recurring
+-- timer is needed while the user edits settings.
 local GAUGE_PREVIEW_MOD = "GaugeNumbers"
-local PREVIEW_HEARTBEAT_MS = 750
-local previewHeartbeatScheduled = false
 local lastPreviewError = nil
 
 local function isValid(object)
@@ -115,28 +113,6 @@ local function publishGaugePreview(active)
     end
     lastPreviewError = nil
     return true
-end
-
-local function scheduleGaugePreviewHeartbeat()
-    if not isOpen or expandedMod ~= GAUGE_PREVIEW_MOD
-        or previewHeartbeatScheduled then
-        return
-    end
-    previewHeartbeatScheduled = true
-    local scheduled, scheduleError = pcall(function()
-        ExecuteWithDelay(PREVIEW_HEARTBEAT_MS, function()
-            previewHeartbeatScheduled = false
-            if isOpen and expandedMod == GAUGE_PREVIEW_MOD then
-                publishGaugePreview(true)
-                scheduleGaugePreviewHeartbeat()
-            end
-        end)
-    end)
-    if not scheduled then
-        previewHeartbeatScheduled = false
-        log("GaugeNumbers preview heartbeat could not be scheduled: " ..
-            tostring(scheduleError))
-    end
 end
 
 -- The panel draws into the start menu that is already on screen.
@@ -782,7 +758,6 @@ function Panel.activate()
         end
         ensureSelectionVisible()
         Panel.render()
-        scheduleGaugePreviewHeartbeat()
         return
     end
 
@@ -822,7 +797,13 @@ function Panel.open()
 end
 
 function Panel.close()
-    publishGaugePreview(false)
+    if not publishGaugePreview(false) then
+        -- Leaving the panel open is the fail-closed state: GaugeNumbers must
+        -- never remain mounted in the menu because the marker could not be
+        -- cleared.
+        log("GaugeNumbers preview close blocked; marker was not cleared")
+        return false
+    end
     isOpen = false
     destroyPanel()
     expandedMod = nil
@@ -832,6 +813,7 @@ function Panel.close()
         host = nil
         styleSource = nil
     end
+    return true
 end
 
 -- Dumps the host widget tree so the exact canvas/child names can be confirmed

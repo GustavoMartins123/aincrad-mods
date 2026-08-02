@@ -59,10 +59,11 @@ Do not include `runtime.lua`, `runtime.lua.*`, `runtime.rev` or the transient
 - Supports `current / maximum`, current-only and percentage formats.
 - Allows each status readout to be enabled independently.
 - Supports centred readouts or values placed beside the gauges.
-- Allows global offsets and individual design-space positions to be adjusted.
+- Allows global offsets and individual UI-layout positions to be adjusted.
 - Can add the current level and experience progress to the HUD.
 - Can use a copy of the game's native gauge widget for the experience bar.
-- Falls back to a simple flat experience bar when the native gauge cannot be created safely.
+- Requires the selected experience style to be available; the flat style is
+  selected explicitly when a flat bar is wanted.
 - Allows the experience display to be anchored to HP, Stamina or SP.
 - Supports live configuration through the optional in-game Mod Menu.
 - Shows the game's native player gauges temporarily while Gauge Numbers is
@@ -134,9 +135,9 @@ return {
     TEXT_OFFSET_Y = -18.0,
     FONT_SIZE = 11.0,
 
-    SHOW_EXP = true,
+    SHOW_EXP = false,
     SHOW_EXP_BAR = true,
-    SHOW_EXP_TEXT = true,
+    SHOW_EXP_TEXT = false,
     SHOW_EXP_LEVEL = true,
 
     EXP_STYLE = "native",
@@ -192,7 +193,7 @@ inside   attempts to attach inside the gauge widget
 
 `front` is the recommended default for centred text.
 
-The `inside` and `gauge` layers can be useful for alternative layouts, but the gauge artwork may draw over centred text. The mod falls back safely when a selected layer cannot accept the widget.
+The `inside` and `gauge` layers can be useful for alternative layouts, but the gauge artwork may draw over centred text. The selected layer is strict; an unavailable canvas is reported instead of being replaced silently.
 
 ### Positioning
 
@@ -236,7 +237,8 @@ native   uses a copy of the game's own gauge widget
 flat     uses a simple backing and fill drawn by the mod
 ```
 
-The native style is preferred. If it cannot be created, the mod automatically uses the flat style instead.
+The native style uses the game's own widget. If a flat bar is wanted, select
+`flat` explicitly; the mod does not silently switch styles.
 
 `EXP_ANCHOR` accepts:
 
@@ -255,7 +257,10 @@ below
 
 Use `EXP_OFFSET_X` and `EXP_OFFSET_Y` for fine positioning.
 
-When `EXP_BAR_WIDTH` or `EXP_BAR_HEIGHT` is `0`, the mod copies the dimensions of the selected anchor gauge. Non-zero values allow a custom size.
+The position, offsets and custom dimensions use the selected canvas's UI layout
+units rather than physical monitor pixels. When `EXP_BAR_WIDTH` or
+`EXP_BAR_HEIGHT` is `0`, the mod copies the live dimensions of the selected
+anchor gauge. Non-zero values allow an explicit custom size.
 
 ### Refresh Interval
 
@@ -320,11 +325,15 @@ Enable `DEBUG_LOGS` for additional resolution, experience and injection diagnost
 
 ## Known Limitations
 
-- The default coordinates are based on the current Echoes of Aincrad HUD.
+- The default coordinates are based on the current Echoes of Aincrad HUD's
+  local UI layout space, not a hardcoded monitor resolution.
 - Large interface changes from future game updates may require new default positions.
-- Alternative HUD scaling, ultrawide layouts or other HUD mods may require offset adjustments.
+- The preview reads the live viewport size and DPI scale because this build's
+  full-screen HUD root does not expose a usable cached geometry, then mounts
+  the native gauge in that local design space. Alternative HUDs can still
+  change where the game's own local bars are authored.
 - The native experience bar depends on a compatible gauge widget being available in the mounted cockpit.
-- When the native bar cannot be created, the flat fallback is used.
+- If the native bar cannot be created, select the flat style explicitly.
 - The mod displays the values reported by the game and does not alter or correct gameplay calculations.
 
 ## Credits
