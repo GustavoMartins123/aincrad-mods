@@ -29,8 +29,8 @@ local function dbg(message)
     if CONFIG ~= nil and CONFIG.DEBUG_LOGS then log(message) end
 end
 
--- Every failure path here is recoverable and repeats on the next poll, so an
--- unfiltered log line would be written twice a second forever.
+-- Preview failures are held fail-closed until the marker closes or settings are
+-- reapplied; a failed preview must never keep constructing UI objects.
 local lastReport = {}
 
 local function reportOnce(tag, message)
@@ -193,18 +193,13 @@ local HIDDEN = 2
 
 local TEXT_BLOCK_CLASS = "/Script/UMG.TextBlock"
 local IMAGE_CLASS = "/Script/UMG.Image"
+local CANVAS_PANEL_CLASS = "/Script/UMG.CanvasPanel"
 local LAYOUT_LIBRARY = "/Script/UMG.Default__WidgetLayoutLibrary"
-local SLATE_LIBRARY = "/Script/UMG.Default__SlateBlueprintLibrary"
 local WIDGET_LIBRARY = "/Script/UMG.Default__WidgetBlueprintLibrary"
 
 local WHITE = { R = 1.0, G = 1.0, B = 1.0, A = 1.0 }
 local EXP_FILL_COLOR = { R = 1.0, G = 0.78, B = 0.28, A = 1.0 }
 local EXP_BACK_COLOR = { R = 0.02, G = 0.03, B = 0.05, A = 0.55 }
-local PREVIEW_GAUGE_COLORS = {
-    HP = { R = 0.24, G = 1.0, B = 0.30, A = 1.0 },
-    STAMINA = { R = 1.0, G = 0.72, B = 0.02, A = 1.0 },
-    SP = { R = 0.00, G = 0.86, B = 1.0, A = 1.0 },
-}
 
 -- unit     the cockpit member holding the whole bar assembly.
 -- canvas   the CanvasPanel inside it that owns the bar's coordinate space.
@@ -271,10 +266,15 @@ local state = {
     previewCockpit = nil,
     previewMenuSize = nil,
     previewMenuCanvas = nil,
-    previewWidgets = {},
-    previewNative = {},
-    previewNativeValues = {},
+    previewRoot = nil,
+    previewRootSlot = nil,
+    previewUnits = nil,
+    previewClone = nil,
+    previewCloneSlot = nil,
+    previewLabels = nil,
     previewMounted = false,
+    previewFailed = false,
+    previewSweepCanvas = nil,
 }
 
 -- Assigned below the widget-lifecycle helpers so releaseWidgets can discard
@@ -286,13 +286,18 @@ local mountPreviewUnitGauge
 local capturePreviewVisibility
 local applyPreviewVisibility
 local readHeroValues
-local readPreviewGaugeGeometry
 local createNativeGaugeForPreview
-local refreshPreviewGaugeValues
+local resolveHero
+local mountPreviewReadouts
 
--- The menu is a separate viewport layer from the cockpit. The live menu owns a
--- full-screen SubMenu canvas, so the preview draws independent native gauge
--- copies there; the original UnitGauge remains in the cockpit tree throughout.
+-- `StaticConstructObject(..., Template=UnitGauge)` only copied the CanvasPanel
+-- properties. Its children still belonged to the live HUD, so it was correctly
+-- rejected as a shallow alias. A WBP_Cockpit instance is also invalid here: its
+-- Construct path owns live cockpit state. The preview therefore creates only
+-- the three independent gauge assemblies and never invokes a cockpit method.
+local PREVIEW_CLONE_PREFIX = "GaugeNumbers_PreviewUnitGauge_"
+local previewCloneSerial = 0
+
 local function resolvePreviewCanvas()
     local ok, menu = pcall(function()
         return FindFirstOf("WBP_Console_MainMenu_C")
@@ -339,25 +344,68 @@ local function readViewportDesignSize()
     }
 end
 
--- The original UnitGauge is part of the game's live animation/state machine.
--- Reparenting it into SubMenu makes the preview visible, but it also moves the
--- native gauge widgets away from the tree that owns their sliders. The preview
--- therefore uses independent native gauge instances and never changes the
--- original cockpit tree.
 local function discardPreviewWidgetState()
-    state.previewWidgets = {}
-    state.previewNative = {}
-    state.previewNativeValues = {}
+    state.previewRoot = nil
+    state.previewRootSlot = nil
+    state.previewUnits = nil
+    state.previewClone = nil
+    state.previewCloneSlot = nil
+    state.previewLabels = nil
     state.previewMounted = false
 end
 
 local function destroyPreviewWidgets()
-    for _, entry in ipairs(state.previewWidgets or {}) do
-        if type(entry) == "table" and isValid(entry.widget) then
-            pcall(function() entry.widget:RemoveFromParent() end)
+    local root = state.previewRoot
+    if isValid(root) then
+        pcall(function() root:RemoveFromParent() end)
+    else
+        local clone = state.previewClone
+        if isValid(clone) then
+            pcall(function() clone:RemoveFromParent() end)
         end
     end
     discardPreviewWidgetState()
+end
+
+local function sweepOrphanedPreviewClones(canvas)
+    if state.previewSweepCanvas == canvas then return true, nil end
+    if not isValid(canvas) then
+        return false, "menu preview canvas is unavailable for clone cleanup"
+    end
+
+    local count = nil
+    local counted = pcall(function() count = tonumber(canvas:GetChildrenCount()) end)
+    if not counted or not finiteNumber(count) then
+        return false, "could not enumerate the menu preview canvas"
+    end
+
+    local orphaned = {}
+    for index = 0, count - 1 do
+        local child = nil
+        local name = nil
+        local read = pcall(function()
+            child = canvas:GetChildAt(index)
+            name = child:GetFullName()
+        end)
+        if not read or not isValid(child) or type(name) ~= "string" then
+            return false, "could not inspect menu preview child " .. tostring(index)
+        end
+        if string.find(name, PREVIEW_CLONE_PREFIX, 1, true) ~= nil then
+            orphaned[#orphaned + 1] = child
+        end
+    end
+    for _, child in ipairs(orphaned) do
+        local removed = pcall(function() child:RemoveFromParent() end)
+        if not removed then
+            return false, "could not remove an orphaned UnitGauge clone"
+        end
+    end
+    state.previewSweepCanvas = canvas
+    if #orphaned > 0 then
+        log("PREVIEW | removed " .. tostring(#orphaned) ..
+            " orphaned UnitGauge clone(s)")
+    end
+    return true, nil
 end
 
 capturePreviewMount = function(cockpit)
@@ -376,9 +424,17 @@ capturePreviewMount = function(cockpit)
     end
 
     destroyPreviewWidgets()
+    local swept, sweepError = sweepOrphanedPreviewClones(menuCanvas)
+    if not swept then
+        reportOnce("PREVIEW-MOUNT",
+            "PREVIEW ERROR | UnitGauge clone cleanup failed: " ..
+            tostring(sweepError))
+        return false
+    end
     state.previewCockpit = cockpit
     state.previewMenuCanvas = menuCanvas
     state.previewMenuSize = viewportSize
+    state.previewFailed = false
     clearReport("PREVIEW-MOUNT")
     return true
 end
@@ -401,6 +457,237 @@ local function placePreviewWidget(canvas, widget, geometry, zOrder)
     return slot
 end
 
+local function requireDistinctPreviewObject(live, copied, label)
+    if not isValid(live) then
+        return false, "live " .. label .. " is unavailable"
+    end
+    if not isValid(copied) then
+        return false, "preview " .. label .. " is unavailable"
+    end
+    if live == copied then
+        return false, "preview " .. label .. " aliases the live widget"
+    end
+
+    local liveName = nil
+    local copiedName = nil
+    local named = pcall(function()
+        liveName = live:GetFullName()
+        copiedName = copied:GetFullName()
+    end)
+    if not named or type(liveName) ~= "string" or type(copiedName) ~= "string" then
+        return false, "could not identify preview " .. label
+    end
+    if liveName == copiedName then
+        return false, "preview " .. label .. " has the live widget identity"
+    end
+    return true, nil
+end
+
+local function requirePreviewValues(values, key)
+    local pair = type(values) == "table" and values[key] or nil
+    if type(pair) ~= "table" or not finiteNumber(pair[1])
+        or not finiteNumber(pair[2]) then
+        return nil, "live " .. key .. " values are unavailable"
+    end
+    return pair, nil
+end
+
+local function readPreviewGaugeValues(liveCockpit)
+    local hero = resolveHero(liveCockpit)
+    if not isValid(hero) then
+        return nil, "live hero is unavailable for the preview"
+    end
+    local values = readHeroValues(hero)
+    local hp, hpError = requirePreviewValues(values, "HP")
+    if hp == nil then return nil, hpError end
+    local stamina, staminaError = requirePreviewValues(values, "STAMINA")
+    if stamina == nil then return nil, staminaError end
+    local sp, spError = requirePreviewValues(values, "SP")
+    if sp == nil then return nil, spError end
+    return values, nil
+end
+
+local function createPreviewRoot(outer)
+    local class = nil
+    local classRead = pcall(function()
+        class = StaticFindObject(CANVAS_PANEL_CLASS)
+    end)
+    if not classRead or not isValid(class) then
+        return nil, "CanvasPanel class is unavailable"
+    end
+
+    previewCloneSerial = previewCloneSerial + 1
+    local root = nil
+    local constructed, constructError = pcall(function()
+        root = StaticConstructObject(class, outer,
+            FName(PREVIEW_CLONE_PREFIX .. tostring(previewCloneSerial)))
+    end)
+    if not constructed then return nil, tostring(constructError) end
+    if not isValid(root) then
+        return nil, "CanvasPanel construction returned no preview root"
+    end
+    return root, nil
+end
+
+local function readPreviewAssemblyLayout(sourceRoot, sourceUnit, key)
+    if not isValid(sourceRoot) or not isValid(sourceUnit) then
+        return nil, "live " .. key .. " gauge assembly is unavailable"
+    end
+
+    local slot = nil
+    local parent = nil
+    local layout = nil
+    local autoSize = nil
+    local zOrder = nil
+    local parentName = nil
+    local read = pcall(function()
+        slot = sourceUnit.Slot
+        parent = slot.Parent
+        layout = slot:GetLayout()
+        autoSize = slot:GetAutoSize()
+        zOrder = slot:GetZOrder()
+    end)
+    if not read or not isValid(slot) or not isValid(parent)
+        or layout == nil or type(autoSize) ~= "boolean"
+        or not finiteNumber(tonumber(zOrder)) then
+        return nil, "live " .. key .. " gauge layout is unavailable"
+    end
+    pcall(function() parentName = parent:GetFullName() end)
+    -- The generated gauge assemblies are not guaranteed to be direct children
+    -- of UnitGauge. Their own CanvasPanelSlot is the authoritative geometry;
+    -- copying that slot into the full-screen preview wrapper preserves the
+    -- original assembly position without reparenting the live widget.
+    return {
+        layout = layout,
+        autoSize = autoSize,
+        zOrder = tonumber(zOrder),
+        parentName = tostring(parentName),
+    }, nil
+end
+
+local function createPreviewAssembly(widgets, owningPlayer, sourceUnit, outer,
+    definition)
+    local class = nil
+    local classRead = pcall(function() class = sourceUnit:GetClass() end)
+    if not classRead or not isValid(class) then
+        return nil, "live " .. definition.key .. " gauge class is unavailable"
+    end
+
+    local clone = nil
+    local created, createError = pcall(function()
+        clone = widgets:Create(outer, class, owningPlayer)
+    end)
+    if not created then return nil, tostring(createError) end
+
+    local distinct, distinctError = requireDistinctPreviewObject(
+        sourceUnit, clone, definition.key .. " gauge assembly")
+    if not distinct then return nil, distinctError end
+
+    local canvas = nil
+    local gauge = nil
+    local treeRead = pcall(function()
+        canvas = clone[definition.canvas]
+        gauge = clone[definition.gauge]
+    end)
+    if not treeRead or not isValid(canvas) or not isValid(gauge) then
+        return nil, "preview " .. definition.key .. " gauge tree is incomplete"
+    end
+    return clone, nil
+end
+
+local function mountPreviewAssembly(root, clone, layout, definition)
+    local slot = nil
+    local mounted, mountError = pcall(function()
+        slot = root:AddChildToCanvas(clone)
+        slot:SetLayout(layout.layout)
+        slot:SetAutoSize(layout.autoSize)
+        slot:SetZOrder(layout.zOrder)
+        clone:SetVisibility(HIT_TEST_INVISIBLE)
+        clone:SetRenderOpacity(1.0)
+        local canvas = clone[definition.canvas]
+        local gauge = clone[definition.gauge]
+        canvas:SetVisibility(VISIBLE)
+        canvas:SetRenderOpacity(1.0)
+        gauge:SetVisibility(VISIBLE)
+        gauge:SetRenderOpacity(1.0)
+    end)
+    if not mounted or not isValid(slot) then
+        return false, tostring(mountError)
+    end
+    return true, nil
+end
+
+local function setPreviewAssemblyValues(units, values)
+    for _, definition in ipairs(BARS) do
+        local pair, pairError = requirePreviewValues(values, definition.key)
+        if pair == nil then return false, pairError end
+        local unit = units[definition.key]
+        local gauge = isValid(unit) and unit[definition.gauge] or nil
+        if not isValid(gauge) then
+            return false, "preview " .. definition.key .. " gauge is unavailable"
+        end
+        local set, setError = pcall(function()
+            gauge:ResetGaugeValue(round(pair[1]), round(pair[2]), 0)
+        end)
+        if not set then return false, tostring(setError) end
+    end
+    return true, nil
+end
+
+local function createPreviewAssemblies(liveCockpit, root, values)
+    local sourceRoot = nil
+    local widgets = nil
+    local owningPlayer = nil
+    local resolved = pcall(function()
+        sourceRoot = liveCockpit.UnitGauge
+        widgets = StaticFindObject(WIDGET_LIBRARY)
+        owningPlayer = liveCockpit:GetOwningPlayer()
+    end)
+    if not resolved or not isValid(sourceRoot) then
+        return nil, "live UnitGauge is unavailable"
+    end
+    if not isValid(widgets) then
+        return nil, "WidgetBlueprintLibrary is unavailable"
+    end
+    if not isValid(owningPlayer) then
+        return nil, "live cockpit owning player is unavailable"
+    end
+
+    local layouts = {}
+    local sources = {}
+    for _, definition in ipairs(BARS) do
+        local sourceUnit = nil
+        local sourceRead = pcall(function()
+            sourceUnit = liveCockpit[definition.unit]
+        end)
+        if not sourceRead or not isValid(sourceUnit) then
+            return nil, "live " .. definition.key .. " gauge assembly is unavailable"
+        end
+        local layout, layoutError =
+            readPreviewAssemblyLayout(sourceRoot, sourceUnit, definition.key)
+        if layout == nil then return nil, layoutError end
+        log("PREVIEW | " .. definition.key .. " source slot parent=" ..
+            tostring(layout.parentName))
+        sources[definition.key] = sourceUnit
+        layouts[definition.key] = layout
+    end
+
+    local units = {}
+    for _, definition in ipairs(BARS) do
+        local clone, cloneError = createPreviewAssembly(widgets, owningPlayer,
+            sources[definition.key], root, definition)
+        if clone == nil then return nil, cloneError end
+        local mounted, mountError = mountPreviewAssembly(root, clone,
+            layouts[definition.key], definition)
+        if not mounted then return nil, mountError end
+        units[definition.key] = clone
+    end
+
+    local copied, copyError = setPreviewAssemblyValues(units, values)
+    if not copied then return nil, copyError end
+    return units, nil
+end
+
 mountPreviewUnitGauge = function()
     if state.previewMounted then return true end
 
@@ -411,97 +698,77 @@ mountPreviewUnitGauge = function()
             "PREVIEW ERROR | preview cockpit or menu canvas became invalid")
         return false
     end
-    if readPreviewGaugeGeometry == nil
-        or createNativeGaugeForPreview == nil then
+    local values, valueError = readPreviewGaugeValues(cockpit)
+    if values == nil then
         reportOnce("PREVIEW-MOUNT",
-            "PREVIEW ERROR | native preview geometry or constructor is unavailable")
+            "PREVIEW ERROR | preview gauge values are unavailable: " ..
+            tostring(valueError))
         return false
     end
 
-    local built = {}
-    for index, definition in ipairs(BARS) do
-        local geometry, geometryError =
-            readPreviewGaugeGeometry(cockpit, definition)
-        if geometry == nil then
-            for _, entry in ipairs(built) do
-                if isValid(entry.widget) then
-                    pcall(function() entry.widget:RemoveFromParent() end)
-                end
-            end
-            reportOnce("PREVIEW-MOUNT",
-                "PREVIEW ERROR | " .. tostring(geometryError))
-            return false
-        end
-
-        -- All three player gauge blueprints are visually compatible, but HP
-        -- and Soul carry Construct graphs that expect the live avatar. The
-        -- stamina blueprint is the only graph-free native gauge, so every
-        -- preview copy is created from that safe class and receives the
-        -- target bar's colour explicitly.
-        local donorUnit = cockpit[NATIVE_DONOR.unit]
-        local donor = isValid(donorUnit) and donorUnit[NATIVE_DONOR.gauge]
-        local widget, createError =
-            createNativeGaugeForPreview(cockpit, donor, menuCanvas)
-        if widget == nil then
-            for _, entry in ipairs(built) do
-                if isValid(entry.widget) then
-                    pcall(function() entry.widget:RemoveFromParent() end)
-                end
-            end
-            reportOnce("PREVIEW-MOUNT",
-                "PREVIEW ERROR | native " .. definition.key ..
-                " preview unavailable: " .. tostring(createError))
-            return false
-        end
-
-        local colored = pcall(function()
-            widget:SetGaugeColor(PREVIEW_GAUGE_COLORS[definition.key])
-        end)
-        if not colored then
-            pcall(function() widget:RemoveFromParent() end)
-            for _, entry in ipairs(built) do
-                if isValid(entry.widget) then
-                    pcall(function() entry.widget:RemoveFromParent() end)
-                end
-            end
-            reportOnce("PREVIEW-MOUNT",
-                "PREVIEW ERROR | native " .. definition.key ..
-                " preview colour could not be applied")
-            return false
-        end
-
-        local slot = placePreviewWidget(menuCanvas, widget, geometry,
-            1000 + index)
-        if slot == nil then
-            pcall(function() widget:RemoveFromParent() end)
-            for _, entry in ipairs(built) do
-                if isValid(entry.widget) then
-                    pcall(function() entry.widget:RemoveFromParent() end)
-                end
-            end
-            reportOnce("PREVIEW-MOUNT",
-                "PREVIEW ERROR | menu rejected native " ..
-                definition.key .. " preview")
-            return false
-        end
-
-        local entry = { key = definition.key, widget = widget, slot = slot }
-        built[#built + 1] = entry
-        state.previewNative[definition.key] = widget
-        log(string.format(
-            "PREVIEW | %s copy geometry x=%.0f y=%.0f w=%.0f h=%.0f",
-            definition.key, geometry.x, geometry.y,
-            geometry.width, geometry.height))
+    local viewport = state.previewMenuSize
+    if type(viewport) ~= "table" or not finiteNumber(viewport.width)
+        or not finiteNumber(viewport.height) then
+        reportOnce("PREVIEW-MOUNT",
+            "PREVIEW ERROR | preview viewport geometry is unavailable")
+        return false
     end
 
-    state.previewWidgets = built
+    local root, rootError = createPreviewRoot(menuCanvas)
+    if root == nil then
+        reportOnce("PREVIEW-MOUNT",
+            "PREVIEW ERROR | preview wrapper creation failed: " ..
+            tostring(rootError))
+        return false
+    end
+    local rootSlot = placePreviewWidget(menuCanvas, root, {
+        x = 0.0,
+        y = 0.0,
+        width = viewport.width,
+        height = viewport.height,
+    }, 1000)
+    if rootSlot == nil then
+        pcall(function() root:RemoveFromParent() end)
+        reportOnce("PREVIEW-MOUNT",
+            "PREVIEW ERROR | menu rejected the preview wrapper")
+        return false
+    end
+
+    local units, assemblyError = createPreviewAssemblies(cockpit, root, values)
+    if units == nil then
+        pcall(function() root:RemoveFromParent() end)
+        reportOnce("PREVIEW-MOUNT",
+            "PREVIEW ERROR | independent gauge assembly clone failed: " ..
+            tostring(assemblyError))
+        return false
+    end
+
+    if type(mountPreviewReadouts) ~= "function" then
+        pcall(function() root:RemoveFromParent() end)
+        reportOnce("PREVIEW-MOUNT",
+            "PREVIEW ERROR | preview readout builder is unavailable")
+        return false
+    end
+    local previewLabels, readoutError =
+        mountPreviewReadouts(cockpit, root, units, values)
+    if previewLabels == nil then
+        pcall(function() root:RemoveFromParent() end)
+        reportOnce("PREVIEW-MOUNT",
+            "PREVIEW ERROR | preview readout clone failed: " ..
+            tostring(readoutError))
+        return false
+    end
+
+    state.previewRoot = root
+    state.previewRootSlot = rootSlot
+    state.previewUnits = units
+    state.previewClone = nil
+    state.previewCloneSlot = nil
+    state.previewLabels = previewLabels
     state.previewMounted = true
     log(string.format(
-        "PREVIEW | native gauge copies mounted | widgets=%d | viewport=%.0fx%.0f",
-        #built, state.previewMenuSize.width, state.previewMenuSize.height))
-    if refreshPreviewGaugeValues ~= nil then
-        refreshPreviewGaugeValues(cockpit)
-    end
+        "PREVIEW | independent gauge assemblies mounted | viewport=%.0fx%.0f",
+        viewport.width, viewport.height))
     clearReport("PREVIEW-MOUNT")
     return true
 end
@@ -513,6 +780,7 @@ restorePreviewMount = function(restore)
         -- World teardown can invalidate a UMG wrapper before the Lua loop sees
         -- the boundary. Drop ownership without dereferencing that old tree.
         discardPreviewWidgetState()
+        state.previewSweepCanvas = nil
     end
     return true
 end
@@ -527,17 +795,18 @@ capturePreviewVisibility = function(cockpit)
     return true
 end
 
-restorePreviewVisibility = function(restore)
-    local hadPreview = state.previewApplied or state.previewMounted
+restorePreviewVisibility = function(restore, resetFailure)
+    local hadPreview = state.previewMounted or isValid(state.previewClone)
     restorePreviewMount(restore)
     state.previewApplied = false
     state.previewCockpit = nil
     state.previewMenuSize = nil
     state.previewMenuCanvas = nil
+    if resetFailure ~= false then state.previewFailed = false end
     clearReport("PREVIEW-APPLIED")
     if hadPreview then
         reportOnce("PREVIEW-RESTORED",
-            "PREVIEW | native gauge copies removed; original cockpit tree untouched")
+            "PREVIEW | UnitGauge clone removed; live cockpit tree untouched")
     end
     return true
 end
@@ -546,27 +815,33 @@ applyPreviewVisibility = function(cockpit)
     if state.previewApplied and state.previewCockpit ~= cockpit then
         restorePreviewVisibility(true)
     end
+    if state.previewFailed then return false end
     if not state.previewApplied
         and not capturePreviewVisibility(cockpit) then
+        state.previewFailed = true
         return false
     end
 
-    local mounted, mountError = pcall(function()
-        if not mountPreviewUnitGauge() then
-            error("native preview gauge mount failed")
-        end
-    end)
-    if not mounted then
-        reportOnce("PREVIEW-NATIVE",
-            "PREVIEW ERROR | native preview mount failed: " ..
-            tostring(mountError))
-        restorePreviewVisibility(true)
+    local called, mounted =
+        xpcall(mountPreviewUnitGauge, debug.traceback)
+    if not called then
+        reportOnce("PREVIEW-CLONE",
+            "PREVIEW ERROR | independent UnitGauge mount crashed: " ..
+            tostring(mounted))
+        restorePreviewVisibility(true, false)
+        state.previewFailed = true
         return false
     end
-    clearReport("PREVIEW-NATIVE")
+    if not mounted then
+        restorePreviewVisibility(true, false)
+        reportOnce("PREVIEW-CLONE",
+            "PREVIEW ERROR | independent gauge assembly mount failed closed")
+        state.previewFailed = true
+        return false
+    end
+    clearReport("PREVIEW-CLONE")
     reportOnce("PREVIEW-APPLIED", string.format(
-        "PREVIEW | applied without reparenting original UnitGauge | widgets=%d",
-        #(state.previewWidgets or {})))
+        "PREVIEW | applied from independent gauge assemblies; live HUD untouched"))
     return true
 end
 
@@ -683,15 +958,51 @@ local function shortName(object)
     return name:match("([^%.%s/]+)$") or name
 end
 
-local function findInstance(className)
-    local ok, found = pcall(function() return FindFirstOf(className) end)
-    if not ok or not isValid(found) then return nil end
-    -- FindFirstOf can hand back the class default object, which has no widget
-    -- tree and no player behind it.
-    if string.find(objectName(found), "Default__", 1, true) ~= nil then
-        return nil
+local function isMountedCockpitCandidate(cockpit)
+    if not isValid(cockpit) then return false end
+    if string.find(objectName(cockpit), "Default__", 1, true) ~= nil then
+        return false
     end
-    return found
+
+    local unitGauge = nil
+    local slot = nil
+    local parent = nil
+    local owningPlayer = nil
+    local read = pcall(function()
+        unitGauge = cockpit.UnitGauge
+        slot = unitGauge.Slot
+        parent = slot.Parent
+        owningPlayer = cockpit:GetOwningPlayer()
+    end)
+    return read and isValid(unitGauge) and isValid(slot)
+        and isValid(parent) and isValid(owningPlayer)
+end
+
+local function findMountedCockpit()
+    -- The UI manager owns the one cockpit currently driving the game. Looking
+    -- it up through this chain cannot select a detached preview object of the
+    -- same class left in the UObject array by a previous Lua reload.
+    local controller = nil
+    local manager = nil
+    local cockpit = nil
+    local read = pcall(function()
+        controller = FindFirstOf("RODInGamePlayerController")
+        if not isValid(controller) then
+            error("RODInGamePlayerController is unavailable")
+        end
+        manager = controller:GetInGameUIManager()
+        if not isValid(manager) then
+            error("RODInGameUIManager is unavailable")
+        end
+        cockpit = manager:GetCockpitWidget()
+    end)
+    if not read then
+        return nil, "RODInGameUIManager cockpit chain is unavailable"
+    end
+    if not isMountedCockpitCandidate(cockpit) then
+        return nil, "RODInGameUIManager did not return a mounted cockpit"
+    end
+    return cockpit, nil
 end
 
 -- The cockpit's own lifetime is the mod's lifecycle. Nothing else resets the
@@ -703,26 +1014,40 @@ local function resolveCockpit()
     if isValid(state.cockpit) then return state.cockpit end
     if state.cockpit ~= nil then releaseWidgets(false, "cockpit went invalid") end
 
-    local found = findInstance("WBP_Cockpit_C")
-        or findInstance("RODCockpitWidgetBase")
-    if found == nil then return nil end
+    local found, findError = findMountedCockpit()
+    if found == nil then
+        reportOnce("COCKPIT",
+            "COCKPIT ERROR | canonical mounted WBP_Cockpit_C is unavailable: " ..
+            tostring(findError))
+        return nil
+    end
 
     state.cockpit = found
+    clearReport("COCKPIT")
     dbg("cockpit resolved | " .. objectName(found))
     return found
 end
 
-local function resolveHero(cockpit)
+resolveHero = function(cockpit)
     local hero = weakObject(cockpit.HeroCharacterRef)
-    if isValid(hero) then return hero end
-    return findInstance("RODWorldHeroCharacter")
-        or findInstance("RODHeroCharacter")
+    if not isValid(hero) then
+        reportOnce("HERO",
+            "HERO ERROR | canonical cockpit HeroCharacterRef is unavailable")
+        return nil
+    end
+    clearReport("HERO")
+    return hero
 end
 
 local function resolvePlayerState(cockpit)
     local playerState = weakObject(cockpit.PlayerStateRef)
-    if isValid(playerState) then return playerState end
-    return findInstance("RODPlayerState")
+    if not isValid(playerState) then
+        reportOnce("PLAYER-STATE",
+            "PLAYER STATE ERROR | canonical cockpit PlayerStateRef is unavailable")
+        return nil
+    end
+    clearReport("PLAYER-STATE")
+    return playerState
 end
 
 --========================================================--
@@ -762,21 +1087,17 @@ local function measure(widget)
     return geometry
 end
 
--- Gauge widgets are not CanvasPanel children on this build, so their slot has
--- no usable size even though Slate has already laid them out. The cached local
--- geometry is the authoritative size for a widget in its current design
--- space; unlike a guessed rectangle it follows the game's DPI/layout rules.
-local function measureCachedWidgetSize(widget)
+-- Gauge widgets are not CanvasPanel children on this build. Their slot therefore
+-- cannot provide a size, and their cached geometry becomes zero when the game's
+-- menu collapses the cockpit. The widget's desired size remains the authoritative
+-- design-space size in that state.
+local function measureWidgetDesiredSize(widget)
     if not isValid(widget) then return nil end
-    local slate = library(SLATE_LIBRARY)
-    if slate == nil then return nil end
 
     local width = nil
     local height = nil
     local read = pcall(function()
-        widget:ForceLayoutPrepass()
-        local geometry = widget:GetCachedGeometry()
-        local size = slate:GetLocalSize(geometry)
+        local size = widget:GetDesiredSize()
         width = tonumber(size.X)
         height = tonumber(size.Y)
     end)
@@ -787,49 +1108,21 @@ local function measureCachedWidgetSize(widget)
     return {
         width = width,
         height = height,
-        note = string.format("cached w=%.0f h=%.0f", width, height),
+        note = string.format("desired w=%.0f h=%.0f", width, height),
     }
 end
 
 local function measureGaugeSize(widget)
-    return measureCachedWidgetSize(widget)
-end
-
-readPreviewGaugeGeometry = function(cockpit, definition)
-    local unit = cockpit[definition.unit]
-    if not isValid(unit) then
-        return nil, definition.key .. " preview assembly is unavailable"
-    end
-
-    local gauge = unit[definition.gauge]
-    if not isValid(gauge) then
-        return nil, definition.key .. " preview gauge is unavailable"
-    end
-
-    -- The assembly is a direct child of the live UnitGauge canvas. Its slot
-    -- supplies the screen position; the inner native gauge supplies the
-    -- rendered bar size. Both are live UI units, so this follows the game's
-    -- current DPI/layout instead of assuming a monitor resolution.
-    local assembly = measure(unit)
-    local gaugeSize = measureGaugeSize(gauge)
-    if assembly == nil or gaugeSize == nil then
-        return nil, definition.key .. " preview geometry is unavailable"
-    end
-    return {
-        x = assembly.x,
-        y = assembly.y,
-        width = gaugeSize.width,
-        height = gaugeSize.height,
-    }, nil
+    return measureWidgetDesiredSize(widget)
 end
 
 -- Drawing ON a bar means out-ranking everything already in that canvas, and a
 -- fixed ZOrder is a guess about a layout the mod does not own.
 --
 -- The floor matters as much as the survey: SlotAsCanvasSlot returns nothing
--- for a child whose parent is not a CanvasPanel, and on this build it returns
--- nothing for the gauges. A survey that reads no slot at all reports 0 and
--- would put the readout on layer 10 -- under anything the HUD placed higher.
+-- for a child whose parent is not a CanvasPanel. A survey that reads no slot at
+-- all reports 0 and would put the readout on layer 10 -- under anything the
+-- HUD placed higher.
 local MINIMUM_Z_ORDER = 500
 
 local function topZOrder(canvas)
@@ -967,13 +1260,8 @@ local function constructWidget(classPath, outer)
         widget = StaticConstructObject(class, outer,
             FName(WIDGET_PREFIX .. tostring(widgetSerial)))
     end)
+    if not built then return nil, tostring(buildError) end
     if not isValid(widget) then
-        -- A named construction is preferred but not required; an unnamed
-        -- widget still works, it just cannot be swept up later.
-        pcall(function() widget = StaticConstructObject(class, outer) end)
-    end
-    if not isValid(widget) then
-        if not built then return nil, tostring(buildError) end
         return nil, "construction returned no widget: " .. classPath
     end
     return widget, nil
@@ -1178,10 +1466,17 @@ local function readoutPlacement(candidate, rightMost)
     }
 end
 
-local function ensureLabel(cockpit, definition, surfaces)
-    local entry = state.labels[definition.key]
+local function ensureLabel(cockpit, definition, surfaces, entries, fontCockpit)
+    if type(entries) ~= "table" then
+        return nil, "readout storage is unavailable"
+    end
+    if not isValid(fontCockpit) then
+        return nil, "readout font cockpit is unavailable"
+    end
+
+    local entry = entries[definition.key]
     if entry ~= nil and isValid(entry.widget) then return entry end
-    state.labels[definition.key] = nil
+    entries[definition.key] = nil
 
     local candidates = surfaces.bars[definition.key]
     if candidates == nil or #candidates == 0 then
@@ -1192,7 +1487,7 @@ local function ensureLabel(cockpit, definition, surfaces)
         local label, buildError = constructWidget(TEXT_BLOCK_CLASS,
             candidate.canvas)
         if label == nil then return nil, buildError end
-        styleLabel(label, cockpit)
+        styleLabel(label, fontCockpit)
 
         local zOrder = math.max(topZOrder(candidate.canvas) + 10,
             MINIMUM_Z_ORDER)
@@ -1212,7 +1507,7 @@ local function ensureLabel(cockpit, definition, surfaces)
                 sources = (candidate.layer == "front") and candidate.chain
                     or nil,
             }
-            state.labels[definition.key] = entry
+            entries[definition.key] = entry
             -- Logged unconditionally: this one line is what a misplaced
             -- readout is diagnosed from, and needing debug logging on first
             -- only means asking for the screenshot twice.
@@ -1257,18 +1552,6 @@ end
 local function mirrorVisibility(entry)
     if entry == nil then return end
     if not isValid(entry.widget) then return end
-
-    if state.previewApplied then
-        if entry.shown ~= true then
-            entry.shown = true
-            pcall(function() entry.widget:SetVisibility(HIT_TEST_INVISIBLE) end)
-        end
-        if entry.opacity ~= 1.0 then
-            entry.opacity = 1.0
-            pcall(function() entry.widget:SetRenderOpacity(1.0) end)
-        end
-        return
-    end
 
     if entry.sources == nil then return end
 
@@ -1320,6 +1603,98 @@ local function stampLabel(entry, current, maximum)
     pcall(function()
         entry.widget:SetText(FText(formatValue(currentValue, maximumValue)))
     end)
+end
+
+-- Preview labels are rebuilt into the independent assembly tree. The live
+-- cockpit supplies only the font donor; it is never a parent, source of a
+-- visibility change, or event target.
+local function previewReadoutCandidates(previewRoot, previewUnits, definition)
+    local unit = previewUnits[definition.key]
+    if not isValid(unit) then return {} end
+
+    local canvas = unit[definition.canvas]
+    local gauge = unit[definition.gauge]
+    local chain = { unit, canvas, gauge }
+    stopCaching(unit, "InvalidationBox_root")
+
+    if CONFIG.READOUT_LAYER == "inside" and isValid(gauge) then
+        local root = nil
+        pcall(function() root = gauge.WidgetTree.RootWidget end)
+        if isValid(root) then
+            return { { canvas = root, layer = "inside", chain = chain,
+                normalised = true } }
+        end
+        return {}
+    end
+    if CONFIG.READOUT_LAYER == "front" then
+        if not isValid(previewRoot) then return {} end
+        return { {
+            canvas = previewRoot,
+            layer = "front",
+            chain = chain,
+            point = {
+                x = CONFIG[definition.posX],
+                y = CONFIG[definition.posY],
+            },
+        } }
+    end
+    if CONFIG.READOUT_LAYER == "gauge" and isValid(canvas) then
+        return { {
+            canvas = canvas,
+            layer = "gauge",
+            chain = chain,
+            rectangle = measure(gauge),
+        } }
+    end
+    return {}
+end
+
+mountPreviewReadouts = function(liveCockpit, previewRoot, previewUnits, values)
+    if not isValid(liveCockpit) or not isValid(previewRoot)
+        or type(previewUnits) ~= "table" then
+        return nil, "live cockpit or independent preview tree is unavailable"
+    end
+    if type(CONFIG) ~= "table" then
+        return nil, "GaugeNumbers configuration is unavailable"
+    end
+
+    local labels = {}
+    local surfaces = { bars = {}, rightMost = nil }
+    for _, definition in ipairs(BARS) do
+        if CONFIG[definition.setting] then
+            local candidates = previewReadoutCandidates(previewRoot,
+                previewUnits, definition)
+            if #candidates == 0 then
+                return nil, "preview " .. definition.key ..
+                    " gauge has no " .. tostring(CONFIG.READOUT_LAYER) ..
+                    " readout canvas"
+            end
+            surfaces.bars[definition.key] = candidates
+            for _, candidate in ipairs(candidates) do
+                local rectangle = candidate.rectangle
+                if rectangle ~= nil and candidate.layer == "front" then
+                    local right = rectangle.x + rectangle.width
+                    if surfaces.rightMost == nil or right > surfaces.rightMost then
+                        surfaces.rightMost = right
+                    end
+                end
+            end
+        end
+    end
+
+    for _, definition in ipairs(BARS) do
+        if CONFIG[definition.setting] then
+            local built, entry, buildError = pcall(ensureLabel,
+                liveCockpit, definition, surfaces, labels, liveCockpit)
+            if not built then return nil, tostring(entry) end
+            if entry == nil then return nil, tostring(buildError) end
+
+            local pair, pairError = requirePreviewValues(values, definition.key)
+            if pair == nil then return nil, pairError end
+            stampLabel(entry, pair[1], pair[2])
+        end
+    end
+    return labels, nil
 end
 
 --========================================================--
@@ -1676,46 +2051,6 @@ readHeroValues = function(hero)
     return values
 end
 
-local function validGaugePair(pair)
-    return type(pair) == "table"
-        and finiteNumber(pair[1])
-        and finiteNumber(pair[2])
-end
-
-refreshPreviewGaugeValues = function(cockpit)
-    if not state.previewMounted or readHeroValues == nil then return false end
-
-    local hero = resolveHero(cockpit)
-    if not isValid(hero) then
-        reportOnce("PREVIEW-NATIVE-VALUES",
-            "PREVIEW ERROR | hero attributes unavailable for preview gauges")
-        return false
-    end
-
-    local values = readHeroValues(hero)
-    if not validGaugePair(values.HP)
-        or not validGaugePair(values.STAMINA)
-        or not validGaugePair(values.SP) then
-        reportOnce("PREVIEW-NATIVE-VALUES",
-            "PREVIEW ERROR | complete hero gauge values unavailable")
-        return false
-    end
-
-    for _, definition in ipairs(BARS) do
-        local pair = values[definition.key]
-        local widget = state.previewNative[definition.key]
-        local previous = state.previewNativeValues[definition.key]
-        if isValid(widget)
-            and (previous == nil or previous[1] ~= pair[1]
-                or previous[2] ~= pair[2]) then
-            driveNativeGauge(widget, pair[1], pair[2])
-            state.previewNativeValues[definition.key] = { pair[1], pair[2] }
-        end
-    end
-    clearReport("PREVIEW-NATIVE-VALUES")
-    return true
-end
-
 local function needsInjection()
     for _, definition in ipairs(BARS) do
         if CONFIG[definition.setting] then
@@ -1738,12 +2073,14 @@ local function updatePreviewMode(active, previewError)
 
     local requested = active == true
     if requested and not state.previewRequested then
+        state.previewFailed = false
         log("PREVIEW | active marker observed")
     elseif not requested and state.previewRequested then
         log("PREVIEW | marker closed")
     end
     state.previewRequested = requested
     if not state.previewRequested then
+        state.previewFailed = false
         if state.previewApplied or state.previewMounted then
             restorePreviewVisibility(isValid(state.cockpit))
         end
@@ -1840,7 +2177,8 @@ local function tick()
     for _, definition in ipairs(BARS) do
         if CONFIG[definition.setting] then
             local tag = "INJECT-" .. definition.key
-            local entry, injectError = ensureLabel(cockpit, definition, surfaces)
+            local entry, injectError = ensureLabel(cockpit, definition, surfaces,
+                state.labels, cockpit)
             if entry == nil then
                 reportOnce(tag, "INJECT ERROR | " .. tostring(injectError))
             else
@@ -1860,9 +2198,6 @@ local function tick()
             if definition ~= nil and CONFIG[definition.setting] then
                 stampLabel(state.labels[key], pair[1], pair[2])
             end
-        end
-        if state.previewRequested and refreshPreviewGaugeValues ~= nil then
-            refreshPreviewGaugeValues(cockpit)
         end
     end
     for _, entry in pairs(state.labels) do mirrorVisibility(entry) end

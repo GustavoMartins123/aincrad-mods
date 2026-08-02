@@ -1841,12 +1841,27 @@ local function queueMenuInjection(menuKey)
         return
     end
 
+    if type(pendingMenuInjections) ~= "table" then
+        error("equipment menu injection state is invalid")
+    end
     local readyAt = os.clock() + MENU_INJECTION_DELAY_SEC
     local pending = pendingMenuInjections[menuKey]
     if pending == nil or readyAt < pending then
         pendingMenuInjections[menuKey] = readyAt
     end
     scheduleMenuInjection()
+end
+
+local function requirePendingMenuInjections()
+    if type(pendingMenuInjections) ~= "table" then
+        error("equipment menu injection state is invalid")
+    end
+    return pendingMenuInjections
+end
+
+local function hasPendingMenuInjections()
+    for _ in pairs(requirePendingMenuInjections()) do return true end
+    return false
 end
 
 activeEquipmentContextIsAttached = function()
@@ -1870,6 +1885,7 @@ end
 
 local function processMenuInjectionCycle()
     local now = os.clock()
+    local pendingInjections = requirePendingMenuInjections()
 
     if activeEquipmentContext ~= nil
         and not activeEquipmentContextIsAttached() then
@@ -1879,9 +1895,9 @@ local function processMenuInjectionCycle()
         if staleKey ~= nil then injectedMenus[staleKey] = nil end
     end
 
-    for menuKey, readyAt in pairs(pendingMenuInjections) do
+    for menuKey, readyAt in pairs(pendingInjections) do
         if now >= readyAt then
-            pendingMenuInjections[menuKey] = nil
+            pendingInjections[menuKey] = nil
             local mainMenu, resolveError = resolveMainMenuByKey(menuKey)
             if mainMenu == nil then
                 log("Equipment injection failed closed for " .. menuKey
@@ -1894,14 +1910,12 @@ local function processMenuInjectionCycle()
 end
 
 scheduleMenuInjection = function()
-    if menuInjectionTimerScheduled
-        or next(pendingMenuInjections) == nil then
-        return
-    end
+    if menuInjectionTimerScheduled then return end
+    if not hasPendingMenuInjections() then return end
 
     local now = os.clock()
     local earliest = nil
-    for _, readyAt in pairs(pendingMenuInjections) do
+    for _, readyAt in pairs(requirePendingMenuInjections()) do
         if earliest == nil or readyAt < earliest then earliest = readyAt end
     end
     local delayMs = math.max(

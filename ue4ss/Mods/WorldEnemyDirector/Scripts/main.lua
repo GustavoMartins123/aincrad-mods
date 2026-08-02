@@ -20,47 +20,55 @@ local CONFIG_PATH = SCRIPT_DIR .. "config.lua"
 local RUNTIME_PATH = SCRIPT_DIR .. "runtime.lua"
 local RUNTIME_LOCK_PATH = RUNTIME_PATH .. ".lock"
 
-local STARTUP_SETTLE_MS = 2000
+-- Tuning constants live in one table rather than one local each. Lua caps a
+-- function -- including this chunk -- at 200 active locals, and this file was
+-- one hook registration away from that ceiling.
+local CONST = {}
+
+CONST.STARTUP_SETTLE_MS = 2000
 -- Used by the ClientRestart-after-travel path. Left at 1500 because cross-world
 -- travel gets a real
 -- ClientRestart and the readiness-stability gate behind it, but it is the
 -- shortest settle in the mod guarding the most expensive transition -- if
 -- streaming crashes resurface after a map change rather than a fast travel,
 -- this is the number to raise.
-local RESTART_SETTLE_MS = 1500
+CONST.RESTART_SETTLE_MS = 1500
 -- FastTravelMod now activates and validates the destination cell before moving
 -- the hero. Two seconds keeps the director out of the close/arrival lifecycle
 -- without adding another five-second wait after the destination is already
 -- locally ready.
-local QUEST_TELEPORT_SETTLE_MS = 2000
-local STABILITY_SAMPLES_REQUIRED = 3
-local DISCOVERY_STABILIZE_MS = 2000
-local SETTINGS_POLL_MS = 1000
-local SPAWN_INITIALIZE_MS = 8000
+CONST.QUEST_TELEPORT_SETTLE_MS = 2000
+CONST.STABILITY_SAMPLES_REQUIRED = 3
+CONST.DISCOVERY_STABILIZE_MS = 2000
+CONST.SETTINGS_POLL_MS = 1000
+CONST.SPAWN_INITIALIZE_MS = 8000
 -- How close a newly seen enemy must be to where a request asked for one
 -- The spawn point is lifted off the navmesh surface before the actor is
 -- created. Spawning a character capsule exactly on the ground fails the
 -- collision check; this was in the mod originally and its removal is what
 -- silently stopped multiplication.
-local SPAWN_Z_OFFSET_CM = 40.0
+CONST.SPAWN_Z_OFFSET_CM = 40.0
 -- Requests allowed to expire unmatched, in a row, before multiplication is
 -- declared non-functional for this session.
 -- How often origins near the hero are revisited when nothing was freed.
-local ORIGIN_SWEEP_MS = 3000
+CONST.ORIGIN_SWEEP_MS = 3000
 -- Blueprint/AI initialization can change a capsule after the initial spawn
 -- check. Re-validate every owned actor after activation so an actor cannot stay
 -- in the world after losing its physical Pawn collision.
-local COLLISION_AUDIT_MS = 500
+CONST.COLLISION_AUDIT_MS = 500
 -- Distance bands are re-scanned faster than the audit runs because a sprinting
 -- player crosses a band edge quickly. The scan is native and reports only
 -- changes, so a short interval costs almost nothing when nothing moved bands.
-local BAND_SCAN_MS = 250
-local OWNED_ADMISSION_SAMPLES_REQUIRED = 3
-local OWNED_ADMISSION_TIMEOUT_MS = 4000
-local NAV_ATTEMPTS_PER_PASS = 1
-local NAV_MAX_ATTEMPTS = 12
-local NAV_MIN_SEPARATION_CM = 150.0
-local MAX_DISCOVERY_PER_TICK = 2
+CONST.BAND_SCAN_MS = 250
+-- How much bigger the game's per-role enemy pool is made before the director
+-- multiplies the population. 8x mirrors the maximum spawn multiplier.
+CONST.POOL_BUDGET_MULTIPLIER = 8
+CONST.OWNED_ADMISSION_SAMPLES_REQUIRED = 3
+CONST.OWNED_ADMISSION_TIMEOUT_MS = 4000
+CONST.NAV_ATTEMPTS_PER_PASS = 1
+CONST.NAV_MAX_ATTEMPTS = 12
+CONST.NAV_MIN_SEPARATION_CM = 150.0
+CONST.MAX_DISCOVERY_PER_TICK = 2
 -- Caps how long the admission-audit loop may spend per 500 ms collision-audit
 -- cycle. A spawn burst otherwise runs comparePhysical/controlOperational/
 -- nativeRegistryMembership for every not-yet-admitted enemy synchronously in
@@ -69,19 +77,19 @@ local MAX_DISCOVERY_PER_TICK = 2
 -- is simply checked on the next 500 ms cycle. Admission itself is unaffected:
 -- the 3-sample stability requirement and admissionDeadlineMs are wall-clock
 -- based, not cycle-count based, so nothing is skipped, only delayed slightly.
-local AUDIT_BUDGET_SEC = 0.003
+CONST.AUDIT_BUDGET_SEC = 0.003
 -- 32 attempts, 250 ms apart: eight seconds of grace for a streaming enemy to
 -- finish initialising before it is reported as broken.
-local SNAPSHOT_RETRY_LIMIT = 32
-local SNAPSHOT_RETRY_BACKOFF_MS = 250
-local GAMEPLAY_MOD_ADDITIVE = 0
-local SPAWN_COLLISION_ADJUST_OR_REJECT = 3
-local SPAWN_SCALE_MULTIPLY_ROOT = 1
-local GAS_VALUE_EPSILON = 0.01
-local ENEMY_ROLE_NONE = 0
-local ENEMY_ROLE_MOB = 1
-local ENEMY_ROLE_ELITE = 2
-local ENEMY_ROLE_BOSS = 3
+CONST.SNAPSHOT_RETRY_LIMIT = 32
+CONST.SNAPSHOT_RETRY_BACKOFF_MS = 250
+CONST.GAMEPLAY_MOD_ADDITIVE = 0
+CONST.SPAWN_COLLISION_ADJUST_OR_REJECT = 3
+CONST.SPAWN_SCALE_MULTIPLY_ROOT = 1
+CONST.GAS_VALUE_EPSILON = 0.01
+CONST.ENEMY_ROLE_NONE = 0
+CONST.ENEMY_ROLE_MOB = 1
+CONST.ENEMY_ROLE_ELITE = 2
+CONST.ENEMY_ROLE_BOSS = 3
 
 local GAS_ATTRIBUTE_NAMES = {
     health = "Health",
@@ -165,7 +173,7 @@ local CONFIG = nil
 local configDigest = nil
 local configHealthy = false
 local elapsedMs = 0
-local lastSettingsCheckMs = -SETTINGS_POLL_MS
+local lastSettingsCheckMs = -CONST.SETTINGS_POLL_MS
 
 local function dbg(message)
     if CONFIG ~= nil and CONFIG.DEBUG_LOGS then log(message) end
@@ -828,6 +836,26 @@ do
         return true, repaired
     end
 
+    -- The last thing done to an owned extra: let it perceive the player.
+    --
+    -- Everything that defines the enemy -- collision, level, attributes,
+    -- registry membership, mutation -- is already final by the time this runs,
+    -- so it can no longer be engaged while half-configured. DisableDetectFlag
+    -- is cleared after StartAI because StartAI writes it, and the result is
+    -- read back rather than assumed.
+    function enemyContracts.enableDetection(enemy)
+        local ok, detectError = pcall(function()
+            enemy:StartAI(false)
+            enemy.DisableDetectFlag = false
+        end)
+        if not ok then return false, firstErrorLine(detectError) end
+
+        local readOk, disabled = pcall(function() return enemy.DisableDetectFlag end)
+        if not readOk then return false, "detection state is unreadable" end
+        if disabled ~= false then return false, "detection did not stay enabled" end
+        return true, nil
+    end
+
     function enemyContracts.controlOperational(enemy)
         local operational, lifecycleError = enemyOperational(enemy)
         if not operational then return nil, lifecycleError end
@@ -836,9 +864,9 @@ do
             if enemy.bAbilitiesInitialized ~= true then
                 error("enemy abilities are not initialized")
             end
-            if enemy.DisableDetectFlag ~= false then
-                error("enemy detection is disabled")
-            end
+            -- Detection is deliberately off until the extra is fully settled,
+            -- so it is not part of this contract. It is switched on as the last
+            -- activation step and verified there instead.
             local controller = enemy:GetController()
             if not isValid(controller) then
                 error("AI controller is unavailable")
@@ -897,17 +925,18 @@ local discoveryBatch = false
 local discoveryReadyAtMs = nil
 local generation = 1
 local worldPaused = true
-local resumeAtMs = STARTUP_SETTLE_MS
+local resumeAtMs = CONST.STARTUP_SETTLE_MS
 local rescanRequested = false
 local worldFault = nil
+local poolBudgetRaised = false
 -- A world fault used to be permanent: one rejected spawn stopped multiplication
 -- for the rest of the session, and the only way back was a world transition.
 -- A single bad actor is not evidence that the next one is bad, so a fault now
 -- stops the work, waits, and lets the director try again. Repeated faults back
 -- off so a genuinely broken world reports itself instead of looping.
-local WORLD_FAULT_RETRY_MS = 15000
-local WORLD_FAULT_RETRY_CEILING_MS = 120000
-local worldFaultRetryMs = WORLD_FAULT_RETRY_MS
+CONST.WORLD_FAULT_RETRY_MS = 15000
+CONST.WORLD_FAULT_RETRY_CEILING_MS = 120000
+local worldFaultRetryMs = CONST.WORLD_FAULT_RETRY_MS
 local worldFaultResumeAtMs = nil
 local awaitingTravelRestart = false
 
@@ -933,15 +962,15 @@ local nextOriginSweepMs = 0
 local nextCollisionAuditMs = 0
 local nextBandScanMs = 0
 local bandScanFaultReported = false
-local SPAWN_PACING_MS = 350
+CONST.SPAWN_PACING_MS = 350
 local lastSpawnMs = 0
-local AMBIENT_CHECK_INTERVAL_MS = 4000
-local AMBIENT_EMPTY_RADIUS_CM = 3500.0
-local AMBIENT_SPAWN_MIN_DIST_CM = 1800.0
-local AMBIENT_SPAWN_MAX_DIST_CM = 3200.0
+CONST.AMBIENT_CHECK_INTERVAL_MS = 4000
+CONST.AMBIENT_EMPTY_RADIUS_CM = 3500.0
+CONST.AMBIENT_SPAWN_MIN_DIST_CM = 1800.0
+CONST.AMBIENT_SPAWN_MAX_DIST_CM = 3200.0
 local nextAmbientCheckMs = 0
 local ambientCounter = 0
-local NATIVE_SANITIZE_DELAY_MS = 2000
+CONST.NATIVE_SANITIZE_DELAY_MS = 2000
 local nativeSanitizeRequested = false
 local nativeSanitizeDueMs = 0
 local nativeSanitizeReason = nil
@@ -974,7 +1003,8 @@ local function clearWorldReferences()
     discoveryReadyAtMs = nil
     worldFault = nil
     worldFaultResumeAtMs = nil
-    worldFaultRetryMs = WORLD_FAULT_RETRY_MS
+    worldFaultRetryMs = CONST.WORLD_FAULT_RETRY_MS
+    poolBudgetRaised = false
     navigationSystem = nil
     gameplayStatics = nil
     worldPartitionSubsystem = nil
@@ -994,9 +1024,57 @@ local function clearWorldReferences()
     nativeSanitizeReason = nil
 end
 
+-- Give the game a bigger enemy pool before multiplying its population.
+--
+-- EnemyPoolingNum is how many enemies the game keeps pooled per role. When it
+-- runs out, the game reuses an enemy that is still in play instead of taking a
+-- fresh one, which is why EnemyReused fires so often here, why an extra could
+-- change size on its own, and why enemies degraded after they had already been
+-- admitted and were working. The mod adds many times the population the pool
+-- was sized for, so it has to raise that budget rather than expect the game to
+-- absorb it.
+--
+-- Applied once per world, and best-effort: if it fails, the director runs
+-- exactly as it did before.
+local function expandEnemyPoolBudget()
+    if poolBudgetRaised then return end
+    if type(WEDNativeExpandEnemyPool) ~= "function" then return end
+
+    -- GameConfig is a field on URODGameInstance; GetGameConfig lives on the
+    -- config class itself, not on the instance.
+    local ok, config = pcall(function()
+        local instance = FindFirstOf("RODGameInstance")
+        if not isValid(instance) then return nil end
+        return instance.GameConfig
+    end)
+    if not ok or not isValid(config) then
+        local fallbackOk, fallback = pcall(FindFirstOf, "RODGameConfig")
+        if not fallbackOk or not isValid(fallback) then return end
+        config = fallback
+    end
+
+    poolBudgetRaised = true
+    local callOk, raised, detail, changed, before, after = pcall(
+        WEDNativeExpandEnemyPool,
+        config:GetAddress(),
+        CONST.POOL_BUDGET_MULTIPLIER)
+    if not callOk or raised ~= true then
+        log("ENEMY POOL | budget unchanged: " ..
+            (callOk and tostring(detail) or firstErrorLine(raised)) ..
+            " | the game may still recycle live enemies")
+        return
+    end
+    log(string.format(
+        "ENEMY POOL | budget raised %dx | %d role(s) changed | total %d -> %d",
+        CONST.POOL_BUDGET_MULTIPLIER,
+        changed or 0,
+        before or 0,
+        after or 0))
+end
+
 local function requestNativeSanitize(reason)
     nativeSanitizeRequested = true
-    nativeSanitizeDueMs = elapsedMs + NATIVE_SANITIZE_DELAY_MS
+    nativeSanitizeDueMs = elapsedMs + CONST.NATIVE_SANITIZE_DELAY_MS
     nativeSanitizeReason = tostring(reason)
 end
 
@@ -1089,7 +1167,7 @@ local function beginRestartSettle()
     local followedTravel = awaitingTravelRestart
     awaitingTravelRestart = false
     worldPaused = true
-    local requestedResumeAtMs = elapsedMs + RESTART_SETTLE_MS
+    local requestedResumeAtMs = elapsedMs + CONST.RESTART_SETTLE_MS
     if resumeAtMs == nil or resumeAtMs < requestedResumeAtMs then
         resumeAtMs = requestedResumeAtMs
     end
@@ -1100,7 +1178,7 @@ local function beginRestartSettle()
         requestNativeSanitize("post-ClientRestart after travel")
         log(string.format(
             "TRAVEL SETTLE | ClientRestart after travel | waiting %g seconds",
-            RESTART_SETTLE_MS / 1000
+            CONST.RESTART_SETTLE_MS / 1000
         ))
         return
     end
@@ -1126,7 +1204,7 @@ local function beginSameWorldSettle(reason)
     local nativeResolved, nativeCleared, nativeTracked, nativeError =
         sanitizeNativeOwnedActors(reason)
     worldPaused = true
-    local requestedResumeAtMs = elapsedMs + QUEST_TELEPORT_SETTLE_MS
+    local requestedResumeAtMs = elapsedMs + CONST.QUEST_TELEPORT_SETTLE_MS
     if resumeAtMs == nil or resumeAtMs < requestedResumeAtMs then
         resumeAtMs = requestedResumeAtMs
     end
@@ -1141,7 +1219,7 @@ local function beginSameWorldSettle(reason)
         nativeTracked,
         nativeResolved,
         nativeCleared,
-        QUEST_TELEPORT_SETTLE_MS / 1000
+        CONST.QUEST_TELEPORT_SETTLE_MS / 1000
     ))
 end
 
@@ -1363,8 +1441,8 @@ local function snapshotEnemy(enemy)
     end
     if not finiteNumber(enemyRole)
         or enemyRole % 1 ~= 0
-        or enemyRole < ENEMY_ROLE_NONE
-        or enemyRole > ENEMY_ROLE_BOSS then
+        or enemyRole < CONST.ENEMY_ROLE_NONE
+        or enemyRole > CONST.ENEMY_ROLE_BOSS then
         return nil, "EnemyRole is outside the reflected EEnemyRole contract"
     end
     local gas, gasError = snapshotGas(enemy, className)
@@ -1375,12 +1453,12 @@ local function snapshotEnemy(enemy)
     -- ordinary field elites carry EnemyRole_Boss too (BP_E001004, a boar), so
     -- keying spawn protection on it pulls normal elites out of the catalog.
     local tier = "common"
-    if enemyRole == ENEMY_ROLE_ELITE then
+    if enemyRole == CONST.ENEMY_ROLE_ELITE then
         tier = "elite"
-    elseif enemyRole == ENEMY_ROLE_BOSS then
+    elseif enemyRole == CONST.ENEMY_ROLE_BOSS then
         tier = "boss"
-    elseif enemyRole ~= ENEMY_ROLE_NONE
-        and enemyRole ~= ENEMY_ROLE_MOB then
+    elseif enemyRole ~= CONST.ENEMY_ROLE_NONE
+        and enemyRole ~= CONST.ENEMY_ROLE_MOB then
         return nil, "EnemyRole has no canonical mutation category"
     end
 
@@ -1453,19 +1531,19 @@ local function gasValues(gas)
 end
 
 local function applyGasDelta(state, key, delta)
-    if math.abs(delta) <= GAS_VALUE_EPSILON then return end
+    if math.abs(delta) <= CONST.GAS_VALUE_EPSILON then return end
     local gas = state.baseline.gas
     local before, beforeError = readGasValue(gas, key)
     if before == nil then error(beforeError) end
     state.object:ApplyInstantGameplayEffect(
         delta,
         gas.attributes[key],
-        GAMEPLAY_MOD_ADDITIVE
+        CONST.GAMEPLAY_MOD_ADDITIVE
     )
     local after, afterError = readGasValue(gas, key)
     if after == nil then error(afterError) end
     local expected = before + delta
-    local tolerance = math.max(GAS_VALUE_EPSILON, math.abs(expected) * 0.0001)
+    local tolerance = math.max(CONST.GAS_VALUE_EPSILON, math.abs(expected) * 0.0001)
     if math.abs(after - expected) > tolerance then
         error(string.format(
             "%s GAS write was rejected (expected %.3f, received %.3f)",
@@ -1490,16 +1568,16 @@ local function retargetDerivedGasStat(state, finalKey, baseKey, multiplier, appl
     if current == nil then error(currentError) end
     local desired = gas.baseline[finalKey] * multiplier
     local firstDelta = desired - current
-    if math.abs(firstDelta) <= GAS_VALUE_EPSILON then return end
+    if math.abs(firstDelta) <= CONST.GAS_VALUE_EPSILON then return end
     applyGasDelta(state, baseKey, firstDelta)
     local actual, actualError = readGasValue(gas, finalKey)
     if actual == nil then error(actualError) end
-    local tolerance = math.max(GAS_VALUE_EPSILON, math.abs(desired) * 0.0001)
+    local tolerance = math.max(CONST.GAS_VALUE_EPSILON, math.abs(desired) * 0.0001)
 
     local totalBaseDelta = firstDelta
     if math.abs(actual - desired) > tolerance then
         local response = actual - current
-        if math.abs(response) <= GAS_VALUE_EPSILON then
+        if math.abs(response) <= CONST.GAS_VALUE_EPSILON then
             error(string.format(
                 "%s did not respond to %s",
                 GAS_ATTRIBUTE_NAMES[finalKey],
@@ -1507,7 +1585,7 @@ local function retargetDerivedGasStat(state, finalKey, baseKey, multiplier, appl
             ))
         end
         local slope = response / firstDelta
-        if not finiteNumber(slope) or math.abs(slope) <= GAS_VALUE_EPSILON then
+        if not finiteNumber(slope) or math.abs(slope) <= CONST.GAS_VALUE_EPSILON then
             error(GAS_ATTRIBUTE_NAMES[finalKey] ..
                 " returned an invalid base-attribute coefficient")
         end
@@ -1972,7 +2050,7 @@ end
 
 local function minimumSpawnSeparation()
     return math.min(
-        NAV_MIN_SEPARATION_CM,
+        CONST.NAV_MIN_SEPARATION_CM,
         math.max(50.0, CONFIG.SPAWN_RADIUS * 0.35)
     )
 end
@@ -2100,7 +2178,7 @@ local function sampleReachablePoint(worldContext, origin, radius)
     return {
         X = located.X,
         Y = located.Y,
-        Z = located.Z + SPAWN_Z_OFFSET_CM,
+        Z = located.Z + CONST.SPAWN_Z_OFFSET_CM,
     }, nil
 end
 
@@ -2120,8 +2198,8 @@ local function resolveNavigableSpawnPosition(request, worldContext)
     -- costs the tick no more than it used to and is retried rather than dropped.
     local firstAttempt = request.navAttempts + 1
     local finalAttempt = math.min(
-        request.navAttempts + NAV_ATTEMPTS_PER_PASS,
-        NAV_MAX_ATTEMPTS
+        request.navAttempts + CONST.NAV_ATTEMPTS_PER_PASS,
+        CONST.NAV_MAX_ATTEMPTS
     )
     local lastFailure = "navigation rejected every sample"
     for attempt = firstAttempt, finalAttempt do
@@ -2149,14 +2227,14 @@ local function resolveNavigableSpawnPosition(request, worldContext)
             )
         end
     end
-    if request.navAttempts < NAV_MAX_ATTEMPTS then
+    if request.navAttempts < CONST.NAV_MAX_ATTEMPTS then
         return nil, lastFailure .. string.format(
             " after %d/%d attempts",
             request.navAttempts,
-            NAV_MAX_ATTEMPTS
+            CONST.NAV_MAX_ATTEMPTS
         ), true
     end
-    return nil, lastFailure .. " after " .. NAV_MAX_ATTEMPTS ..
+    return nil, lastFailure .. " after " .. CONST.NAV_MAX_ATTEMPTS ..
         " attempts", false
 end
 
@@ -2341,7 +2419,7 @@ end
 -- common rather than rare: a whole cell's worth of enemies arrives at once, and
 -- the log filled with "required GAS attribute is absent: MaxHealth" for enemies
 -- that were perfectly fine a second later.
-local TRANSIENT_SNAPSHOT_PREFIXES = {
+CONST.TRANSIENT_SNAPSHOT_PREFIXES = {
     "required skeletal mesh is unavailable",
     "required enemy fields are unreadable",
     "required enemy AbilitySystem is unavailable",
@@ -2351,7 +2429,7 @@ local TRANSIENT_SNAPSHOT_PREFIXES = {
 
 local function snapshotErrorIsTransient(message)
     if type(message) ~= "string" then return false end
-    for _, prefix in ipairs(TRANSIENT_SNAPSHOT_PREFIXES) do
+    for _, prefix in ipairs(CONST.TRANSIENT_SNAPSHOT_PREFIXES) do
         if message:find(prefix, 1, true) == 1 then return true end
     end
     return false
@@ -2522,17 +2600,17 @@ local function registerEnemy(enemy, reused, queued)
     if baseline == nil then
         if queued ~= nil and snapshotErrorIsTransient(snapshotError) then
             local retryCount = (queued.retryCount or 0) + 1
-            if retryCount <= SNAPSHOT_RETRY_LIMIT then
+            if retryCount <= CONST.SNAPSHOT_RETRY_LIMIT then
                 queued.retryCount = retryCount
-                queued.retryAtMs = elapsedMs + SNAPSHOT_RETRY_BACKOFF_MS
+                queued.retryAtMs = elapsedMs + CONST.SNAPSHOT_RETRY_BACKOFF_MS
                 queued.request = request
                 objectQueue[#objectQueue + 1] = queued
                 return
             end
             log("ENEMY ERROR | " .. key .. " | " .. snapshotError ..
-                " | still absent after " .. SNAPSHOT_RETRY_LIMIT ..
+                " | still absent after " .. CONST.SNAPSHOT_RETRY_LIMIT ..
                 " retries over " ..
-                (SNAPSHOT_RETRY_LIMIT * SNAPSHOT_RETRY_BACKOFF_MS) .. " ms")
+                (CONST.SNAPSHOT_RETRY_LIMIT * CONST.SNAPSHOT_RETRY_BACKOFF_MS) .. " ms")
             if request ~= nil then
                 spawnQueue = {}
                 pendingSpawns = {}
@@ -2587,7 +2665,7 @@ local function registerEnemy(enemy, reused, queued)
         retired = false,
         admissionStableSamples = 0,
         admissionDeadlineMs =
-            request and (elapsedMs + OWNED_ADMISSION_TIMEOUT_MS) or nil,
+            request and (elapsedMs + CONST.OWNED_ADMISSION_TIMEOUT_MS) or nil,
         -- Carried with the baseline it belongs to. Re-rolling on every
         -- re-registration is what made one enemy change size on its own.
         scaleRoll = (baseline == preservedBaseline) and preservedScaleRoll or nil,
@@ -2759,7 +2837,18 @@ activateSpawnedEnemy = function(enemy, key, spawnPosition)
         enemy.ProwlGoalPositionFlag = false
         controller:StartAI(enemy)
         controller:ApplyBindFunction()
-        enemy:StartAI(false)
+        -- Started blind on purpose.
+        --
+        -- StartAI's argument is the option struct's IsNodetect, so true means
+        -- "do not perceive". The behaviour tree still runs, which is what
+        -- admission checks, but the extra will not hunt the player yet.
+        --
+        -- Extras were charging the player the instant they appeared, before
+        -- their level, attributes and collision had been settled, and those
+        -- were the ones that could not be damaged. Perception is switched on as
+        -- the very last step, once everything else about the enemy is final.
+        enemy:StartAI(true)
+        enemy.DisableDetectFlag = true
         treeResult = enemy:StartBehaviorTree()
     end)
     if not activated then
@@ -2861,7 +2950,7 @@ end
 -- state is authoritative and is not reinterpreted as a spawn-contract failure.
 local function auditOwnedEnemyCollision()
     if elapsedMs < nextCollisionAuditMs then return end
-    nextCollisionAuditMs = elapsedMs + COLLISION_AUDIT_MS
+    nextCollisionAuditMs = elapsedMs + CONST.COLLISION_AUDIT_MS
 
     -- The dead are retired before anything is compared. A killed extra fails
     -- both contracts by definition — the game turns its collision off and stops
@@ -2909,11 +2998,11 @@ local function auditOwnedEnemyCollision()
                     state.admissionStableSamples =
                         state.admissionStableSamples + 1
                     if state.admissionStableSamples
-                        >= OWNED_ADMISSION_SAMPLES_REQUIRED then
+                        >= CONST.OWNED_ADMISSION_SAMPLES_REQUIRED then
                         state.admitted = true
                         -- A spawn that reached admission proves the pipeline
                         -- works, so the retry delay goes back to its floor.
-                        worldFaultRetryMs = WORLD_FAULT_RETRY_MS
+                        worldFaultRetryMs = CONST.WORLD_FAULT_RETRY_MS
                         log("SPAWN ADMITTED | " .. tostring(state.key) ..
                             " | " .. tostring(physicalDetail) ..
                             " | controller=" .. tostring(controlDetail) ..
@@ -2921,6 +3010,20 @@ local function auditOwnedEnemyCollision()
                         reportRegistryMembership(state)
                         if configHealthy and CONFIG.ENABLED then
                             applyMutation(state)
+                        end
+                        -- Absolute last step, after mutation: the extra is now
+                        -- exactly what it is going to be, so it may start
+                        -- hunting.
+                        local detectOk, detectError =
+                            enemyContracts.enableDetection(state.object)
+                        if detectOk then
+                            dbg("SPAWN PERCEPTION | " .. tostring(state.key) ..
+                                " | detection enabled after full configuration")
+                        else
+                            log("SPAWN PERCEPTION FAILED | " ..
+                                tostring(state.key) .. " | " ..
+                                tostring(detectError) ..
+                                " | extra will not notice the player")
                         end
                     end
                 end
@@ -2944,7 +3047,7 @@ local function auditOwnedEnemyCollision()
                         " | native registry: " .. tostring(registryDetail)
                 end
             end
-            if os.clock() - auditStartTime > AUDIT_BUDGET_SEC then break end
+            if os.clock() - auditStartTime > CONST.AUDIT_BUDGET_SEC then break end
         end
     end
 
@@ -3001,7 +3104,7 @@ local function streamingIsSettled()
 end
 
 local function processSpawnRequest()
-    if elapsedMs < lastSpawnMs + SPAWN_PACING_MS then return end
+    if elapsedMs < lastSpawnMs + CONST.SPAWN_PACING_MS then return end
     local request = table.remove(spawnQueue, 1)
     if request == nil or request.generation ~= generation then return end
     lastSpawnMs = elapsedMs
@@ -3132,9 +3235,9 @@ local function processSpawnRequest()
             owner,
             spawnClass,
             transform,
-            SPAWN_COLLISION_ADJUST_OR_REJECT,
+            CONST.SPAWN_COLLISION_ADJUST_OR_REJECT,
             nil,
-            SPAWN_SCALE_MULTIPLY_ROOT
+            CONST.SPAWN_SCALE_MULTIPLY_ROOT
         )
         if not isValid(spawned) then
             error("BeginDeferredActorSpawnFromClass returned no actor")
@@ -3167,7 +3270,7 @@ local function processSpawnRequest()
         requestNativeSanitize(
             "issued actor batch: " .. tostring(request.actorKey))
         request.object = spawned
-        request.expiresAtMs = elapsedMs + SPAWN_INITIALIZE_MS
+        request.expiresAtMs = elapsedMs + CONST.SPAWN_INITIALIZE_MS
         pendingSpawns[#pendingSpawns + 1] = request
         insertedPending = true
 
@@ -3179,7 +3282,7 @@ local function processSpawnRequest()
         local finished = gameplayStatics:FinishSpawningActor(
             spawned,
             transform,
-            SPAWN_SCALE_MULTIPLY_ROOT
+            CONST.SPAWN_SCALE_MULTIPLY_ROOT
         )
         if not isValid(finished) then
             error("FinishSpawningActor returned no actor")
@@ -3242,7 +3345,7 @@ local function requestWorldScan()
         return false
     end
     discoveryBatch = true
-    discoveryReadyAtMs = elapsedMs + DISCOVERY_STABILIZE_MS
+    discoveryReadyAtMs = elapsedMs + CONST.DISCOVERY_STABILIZE_MS
     if enemies ~= nil then
         for _, enemy in pairs(enemies) do
             objectQueue[#objectQueue + 1] = { object = enemy, reused = false }
@@ -3354,7 +3457,7 @@ local function applyNewSettings(settings, digest)
 end
 
 local function checkSettings(force)
-    if not force and elapsedMs - lastSettingsCheckMs < SETTINGS_POLL_MS then return end
+    if not force and elapsedMs - lastSettingsCheckMs < CONST.SETTINGS_POLL_MS then return end
     lastSettingsCheckMs = elapsedMs
 
     local settings, digest, settingsError, transactionInProgress = loadSettings()
@@ -3445,8 +3548,8 @@ end
 -- not be able to stop enemy multiplication.
 local enemyLod = {}
 do
-local ZONE_ACTIVE = 1
-local ZONE_DORMANT = 2
+CONST.ZONE_ACTIVE = 1
+CONST.ZONE_DORMANT = 2
 
 -- There is no release tier yet: everything past the combat radius is simply
 -- asleep, and the scan's outer edge has nothing to separate. Passing an edge
@@ -3454,7 +3557,7 @@ local ZONE_DORMANT = 2
 -- borrowing DESPAWN_RADIUS, which means something else entirely -- it gates
 -- which spawns are issued. Coupling the two would let a saved menu value for
 -- one silently change the other.
-local BAND_NO_RELEASE_CM = 1.0e9
+CONST.BAND_NO_RELEASE_CM = 1.0e9
 
 local function lodAvailable()
     return CONFIG ~= nil
@@ -3516,7 +3619,7 @@ local function sleepExtra(state)
     end)
     if not stopped then return false, "StopLogic was rejected" end
     applyTickInterval(state, CONFIG.LOD_DORMANT_TICK_S)
-    state.lodZone = ZONE_DORMANT
+    state.lodZone = CONST.ZONE_DORMANT
     return true, nil
 end
 
@@ -3529,7 +3632,7 @@ local function wakeExtra(state)
         restored = false
     end
     applyTickInterval(state, state.lodOriginalTickInterval or 0.0)
-    state.lodZone = ZONE_ACTIVE
+    state.lodZone = CONST.ZONE_ACTIVE
     if not restored then return false, "RestartLogic was rejected" end
     return true, nil
 end
@@ -3541,8 +3644,8 @@ local function applyZoneTransition(state, newZone)
     -- Anything past the sleep band is also asleep. The furthest band exists so
     -- that releasing the actor entirely can be added later; until then the
     -- correct treatment for "even further away" is emphatically not to wake it.
-    if newZone ~= ZONE_ACTIVE then
-        if state.lodZone == ZONE_DORMANT then return end
+    if newZone ~= CONST.ZONE_ACTIVE then
+        if state.lodZone == CONST.ZONE_DORMANT then return end
         if not extraMaySleep(state) then return end
         local ok, reason = sleepExtra(state)
         if ok then
@@ -3554,8 +3657,8 @@ local function applyZoneTransition(state, newZone)
         return
     end
 
-    if state.lodZone ~= ZONE_DORMANT then
-        state.lodZone = ZONE_ACTIVE
+    if state.lodZone ~= CONST.ZONE_DORMANT then
+        state.lodZone = CONST.ZONE_ACTIVE
         return
     end
     local ok, reason = wakeExtra(state)
@@ -3572,18 +3675,18 @@ function enemyLod.update()
     if not lodAvailable() then return end
     if worldPaused or worldFault ~= nil then return end
     if elapsedMs < nextBandScanMs then return end
-    nextBandScanMs = elapsedMs + BAND_SCAN_MS
+    nextBandScanMs = elapsedMs + CONST.BAND_SCAN_MS
 
     local heroLocation = resolveHeroLocation()
     if heroLocation == nil then return end
 
     local scanOk, scanned, detail, transitionCount = pcall(
         WEDNativeScanOwnedEnemies,
-        heroLocation.X,
-        heroLocation.Y,
-        CONFIG.COMBAT_RADIUS,
-        BAND_NO_RELEASE_CM,
-        CONFIG.LOD_HYSTERESIS_CM)
+        math.floor(heroLocation.X),
+        math.floor(heroLocation.Y),
+        math.floor(CONFIG.COMBAT_RADIUS),
+        math.floor(CONST.BAND_NO_RELEASE_CM),
+        math.floor(CONFIG.LOD_HYSTERESIS_CM))
     if not scanOk or scanned ~= true then
         if not bandScanFaultReported then
             bandScanFaultReported = true
@@ -3620,7 +3723,7 @@ local function checkAmbientEmptyAreaSpawns()
     if CONFIG == nil or not CONFIG.ENABLED or not CONFIG.SPAWN_IN_EMPTY_AREAS then return end
     if worldPaused or worldFault ~= nil then return end
     if elapsedMs < nextAmbientCheckMs then return end
-    nextAmbientCheckMs = elapsedMs + AMBIENT_CHECK_INTERVAL_MS
+    nextAmbientCheckMs = elapsedMs + CONST.AMBIENT_CHECK_INTERVAL_MS
 
     if #classOrder == 0 then return end
     if activeExtraCount() >= CONFIG.MAX_ACTIVE_EXTRAS then return end
@@ -3637,7 +3740,7 @@ local function checkAmbientEmptyAreaSpawns()
     -- instead of the whole roster; only a genuinely empty area still pays
     -- for the full scan, which is the case that needs an accurate answer.
     local nearbyEnemies = 0
-    local emptyRadSq = AMBIENT_EMPTY_RADIUS_CM * AMBIENT_EMPTY_RADIUS_CM
+    local emptyRadSq = CONST.AMBIENT_EMPTY_RADIUS_CM * CONST.AMBIENT_EMPTY_RADIUS_CM
     for _, state in pairs(states) do
         if isValid(state.object) then
             local enemyPos = actorLocation(state.object)
@@ -3667,7 +3770,9 @@ local function checkAmbientEmptyAreaSpawns()
     local chosenClassKey = classInfo.classKey
 
     local angle = math.random() * math.pi * 2.0
-    local dist = AMBIENT_SPAWN_MIN_DIST_CM + math.random() * (AMBIENT_SPAWN_MAX_DIST_CM - AMBIENT_SPAWN_MIN_DIST_CM)
+    local minDist = CONST.AMBIENT_SPAWN_MIN_DIST_CM
+    local dist = minDist
+        + math.random() * (CONST.AMBIENT_SPAWN_MAX_DIST_CM - minDist)
     local rawTarget = {
         X = heroPos.X + math.cos(angle) * dist,
         Y = heroPos.Y + math.sin(angle) * dist,
@@ -3680,18 +3785,52 @@ local function checkAmbientEmptyAreaSpawns()
     ambientCounter = ambientCounter + 1
     local ambientKey = "ambient_origin_" .. tostring(ambientCounter)
 
-    local heroLevel = 1
-    pcall(function()
-        local lvl = hero:GetEnemyLevel()
-        if finiteNumber(lvl) then heroLevel = math.max(1, math.floor(lvl)) end
-    end)
+    -- The level comes from enemies the game itself placed, never from the hero.
+    --
+    -- It used to be read with hero:GetEnemyLevel(), but GetEnemyLevel exists
+    -- only on ARODEnemyCharacter -- the hero has no such method, so the call
+    -- always threw, the pcall swallowed it, and every ambient enemy was created
+    -- at level 1. Those enemies could not hurt the player and died to a single
+    -- companion hit, while looking completely healthy in the log. They also
+    -- appeared exactly when an area had been cleared, because that is when the
+    -- empty-area check fires, which is why the problem seemed to come and go.
+    --
+    -- The nearest natural origin of the same species is preferred, then the
+    -- nearest natural origin of any species, so the level reflects the local
+    -- area. If the director has not discovered a single natural enemy yet there
+    -- is nothing to copy, and the spawn is skipped rather than invented.
+    local ambientLevel = nil
+    local sameClassDistance, anyClassDistance = nil, nil
+    for _, origin in pairs(origins) do
+        if origin.isAmbient ~= true
+            and origin.location ~= nil
+            and finiteNumber(origin.level)
+            and origin.level >= 1 then
+            local distance = planarDistanceSquared(navPoint, origin.location)
+            if origin.classKey == chosenClassKey then
+                if sameClassDistance == nil or distance < sameClassDistance then
+                    sameClassDistance = distance
+                    ambientLevel = origin.level
+                end
+            elseif sameClassDistance == nil
+                and (anyClassDistance == nil or distance < anyClassDistance) then
+                anyClassDistance = distance
+                ambientLevel = origin.level
+            end
+        end
+    end
+    if ambientLevel == nil then
+        dbg("AMBIENT SPAWN | skipped | no natural enemy level is known to copy")
+        origins[ambientKey] = nil
+        return
+    end
 
     origins[ambientKey] = {
         key = ambientKey,
         classObject = classInfo.classObject,
         classKey = chosenClassKey,
         physicalContract = classInfo.physicalContract,
-        level = heroLevel,
+        level = ambientLevel,
         location = navPoint,
         issued = 1,
         completed = true,
@@ -3706,7 +3845,7 @@ local function checkAmbientEmptyAreaSpawns()
         classKey = chosenClassKey,
         classObject = classInfo.classObject,
         physicalContract = classInfo.physicalContract,
-        level = heroLevel,
+        level = ambientLevel,
         originLocation = navPoint,
         navAttempts = 0,
         spawnEligible = true,
@@ -3734,11 +3873,13 @@ local function tick(stepMs)
             readinessStabilitySamples = 0
         end
 
-        if heroReady and clockPassed and readinessStabilitySamples >= STABILITY_SAMPLES_REQUIRED then
+        if heroReady and clockPassed and readinessStabilitySamples >= CONST.STABILITY_SAMPLES_REQUIRED then
             worldPaused = false
             resumeAtMs = nil
             rescanRequested = true
             log("WORLD READY | enemy director resumed via readiness stability")
+            -- Before anything is issued into this world.
+            expandEnemyPoolBudget()
         else
             return
         end
@@ -3756,7 +3897,7 @@ local function tick(stepMs)
             -- Back off, so a world that faults every attempt stops flooding
             -- the log while a one-off recovers at full speed once it succeeds.
             worldFaultRetryMs = math.min(
-                worldFaultRetryMs * 2, WORLD_FAULT_RETRY_CEILING_MS)
+                worldFaultRetryMs * 2, CONST.WORLD_FAULT_RETRY_CEILING_MS)
             rescanRequested = true
         end
         if worldFault ~= nil then return end
@@ -3774,7 +3915,7 @@ local function tick(stepMs)
     enemyLod.update()
     if not discoveryBatch then
         if elapsedMs >= nextOriginSweepMs then
-            nextOriginSweepMs = elapsedMs + ORIGIN_SWEEP_MS
+            nextOriginSweepMs = elapsedMs + CONST.ORIGIN_SWEEP_MS
             reconcileNearbyOrigins()
         end
     end
@@ -3785,7 +3926,7 @@ local function tick(stepMs)
 
     local discoveryStartTime = os.clock()
     local MAX_DISCOVERY_SEC = 0.002
-    for _ = 1, MAX_DISCOVERY_PER_TICK do
+    for _ = 1, CONST.MAX_DISCOVERY_PER_TICK do
         local queued = table.remove(objectQueue, 1)
         if queued == nil then break end
         registerEnemy(queued.object, queued.reused, queued)
@@ -3843,7 +3984,7 @@ local function queueLifecycleEnemy(object, reused)
     if not isValid(object) then return end
     objectQueue[#objectQueue + 1] = { object = object, reused = reused }
     if discoveryBatch then
-        discoveryReadyAtMs = elapsedMs + DISCOVERY_STABILIZE_MS
+        discoveryReadyAtMs = elapsedMs + CONST.DISCOVERY_STABILIZE_MS
     end
 end
 

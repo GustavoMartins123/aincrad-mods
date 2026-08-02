@@ -191,7 +191,11 @@ local cachedWidgetLibrary = nil
 
 local function resolveNotificationUi()
     if isValid(cachedMessageLog) and isValid(cachedWidgetLibrary) then
-        return cachedMessageLog, cachedWidgetLibrary, nil
+        local okPanel, panelValid = pcall(function() return isValid(cachedMessageLog.Information) end)
+        local okPlayer, playerValid = pcall(function() return isValid(cachedMessageLog:GetOwningPlayer()) end)
+        if okPanel and panelValid and okPlayer and playerValid then
+            return cachedMessageLog, cachedWidgetLibrary, nil
+        end
     end
     cachedMessageLog = nil
     cachedWidgetLibrary = nil
@@ -267,6 +271,8 @@ displayExperience = function(amount)
     end)
 
     if not ok then
+        cachedMessageLog = nil
+        cachedWidgetLibrary = nil
         if addedToPanel and isValid(messageWidget) then
             pcall(function() messageWidget:RemoveFromParent() end)
         end

@@ -162,6 +162,40 @@ namespace
         std::int32_t old_zone{kZoneUnknown};
     };
 
+    // URODGameConfig::EnemyPoolingNum is TMap<EEnemyRole, int32>: how many
+    // enemies the game keeps pooled per role. When that budget runs out the
+    // game recycles an enemy that is still alive, which is what EnemyReused
+    // fires on. A multiplied population is far larger than the pool was sized
+    // for, so live extras get repurposed underneath us mid-fight and come back
+    // half-initialised. Raising the budget is the fix, and it is the game's own
+    // number rather than a bypass.
+    //
+    // A TMap is a TSet of key/value pairs over a sparse array. The offsets are
+    // never guessed: FMapProperty::GetMapLayout gives the real element stride
+    // and value offset for this build.
+    struct ScriptSparseArrayLayout
+    {
+        std::int32_t element_offset{};
+        std::int32_t alignment{};
+        std::int32_t size{};
+    };
+
+    struct ScriptSetLayout
+    {
+        std::int32_t element_offset{};
+        std::int32_t hash_next_id_offset{};
+        std::int32_t hash_index_offset{};
+        std::int32_t size{};
+        ScriptSparseArrayLayout sparse_array_layout{};
+    };
+
+    struct ScriptMapLayout
+    {
+        std::int32_t key_offset{};
+        std::int32_t value_offset{};
+        ScriptSetLayout set_layout{};
+    };
+
     struct ObjectArray
     {
         void** data{};
@@ -197,6 +231,8 @@ namespace
         using UnsetInternalFlags = void (*)(void*, std::uint32_t);
         using SerialNumbersMatch = bool (*)(const WeakObjectPtr*, void*);
         using ObjectArrayLock = void (*)(void*);
+        using GetMapLayout = ScriptMapLayout* (*)(void*);
+        using GetMapValueProp = void** (*)(void*);
 
         HMODULE module{};
         RegisterFunction register_function{};
@@ -224,6 +260,8 @@ namespace
         SerialNumbersMatch serial_numbers_match{};
         ObjectArrayLock lock_object_array{};
         ObjectArrayLock unlock_object_array{};
+        GetMapLayout get_map_layout{};
+        GetMapValueProp get_map_value_prop{};
         void** guobject_array_storage{};
 
         std::string missing_symbols{};
@@ -278,6 +316,8 @@ namespace
             bind(serial_numbers_match, "?SerialNumbersMatch@FWeakObjectPtr@Unreal@RC@@QEBA_NPEAUFUObjectItem@23@@Z");
             bind(lock_object_array, "?LockGUObjectArray@FUObjectArray@Unreal@RC@@QEAAXXZ");
             bind(unlock_object_array, "?UnlockGUObjectArray@FUObjectArray@Unreal@RC@@QEAAXXZ");
+            bind(get_map_layout, "?GetMapLayout@FMapProperty@Unreal@RC@@QEAAAEAUFScriptMapLayout@23@XZ");
+            bind(get_map_value_prop, "?GetValueProp@FMapProperty@Unreal@RC@@QEAAAEAPEAVFProperty@23@XZ");
             bind(guobject_array_storage, "?GUObjectArray@Unreal@RC@@3PEAVFUObjectArray@12@EA");
         }
 
@@ -339,18 +379,6 @@ namespace
         }
         value = static_cast<std::int64_t>(number);
         return true;
-    }
-
-    bool require_number(const Lua& lua, int index, double& value)
-    {
-        if (g_api.is_number(&lua, index))
-        {
-            value = g_api.get_number(&lua, index);
-            return std::isfinite(value);
-        }
-        if (!g_api.is_integer(&lua, index)) return false;
-        value = static_cast<double>(g_api.get_integer(&lua, index));
-        return std::isfinite(value);
     }
 
     bool guarded_get_weak_object(const WeakObjectPtr& weak, void*& actor)
@@ -526,16 +554,49 @@ namespace
         }
     }
 
-    bool exact_weak_identity(void* actor, WeakObjectPtr& weak)
+    // The failure reason is reported separately because these conditions mean
+    // very different things. "Could not be converted to an exact weak identity"
+    // was one message for all of them, which made an actor the game had already
+    // destroyed indistinguishable from one that was merely not registered yet.
+    bool exact_weak_identity(void* actor, WeakObjectPtr& weak, const char*& reason)
     {
-        if (!guarded_set_weak_object(weak, actor)
-            || weak.object_index < 0 || weak.object_serial_number <= 0)
+        reason = "";
+        if (!guarded_set_weak_object(weak, actor))
         {
+            reason = "weak pointer assignment faulted";
             return false;
         }
+        if (weak.object_index < 0)
+        {
+            reason = "actor is not present in the global object array";
+            return false;
+        }
+        if (weak.object_serial_number <= 0)
+        {
+            reason = "actor has no serial number yet";
+            return false;
+        }
+
         void* resolved_actor = nullptr;
-        return guarded_get_weak_object(weak, resolved_actor)
-            && resolved_actor == actor;
+        if (!guarded_get_weak_object(weak, resolved_actor))
+        {
+            reason = "weak pointer resolution faulted";
+            return false;
+        }
+        if (resolved_actor == nullptr)
+        {
+            // The usual cause: the actor was destroyed or marked for
+            // destruction between being issued and being registered, so the
+            // weak pointer legitimately refuses to resolve it.
+            reason = "actor no longer resolves; it was destroyed or marked pending kill";
+            return false;
+        }
+        if (resolved_actor != actor)
+        {
+            reason = "weak pointer resolved to a different actor";
+            return false;
+        }
+        return true;
     }
 
     bool is_owned_actor_tracked(const WeakObjectPtr& weak)
@@ -562,8 +623,9 @@ namespace
 
         auto* actor = reinterpret_cast<void*>(static_cast<std::uintptr_t>(actor_address));
         WeakObjectPtr weak{};
-        if (!exact_weak_identity(actor, weak))
-            return push_result(lua, false, "actor could not be converted to an exact weak identity");
+        const char* identity_reason = "";
+        if (!exact_weak_identity(actor, weak, identity_reason))
+            return push_result(lua, false, std::string("exact weak identity failed: ") + identity_reason);
 
         if (!is_owned_actor_tracked(weak))
             g_owned_actors.push_back(OwnedActor{weak, kZoneUnknown});
@@ -595,8 +657,9 @@ namespace
 
         auto* actor = reinterpret_cast<void*>(static_cast<std::uintptr_t>(actor_address));
         WeakObjectPtr weak{};
-        if (!exact_weak_identity(actor, weak))
-            return push_result(lua, false, "actor could not be converted to an exact weak identity");
+        const char* identity_reason = "";
+        if (!exact_weak_identity(actor, weak, identity_reason))
+            return push_result(lua, false, std::string("exact weak identity failed: ") + identity_reason);
 
         const bool owned = is_owned_actor_tracked(weak);
         return push_result(
@@ -909,19 +972,34 @@ namespace
                 "WEDNativeScanOwnedEnemies requires hero X, hero Y, combat radius, despawn radius and hysteresis");
         }
 
-        double hero_x{};
-        double hero_y{};
-        double combat_radius{};
-        double despawn_radius{};
-        double hysteresis{};
-        if (!require_number(lua, 1, hero_x)
-            || !require_number(lua, 2, hero_y)
-            || !require_number(lua, 3, combat_radius)
-            || !require_number(lua, 4, despawn_radius)
-            || !require_number(lua, 5, hysteresis))
+        // Centimetres arrive as integers.
+        //
+        // These were read with is_number/get_number and every call was rejected
+        // as non-finite, which left distance banding switched off for its whole
+        // life without anything else noticing. The integer path is the one the
+        // tracking and registry functions already use successfully against this
+        // UE4SS build, and whole centimetres are far finer than any band edge
+        // needs.
+        std::int64_t hero_x_cm{};
+        std::int64_t hero_y_cm{};
+        std::int64_t combat_radius_cm{};
+        std::int64_t despawn_radius_cm{};
+        std::int64_t hysteresis_cm{};
+        if (!require_integer(lua, 1, hero_x_cm)
+            || !require_integer(lua, 2, hero_y_cm)
+            || !require_integer(lua, 3, combat_radius_cm)
+            || !require_integer(lua, 4, despawn_radius_cm)
+            || !require_integer(lua, 5, hysteresis_cm))
         {
-            return push_result(lua, false, "WEDNativeScanOwnedEnemies received a non-finite argument");
+            return push_result(lua, false,
+                "WEDNativeScanOwnedEnemies requires whole-centimetre integers");
         }
+
+        const double hero_x = static_cast<double>(hero_x_cm);
+        const double hero_y = static_cast<double>(hero_y_cm);
+        const double combat_radius = static_cast<double>(combat_radius_cm);
+        const double despawn_radius = static_cast<double>(despawn_radius_cm);
+        const double hysteresis = static_cast<double>(hysteresis_cm);
         if (combat_radius <= 0.0 || despawn_radius <= combat_radius || hysteresis < 0.0)
             return push_result(lua, false, "WEDNativeScanOwnedEnemies received an invalid radius band");
 
@@ -1012,6 +1090,136 @@ namespace
             transition.actor_address,
             transition.new_zone,
             transition.old_zone);
+    }
+
+    // Raise URODGameConfig::EnemyPoolingNum so the game keeps more enemies
+    // pooled per role and stops recycling ones that are still alive.
+    //
+    // When that budget runs out the game reuses an enemy that is still in play,
+    // which is what EnemyReused fires on. A multiplied population is far larger
+    // than the pool was ever sized for, so live extras get repurposed
+    // underneath us mid-fight and come back half-initialised.
+    //
+    // Only the int32 values are touched. No key is added, nothing is rehashed,
+    // and the map's structure is never rewritten -- that is the difference
+    // between adjusting the game's own budget and corrupting a native
+    // container. Offsets are not guessed either: FMapProperty::GetMapLayout
+    // gives the real element stride and value offset for this build.
+    //
+    // The SEH block lives in its own function because a function that needs C++
+    // object unwinding cannot use __try.
+    bool guarded_raise_pool_budget(
+        void* config,
+        void* map_property,
+        std::int64_t multiplier,
+        std::int64_t& raised,
+        std::int64_t& total_before,
+        std::int64_t& total_after,
+        const char*& failure)
+    {
+        __try
+        {
+            const int map_offset = g_api.get_property_offset(map_property);
+            if (map_offset <= 0)
+            {
+                failure = "EnemyPoolingNum has no usable offset";
+                return false;
+            }
+
+            const ScriptMapLayout* layout = g_api.get_map_layout(map_property);
+            void** value_prop_ref = g_api.get_map_value_prop(map_property);
+            void* value_prop = value_prop_ref == nullptr ? nullptr : *value_prop_ref;
+            if (layout == nullptr || value_prop == nullptr
+                || g_api.get_property_size(value_prop) != static_cast<int>(sizeof(std::int32_t)))
+            {
+                failure = "EnemyPoolingNum is not a map of 32-bit values";
+                return false;
+            }
+
+            // A TMap begins with its sparse array, whose first member has the
+            // same data/count/capacity shape as any TArray.
+            auto* pairs = reinterpret_cast<ObjectArray*>(
+                static_cast<std::byte*>(config) + map_offset);
+            const std::int32_t stride = layout->set_layout.sparse_array_layout.size;
+            const std::int32_t value_offset = layout->value_offset;
+
+            if (stride <= 0 || stride > 4096
+                || value_offset < 0 || value_offset + 4 > stride
+                || pairs->count < 0 || pairs->count > 4096
+                || pairs->capacity < pairs->count
+                || (pairs->count > 0 && pairs->data == nullptr))
+            {
+                failure = "EnemyPoolingNum layout is outside its expected bounds";
+                return false;
+            }
+
+            auto* base = reinterpret_cast<std::byte*>(pairs->data);
+            for (std::int32_t index = 0; index < pairs->count; ++index)
+            {
+                auto* value = reinterpret_cast<std::int32_t*>(
+                    base + static_cast<std::size_t>(index) * stride + value_offset);
+                const std::int32_t before = *value;
+                // Free slots in the sparse array hold link data, so only values
+                // that look like a real pool size are touched.
+                if (before <= 0 || before > 4096) continue;
+                const std::int64_t scaled =
+                    static_cast<std::int64_t>(before) * multiplier;
+                const std::int32_t after = static_cast<std::int32_t>(
+                    scaled > 8192 ? 8192 : scaled);
+                total_before += before;
+                total_after += after;
+                if (after != before)
+                {
+                    *value = after;
+                    ++raised;
+                }
+            }
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            failure = "EnemyPoolingNum could not be read or written";
+            return false;
+        }
+    }
+
+    int native_expand_enemy_pool(const Lua& lua)
+    {
+        if (!g_api.unreal_ready())
+            return push_result(lua, false, "UE4SS native ABI is incomplete: " + g_api.missing_symbols);
+        if (g_api.get_map_layout == nullptr || g_api.get_map_value_prop == nullptr)
+            return push_result(lua, false, "this UE4SS build does not expose FMapProperty layout access");
+        if (g_api.get_stack_size(&lua) != 2)
+            return push_result(lua, false, "WEDNativeExpandEnemyPool requires a game config address and a multiplier");
+
+        std::int64_t config_address{};
+        std::int64_t multiplier{};
+        if (!require_integer(lua, 1, config_address) || config_address <= 0
+            || !require_integer(lua, 2, multiplier)
+            || multiplier < 1 || multiplier > 64)
+        {
+            return push_result(lua, false, "WEDNativeExpandEnemyPool received an invalid address or multiplier");
+        }
+
+        auto* config = reinterpret_cast<void*>(static_cast<std::uintptr_t>(config_address));
+        void* map_property = nullptr;
+        if (!guarded_get_property(config, L"EnemyPoolingNum", map_property)
+            || map_property == nullptr)
+        {
+            return push_result(lua, false, "URODGameConfig does not expose EnemyPoolingNum");
+        }
+
+        std::int64_t raised = 0;
+        std::int64_t total_before = 0;
+        std::int64_t total_after = 0;
+        const char* failure = "";
+        if (!guarded_raise_pool_budget(config, map_property, multiplier,
+                raised, total_before, total_after, failure))
+        {
+            return push_result(lua, false, failure);
+        }
+        return push_result(lua, true, "enemy pool budget raised",
+            raised, total_before, total_after);
     }
 
     enum class ArrayRegistrationResult
@@ -1162,8 +1370,9 @@ namespace
         auto* game_state = reinterpret_cast<void*>(static_cast<std::uintptr_t>(game_state_address));
 
         WeakObjectPtr weak{};
-        if (!exact_weak_identity(actor, weak))
-            return push_result(lua, false, "actor could not be converted to an exact weak identity");
+        const char* identity_reason = "";
+        if (!exact_weak_identity(actor, weak, identity_reason))
+            return push_result(lua, false, std::string("exact weak identity failed: ") + identity_reason);
         if (!is_owned_actor_tracked(weak))
             return push_result(lua, false, "actor was not tracked before native registry injection");
 
@@ -1256,12 +1465,14 @@ namespace
             const LuaFunction register_enemy = &native_register_enemy;
             const LuaFunction release_owned_world = &native_release_owned_world;
             const LuaFunction scan_owned_enemies = &native_scan_owned_enemies;
+            const LuaFunction expand_enemy_pool = &native_expand_enemy_pool;
             const LuaFunction next_zone_transition = &native_next_zone_transition;
             const std::string track_name = "WEDNativeTrackOwnedEnemy";
             const std::string identify_name = "WEDNativeIdentifyOwnedEnemy";
             const std::string register_name = "WEDNativeRegisterEnemy";
             const std::string release_name = "WEDNativeReleaseOwnedWorld";
             const std::string scan_name = "WEDNativeScanOwnedEnemies";
+            const std::string expand_name = "WEDNativeExpandEnemyPool";
             const std::string transition_name = "WEDNativeNextZoneTransition";
 
             std::vector<Lua*> states{&lua, &main_lua, &async_lua};
@@ -1283,6 +1494,7 @@ namespace
                 g_api.register_function(states[index], register_name, register_enemy);
                 g_api.register_function(states[index], release_name, release_owned_world);
                 g_api.register_function(states[index], scan_name, scan_owned_enemies);
+                g_api.register_function(states[index], expand_name, expand_enemy_pool);
                 g_api.register_function(states[index], transition_name, next_zone_transition);
             }
         }
