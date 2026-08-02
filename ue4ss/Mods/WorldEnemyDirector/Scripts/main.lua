@@ -58,6 +58,15 @@ local NAV_ATTEMPTS_PER_PASS = 1
 local NAV_MAX_ATTEMPTS = 12
 local NAV_MIN_SEPARATION_CM = 150.0
 local MAX_DISCOVERY_PER_TICK = 2
+-- Caps how long the admission-audit loop may spend per 500 ms collision-audit
+-- cycle. A spawn burst otherwise runs comparePhysical/controlOperational/
+-- nativeRegistryMembership for every not-yet-admitted enemy synchronously in
+-- one pass on the game thread. This spreads that cost across additional
+-- cycles instead of stalling one frame for the whole burst; a deferred enemy
+-- is simply checked on the next 500 ms cycle. Admission itself is unaffected:
+-- the 3-sample stability requirement and admissionDeadlineMs are wall-clock
+-- based, not cycle-count based, so nothing is skipped, only delayed slightly.
+local AUDIT_BUDGET_SEC = 0.003
 -- 32 attempts, 250 ms apart: eight seconds of grace for a streaming enemy to
 -- finish initialising before it is reported as broken.
 local SNAPSHOT_RETRY_LIMIT = 32
@@ -2639,6 +2648,7 @@ local function auditOwnedEnemyCollision()
     end
 
     local rejected = nil
+    local auditStartTime = os.clock()
     for _, state in pairs(states) do
         if state.owned and isValid(state.object) and not state.retired
             and state.admitted ~= true then
@@ -2688,6 +2698,7 @@ local function auditOwnedEnemyCollision()
                         " | native registry: " .. tostring(registryDetail)
                 end
             end
+            if os.clock() - auditStartTime > AUDIT_BUDGET_SEC then break end
         end
     end
 
@@ -3185,13 +3196,20 @@ local function checkAmbientEmptyAreaSpawns()
     local heroPos, posError = actorLocation(hero)
     if heroPos == nil then return end
 
+    -- Only "is there at least one enemy nearby" is ever consulted below, so
+    -- this stops at the first match instead of pricing a full reflected
+    -- location read against every tracked state on every 4-second check. The
+    -- common case (a populated area) now resolves in a handful of reads
+    -- instead of the whole roster; only a genuinely empty area still pays
+    -- for the full scan, which is the case that needs an accurate answer.
     local nearbyEnemies = 0
     local emptyRadSq = AMBIENT_EMPTY_RADIUS_CM * AMBIENT_EMPTY_RADIUS_CM
     for _, state in pairs(states) do
         if isValid(state.object) then
             local enemyPos = actorLocation(state.object)
             if enemyPos ~= nil and planarDistanceSquared(heroPos, enemyPos) <= emptyRadSq then
-                nearbyEnemies = nearbyEnemies + 1
+                nearbyEnemies = 1
+                break
             end
         end
     end
