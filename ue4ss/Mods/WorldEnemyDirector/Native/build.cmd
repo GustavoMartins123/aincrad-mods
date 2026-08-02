@@ -1,8 +1,26 @@
 @echo off
-setlocal
+setlocal enableextensions enabledelayedexpansion
 
-call "E:\Microsoft Visual Studio 2022\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
-if errorlevel 1 exit /b %errorlevel%
+if not defined VSINSTALLDIR (
+    set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+    if exist "!VSWHERE!" (
+        for /f "usebackq tokens=*" %%i in (`"!VSWHERE!" -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
+            set "VS_PATH=%%i"
+        )
+    )
+    if defined VS_PATH (
+        if exist "!VS_PATH!\Common7\Tools\VsDevCmd.bat" (
+            call "!VS_PATH!\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+        )
+    )
+)
+
+where cl.exe >nul 2>&1
+if errorlevel 1 (
+    echo [ERRO] Compilador C++ ^(cl.exe^) nao encontrado.
+    echo Certifique-se de ter o Visual Studio instalado com a carga de trabalho "Desenvolvimento para Desktop com C++".
+    exit /b 1
+)
 
 set "WED_BUILD=%~dp0..\..\..\..\.build-wed-native"
 set "WED_DLLS=%~dp0..\dlls"
