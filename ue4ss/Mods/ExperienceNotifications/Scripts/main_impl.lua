@@ -1,5 +1,5 @@
 local MOD_NAME = "ExperienceNotifications"
-local MOD_VERSION = "1.2.1"
+local MOD_VERSION = "1.2.2"
 
 print(string.format("[%s] Loading v%s\n", MOD_NAME, MOD_VERSION))
 
@@ -23,6 +23,8 @@ local CONFIG = nil
 local lastDisplayError = nil
 local acquisitionReadyReported = false
 local displayReadyReported = false
+local cachedMessageLog = nil
+local cachedWidgetLibrary = nil
 
 pcall(function()
     RegisterHook("/Script/Engine.PlayerController:ClientRestart", function()
@@ -183,9 +185,6 @@ local function queueEnemyAcquisition(sourceParameter, acquisitionParameter)
     dbg("ENEMY EXP | +" .. amount)
     queueDisplay(amount)
 end
-
-local cachedMessageLog = nil
-local cachedWidgetLibrary = nil
 
 local function resolveNotificationUi()
     if isValid(cachedMessageLog) and isValid(cachedWidgetLibrary) then
