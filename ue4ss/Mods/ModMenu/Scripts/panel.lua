@@ -667,13 +667,30 @@ local function toggleBool(row)
         end
 
         if nextState == true then
-            local scriptPath = store.scriptDirFor(row.entry.mod) .. "main.lua"
-            local loadOk, loadErr = pcall(dofile, scriptPath)
-            if loadOk then
-                log("Dynamically loaded " .. row.entry.mod .. " main.lua at runtime")
-            else
-                log("Dynamic load of " .. row.entry.mod .. " returned: " .. tostring(loadErr))
+            if type(RestartMod) ~= "function" then
+                log(
+                    "Cannot start " ..
+                    row.entry.mod ..
+                    ": this UE4SS build does not expose RestartMod"
+                )
+                return false
             end
+
+            local startQueued, startError = pcall(function()
+                RestartMod(row.entry.mod)
+            end)
+
+            if not startQueued then
+                log(
+                    "Could not queue UE4SS start for " ..
+                    row.entry.mod ..
+                    ": " ..
+                    tostring(startError)
+                )
+                return false
+            end
+
+            log("UE4SS start queued for " .. row.entry.mod)
         end
 
         buildRows()
