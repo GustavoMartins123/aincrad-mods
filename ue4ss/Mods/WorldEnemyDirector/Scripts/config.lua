@@ -49,7 +49,10 @@ return {
     --               "cyan", or "white".
     COLOR_MODE = "off",
     COLOR_PRESET = "crimson",
-    COLOR_PARAMETER_NAME = "Color",
+    -- Blue Boar body and eye materials enable `addFresnel_On` and expose this
+    -- HDR vector parameter. It is a visible rim-light channel, unlike `Color`
+    -- and the texture-disabled `BC` path.
+    COLOR_PARAMETER_NAME = "addFresnel_color",
 
     -- EnemyRole_None and EnemyRole_Mob.
     COMMON_HEALTH_MULTIPLIER = 1.0,

@@ -101,7 +101,10 @@ local GAS_ATTRIBUTE_NAMES = {
 }
 
 local PALETTE = {
-    crimson = { R = 0.85, G = 0.04, B = 0.08, A = 1.0 },
+    -- Temporary HDR probe for the compiled addFresnel_color branch. The
+    -- material's authored value reaches B=3.0; 25.0 red is deliberately
+    -- unmistakable if this parameter contributes to the rendered result.
+    crimson = { R = 25.0, G = 0.0, B = 0.0, A = 1.0 },
     emerald = { R = 0.03, G = 0.80, B = 0.20, A = 1.0 },
     azure = { R = 0.04, G = 0.28, B = 0.95, A = 1.0 },
     gold = { R = 1.00, G = 0.58, B = 0.04, A = 1.0 },
@@ -1522,6 +1525,58 @@ local function copyColor(value)
     return { R = value.R, G = value.G, B = value.B, A = value.A }
 end
 
+-- SetMaterialColorParameter is a void interface call. Reading the actual
+-- material instances afterwards separates a dispatched call from a value that
+-- reached the live render materials. This is diagnostic only: it never
+-- invents a second material path.
+local function describeLiveMaterialColor(mesh, parameterName)
+    if not isValid(mesh) then error("colour verification mesh is unavailable") end
+    local materialCount = tonumber(mesh:GetNumMaterials())
+    if not finiteNumber(materialCount)
+        or materialCount < 1
+        or materialCount ~= math.floor(materialCount) then
+        error("colour verification received an invalid material count")
+    end
+
+    local parameter = FName(parameterName)
+    local customDataIndex = tonumber(mesh:GetCustomPrimitiveDataIndexForVectorParameter(parameter))
+    if not finiteNumber(customDataIndex)
+        or customDataIndex ~= math.floor(customDataIndex) then
+        error("colour verification received an invalid Custom Primitive Data index")
+    end
+    local slots = {}
+    for index = 0, materialCount - 1 do
+        local material = mesh:GetMaterial(index)
+        if not isValid(material) then
+            error("colour verification material slot " .. tostring(index) .. " is unavailable")
+        end
+        local value = material:K2_GetVectorParameterValue(parameter)
+        local ok, red, green, blue, alpha = pcall(function()
+            return tonumber(value.R), tonumber(value.G), tonumber(value.B), tonumber(value.A)
+        end)
+        if not ok
+            or not finiteNumber(red)
+            or not finiteNumber(green)
+            or not finiteNumber(blue)
+            or not finiteNumber(alpha) then
+            error("colour verification could not read material slot " .. tostring(index))
+        end
+        slots[#slots + 1] = string.format(
+            "%d=(%.3f,%.3f,%.3f,%.3f)",
+            index,
+            red,
+            green,
+            blue,
+            alpha
+        )
+    end
+    return string.format(
+        "custom_primitive_data=%d slots=%s",
+        customDataIndex,
+        table.concat(slots, ";")
+    )
+end
+
 local function gasValues(gas)
     local values = {}
     for key, _ in pairs(GAS_ATTRIBUTE_NAMES) do
@@ -1924,14 +1979,36 @@ local function applyMutation(state)
     end
 
     state.applied = true
+    if state.colorParameter ~= nil then
+        local verified, materialValues = pcall(
+            describeLiveMaterialColor,
+            state.baseline.mesh,
+            state.colorParameter
+        )
+        if not verified then
+            log("COLOR VERIFY ERROR | " .. state.key .. " | " .. tostring(materialValues))
+        else
+            dbg(string.format(
+                "COLOR VERIFY | %s | parameter=%s expected=(%.3f,%.3f,%.3f,%.3f) materials=%s",
+                state.key,
+                state.colorParameter,
+                state.appliedColor.R,
+                state.appliedColor.G,
+                state.appliedColor.B,
+                state.appliedColor.A,
+                materialValues
+            ))
+        end
+    end
     if state.owned then
         requestNativeSanitize("owned mutation: " .. tostring(state.key))
     end
     dbg(string.format(
-        "MUTATED | %s | tier=%s scale=%.2fx gas_hp=%.1f/%.1f gas_atk=%.1f gas_def=%.1f speed=%.2fx xp=%.2fx",
+        "MUTATED | %s | tier=%s scale=%.2fx color=%s gas_hp=%.1f/%.1f gas_atk=%.1f gas_def=%.1f speed=%.2fx xp=%.2fx",
         state.key,
         state.baseline.tier,
         scaleFactor,
+        tostring(state.colorParameter or "off"),
         actualGas.health,
         actualGas.maxHealth,
         actualGas.attack,

@@ -115,18 +115,24 @@ BC = (R=0.895833, G=0.686177, B=0.576916, A=1.0)
 ExpressionGUID = 8AAA20D246BED27B84212F98636D6890
 ```
 
-The matching non-empty expression GUID on both body and eye slots is evidence
-that `BC` is an actual material parameter inherited from the compiled graph;
-it is the supported candidate for this Blue Boar's colour mutation. Therefore
-the observed no-op is not a failure to reach the real material: it is the
-director writing an undeclared `Color` override that the shader does not read.
+The matching non-empty expression GUID on both body and eye slots proves that
+`BC` is exposed, but it is not a usable live tint path for this variant: both
+asset instances set the `BC_Texture` static switch to `true`, and an isolated
+runtime write to `BC` produced no visible change.
 
-Use one isolated in-game test before making this global: set
-`COLOR_PARAMETER_NAME = "BC"`, use `COLOR_MODE = "fixed"`, restart all mods,
-and inspect a newly initialized `BP_E001001_C`. If its body and eye tint
-visibly change, record the result and only then evaluate whether `BC` is valid
-for each other enemy material family. Do not assume one parameter name is
-universal merely because it works for this species.
+The shared preset instances instead enable the `addFresnel_On` static switch
+and expose this HDR vector parameter on both material paths:
+
+```text
+addFresnel_color = (R=0.0, G=1.767918, B=3.0, A=1.0)
+ExpressionGUID = EBDC64694B77D865BDD3A7A93858E042
+```
+
+This is the evidence-backed colour channel for the Blue Boar family. The
+director therefore targets `addFresnel_color`, which produces a coloured
+Fresnel/rim-light effect rather than replacing the albedo texture. Test it on
+a newly initialized actor with `COLOR_MODE = "fixed"` before treating the name
+as valid for another enemy material family.
 
 Do not treat interface membership or a void `SetMaterialColorParameter` call as
 proof that a material parameter exists.

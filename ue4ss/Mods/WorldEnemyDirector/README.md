@@ -202,7 +202,7 @@ and detection geometry that their AI was authored for.
 ## Colour requirement
 
 Colour uses one exact material parameter named by `COLOR_PARAMETER_NAME`
-(`Color` by default). The enemy must implement
+(`addFresnel_color` by default). The enemy must implement
 `RODMaterialParameterInterface`. If that contract is absent, colour mutation is
 rejected for that actor and the error is written to `UE4SS.log`; the mod does not
 guess another parameter or material path.

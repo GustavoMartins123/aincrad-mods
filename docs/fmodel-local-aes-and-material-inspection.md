@@ -142,10 +142,11 @@ Walk every persistent parent material instance and distinguish these cases:
 
 For `BP_E001001_C` specifically, the observed `Color` value matched the
 director's violet preset but existed only on the live MIDs. Both actual parent
-slots expose `BC` with the same expression GUID. This identifies the reason
-the current `Color` configuration has no visible effect and supplies `BC` as
-a species-specific test candidate; it does not establish a global name for all
-enemy material families.
+slots expose `BC`, but their `BC_Texture` static switch is enabled and a
+runtime `BC` write did not visibly alter the model. The shared parent instead
+enables `addFresnel_On` and exposes HDR `addFresnel_color`; it is the
+species-specific, visible rim-light candidate. This does not establish a
+global parameter name for all enemy material families.
 
 ## Failure handling
 
