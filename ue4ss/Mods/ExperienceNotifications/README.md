@@ -1,7 +1,8 @@
 # Experience Notifications
 
-Shows the exact hero experience awarded by a confirmed enemy death as an
-`EXP +N` entry in Echoes of Aincrad's native side-message stack.
+Experience Notifications **v1.2.2** shows the exact hero experience awarded by
+a confirmed enemy death as an `EXP +N` entry in Echoes of Aincrad's native
+side-message stack.
 
 ## Requirements
 
@@ -29,11 +30,12 @@ ExperienceNotifications\
     ├── main.lua
     ├── main_impl.lua
     ├── config.lua
+    ├── modmenu.lua
     └── standalone\
         └── ModMenuBridge.lua
 ```
 
-Restart the game after installing or enabling the mod.
+Fully restart the game after installing or updating the mod.
 
 ## How it works
 
@@ -46,8 +48,13 @@ displayed.
 
 The message is an instance of the game's own `URODEventMessageWidget`, inserted
 into the active `URODInfoMessageLogWidget.Information` panel. The native message
-log owns its lifetime through `SetMessageTimer`; Lua does not retain a widget or
-world object across travel.
+log owns its lifetime through `SetMessageTimer`; Lua does not retain an inserted
+message widget after publication.
+
+The active message-log and widget-library references are cached only while they
+remain valid. Version 1.2.2 clears those local caches on `ClientRestart`, so a
+world or player-controller transition cannot keep the notification resolver
+pointing at the previous world's interface.
 
 Before insertion, the mod writes `EXP +N` to the native rich-text block and
 reads it back immediately. A rejected or replaced value prevents insertion and
