@@ -14,6 +14,9 @@ release-reference pages for their respective projects:
 - [Aincrad Open World](https://www.nexusmods.com/echoesofaincrad/mods/55)
 - [Field Equipment Mod](https://www.nexusmods.com/echoesofaincrad/mods/64)
 
+For locally inspecting encrypted game assets in FModel without recording an
+AES key, see [FModel local AES and material inspection](docs/fmodel-local-aes-and-material-inspection.md).
+
 For an exact source-by-source comparison against the original Nexus archives,
 see [Modifications from the Original Nexus Releases](MODIFICATIONS.md).
 

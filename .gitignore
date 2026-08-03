@@ -8,6 +8,8 @@
 !/.gitignore
 !/README.md
 !/MODIFICATIONS.md
+!/docs/
+!/docs/**
 !/ue4ss/
 
 # Inside ue4ss, keep the settings file and the mods. UE4SS itself is a

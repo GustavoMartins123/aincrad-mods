@@ -911,6 +911,12 @@ local function setNativeMenuInputEnabled(context, enabled)
     for _, target in ipairs(targets) do
         if isValid(target) and isValid(context.mainMenu) then
             local ok = false
+            if type(target.SetIsEnabled) == "function" then
+                if pcall(function() target:SetIsEnabled(enabled) end) then ok = true end
+            end
+            if type(target.SetIsFocusable) == "function" then
+                if pcall(function() target:SetIsFocusable(enabled) end) then ok = true end
+            end
             if type(target.SetInputEnable) == "function" then
                 if pcall(function() target:SetInputEnable(enabled) end) then ok = true end
             end
@@ -1100,7 +1106,12 @@ local function routeToPanel(button)
 
     -- Taking the shared input lock for a button that maps to nothing would
     -- block the keybind carrying the same press from acting on it.
-    if action ~= nil then withInputLock(action) end
+    if action ~= nil then
+        withInputLock(action)
+        if activeContext ~= nil then
+            pcall(resetNativeSelection, activeContext)
+        end
+    end
 
     -- Every button is swallowed while the panel is up, whether or not the lock
     -- let it through, otherwise the start menu underneath keeps reacting to
@@ -1423,6 +1434,7 @@ ensureInputHooks = function()
             -- worth more than fighting it.
             if panel.isOpen() then
                 pendingFocusRedirects[listKey] = nil
+                pcall(resetNativeSelection, context)
                 if not warnedFocusWhilePanelOpen then
                     warnedFocusWhilePanelOpen = true
                     log("native focus is still moving with the panel open; " ..
@@ -1511,7 +1523,12 @@ local function bindPanelKey(key, action)
             if not panel.isOpen() then return end
             -- Shares the lock with the button hooks: the same keypress often
             -- arrives through both paths.
-            ExecuteInGameThread(function() withInputLock(action) end)
+            ExecuteInGameThread(function()
+                withInputLock(action)
+                if activeContext ~= nil then
+                    pcall(resetNativeSelection, activeContext)
+                end
+            end)
         end)
     end)
     if not ok then log("keybind unavailable: " .. tostring(err)) end

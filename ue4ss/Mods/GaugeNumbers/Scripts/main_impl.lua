@@ -640,6 +640,34 @@ local function mountPreviewAssembly(root, clone, layout, definition)
     return true, nil
 end
 
+-- ResetGaugeValue computes the fill against the gauge's cached layout.  A
+-- freshly-created assembly has not yet inherited its parent CanvasPanel's
+-- geometry, so doing that reset immediately gives the fill an arbitrary
+-- full-width surface while the transparent artwork is still at native size.
+-- Resolve the complete copied tree first; the data/value logic remains the
+-- same and only runs after the native slots have their real bounds.
+local function prepassPreviewAssemblies(root, units)
+    if not isValid(root) or type(units) ~= "table" then
+        return false, "preview gauge layout tree is unavailable"
+    end
+    local passed, prepassError = pcall(function()
+        root:ForceLayoutPrepass()
+        for _, definition in ipairs(BARS) do
+            local unit = units[definition.key]
+            local canvas = isValid(unit) and unit[definition.canvas] or nil
+            local gauge = isValid(unit) and unit[definition.gauge] or nil
+            if not isValid(unit) or not isValid(canvas) or not isValid(gauge) then
+                error("preview " .. definition.key .. " gauge tree is incomplete")
+            end
+            unit:ForceLayoutPrepass()
+            canvas:ForceLayoutPrepass()
+            gauge:ForceLayoutPrepass()
+        end
+    end)
+    if not passed then return false, tostring(prepassError) end
+    return true, nil
+end
+
 local function setPreviewAssemblyValues(units, values)
     for _, definition in ipairs(BARS) do
         local pair, pairError = requirePreviewValues(values, definition.key)
@@ -703,6 +731,10 @@ local function createPreviewAssemblies(liveCockpit, sourceRoot, root, values)
         if not mounted then return nil, mountError end
         units[definition.key] = clone
     end
+
+    local laidOut, layoutError = prepassPreviewAssemblies(root, units)
+    if not laidOut then return nil, "preview gauge layout prepass failed: " ..
+        tostring(layoutError) end
 
     local copied, copyError = setPreviewAssemblyValues(units, values)
     if not copied then return nil, copyError end

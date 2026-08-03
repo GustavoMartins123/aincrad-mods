@@ -207,6 +207,13 @@ Colour uses one exact material parameter named by `COLOR_PARAMETER_NAME`
 rejected for that actor and the error is written to `UE4SS.log`; the mod does not
 guess another parameter or material path.
 
+Interface membership does not prove that the configured parameter is exposed by
+the real material instance. The current setter returns no success value, so a
+call can complete without changing a visible material. Before changing
+`COLOR_PARAMETER_NAME`, inspect the actual cooked material and its
+`VectorParameterValues` with the documented local process in
+[`docs/fmodel-local-aes-and-material-inspection.md`](../../../docs/fmodel-local-aes-and-material-inspection.md).
+
 ## Diagnostics
 
 Run this read-only command in the UE4SS console:
