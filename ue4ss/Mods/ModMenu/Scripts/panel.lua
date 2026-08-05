@@ -694,13 +694,37 @@ local function toggleBool(row)
             return false
         end
 
+        -- Past this point enabled.txt has already changed on disk, so the switch
+        -- has happened whatever else does or does not work. Starting the mod in
+        -- this session is a separate, best-effort step on top of it: if it
+        -- fails, the mod is still on for the next launch, which is the state the
+        -- row shows. Returning early here instead skipped the redraw below and
+        -- left the row displaying the value it had before the press, so the menu
+        -- said OFF about a mod that was written on -- and pressing again to
+        -- "fix" it read the new state and switched it back off.
         if nextState == true then
-            local scriptPath = store.scriptDirFor(row.entry.mod) .. "main.lua"
-            local loadOk, loadErr = pcall(dofile, scriptPath)
-            if loadOk then
-                log("Dynamically loaded " .. row.entry.mod .. " main.lua at runtime")
+            local startError = nil
+            if type(RestartMod) ~= "function" then
+                -- A real Lua global registered by the loader, not a UObject
+                -- method, so this test is meaningful here.
+                startError = "this UE4SS build does not expose RestartMod"
             else
-                log("Dynamic load of " .. row.entry.mod .. " returned: " .. tostring(loadErr))
+                local called, callError = pcall(function()
+                    RestartMod(row.entry.mod)
+                end)
+                if not called then startError = tostring(callError) end
+            end
+
+            if startError == nil then
+                -- Queued, not started. RestartMod only enqueues a reinstall and
+                -- resolves the folder name later, on the loader's event loop; a
+                -- name it cannot match is a warning in UE4SS.log and nothing
+                -- here. So this must not claim the mod is running.
+                log("UE4SS start queued for " .. row.entry.mod ..
+                    "; UE4SS.log has the outcome")
+            else
+                log(row.entry.mod .. " is switched on for the next launch, but " ..
+                    "could not be started now: " .. startError)
             end
         end
 
