@@ -1606,6 +1606,59 @@ local function acquireExistingMainMenu()
     end
 end
 
+-- Going into a start-menu submenu and back out rebuilds the rail.
+--
+-- Entering Equipment (or any other native submenu) and returning does not
+-- construct a new start menu -- the same WBP_Console_MainMenu_C object stays
+-- alive -- but the game rebuilds the row list underneath it. Every injected row
+-- is a child of that list, so every injected row is gone, and because the menu
+-- object never changed, NotifyOnNewObject does not fire and nothing here ever
+-- learns about it. The Mods row simply stops existing for the rest of the
+-- session. FieldEquipPro already re-arms itself on this event, which is why its
+-- row comes back and everybody else's does not; that mod's own comment says as
+-- much -- "returning from Equipment rebuilds this rail from scratch, which is
+-- also how every other mod gets its row back".
+--
+-- The rebuild is not synchronous with the event, so this checks a few times
+-- rather than guessing one delay. activeMenuContextIsAttached is the existing
+-- test for "is our row still on the rail it was injected into", and clearing
+-- injectedMenus is what lets the normal acquisition path run again -- the same
+-- two steps processMenuInjectionCycle already takes, which never reach this case
+-- because that cycle's timer stops as soon as there is nothing queued.
+local RAIL_REACQUIRE_DELAYS_MS = { 250, 700, 1500 }
+-- ClosedMenu belongs to RODMenuWidgetBase, so it fires for every menu in the
+-- game, and twice in a row for one Equipment exit in the logs. Without this the
+-- mod would keep three timers in flight per event, forever, for menus that have
+-- nothing to do with this rail.
+local railReacquireInFlight = false
+
+local function reacquireRailAfterSubmenu()
+    if railReacquireInFlight then return end
+    railReacquireInFlight = true
+
+    local passes = #RAIL_REACQUIRE_DELAYS_MS
+    for _, delay in ipairs(RAIL_REACQUIRE_DELAYS_MS) do
+        ExecuteWithDelay(delay, function()
+            onGameThread(function()
+                passes = passes - 1
+                if passes <= 0 then railReacquireInFlight = false end
+                if panel.isOpen() then return end
+
+                local context = activeContext
+                if context ~= nil then
+                    if activeMenuContextIsAttached() then return end
+                    local staleKey = context.mainMenuKey
+                    activeContext = nil
+                    if staleKey ~= nil then injectedMenus[staleKey] = nil end
+                    log("the Mods row left the rail on a submenu return; re-injecting")
+                end
+
+                acquireExistingMainMenu()
+            end)
+        end)
+    end
+end
+
 -- Every hook below only has anything to do once a Mods row exists on the rail.
 -- Registering them at load time meant this mod had callbacks running on common
 -- engine events throughout startup and gameplay for no benefit, which is a large
@@ -1733,6 +1786,19 @@ ensureInputHooks = function()
                 openPanel()
             end
         end)
+
+    -- Coming back from a native submenu rebuilds the rail out from under this
+    -- row. Both events are hooked because EndSubMenu is the main menu's own
+    -- return path while ClosedMenu is what the submenu widget itself reports,
+    -- and which one fires depends on how the player left. Re-acquisition is
+    -- idempotent -- it does nothing when the row is still attached -- so hooking
+    -- both costs a cheap check and covers both exits.
+    safeHook("/Script/ROD.RODConsoleMainMenuWidgetBase:EndSubMenu", function()
+        reacquireRailAfterSubmenu()
+    end)
+    safeHook("/Script/ROD.RODMenuWidgetBase:ClosedMenu", function()
+        reacquireRailAfterSubmenu()
+    end)
 
     -- The start menu closing must take the panel with it, or it would be left
     -- floating over the world. The context reference is deliberately kept until
