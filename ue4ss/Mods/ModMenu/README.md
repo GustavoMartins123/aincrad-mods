@@ -148,8 +148,21 @@ removing, renaming or updating a mod.
 When a mod started the game without `enabled.txt`, switching it to **ON** does
 two things:
 
-1. creates the persistent `enabled.txt` marker;
-2. calls UE4SS `RestartMod("<FolderName>")`.
+1. creates the persistent `enabled.txt` marker, immediately;
+2. calls UE4SS `RestartMod("<FolderName>")` — but only once the panel closes.
+
+The start waits for the panel to be gone on purpose. A mod that comes up while
+the panel is open finds a start menu that is already open and injects its own
+rail row straight away, building widgets and forcing a layout prepass underneath
+a panel that is covering the whole menu and holding the input. That is a visible
+stutter and a rail whose rows end up in the wrong order. Nothing on the rail is
+reachable until the panel closes anyway, so waiting costs nothing: the row
+already reads **ON** the moment you press it, because the marker is already
+written.
+
+Switching a mod on and back off before closing the panel cancels the pending
+start rather than starting it, and the marker state at close is what decides —
+never the keypress.
 
 `RestartMod` asks UE4SS to create or recreate that mod through its own mod
 manager. The target receives its own isolated Lua state, `ModRef`, hooks,

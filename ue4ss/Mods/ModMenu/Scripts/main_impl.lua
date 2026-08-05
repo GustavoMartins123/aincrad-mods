@@ -539,14 +539,30 @@ local function refreshRailPosition(context)
 
     if lastRowPosition ~= ownPosition then
         -- Something was appended below. Detach and re-append to reclaim the end.
-        local moved = pcall(function()
-            wrapper:RemoveFromParent()
-            parent:AddChildToVerticalBox(wrapper)
-        end)
-        if moved then
-            pcall(function() wrapper:SetVisibility(VISIBLE) end)
-            pcall(function() wrapper:ForceLayoutPrepass() end)
-            log("another mod appended a row below Mods; moved Mods back to the end")
+        --
+        -- The two halves are checked separately and the result is verified. As
+        -- one pcall, a detach that succeeded followed by an append that failed
+        -- reported "did not move" while having already taken the row out of the
+        -- tree -- the Mods entry would simply be gone, with nothing saying so.
+        -- Anything that makes the append fail happens exactly when the menu is
+        -- being torn down, which is also when this runs on a delayed pass.
+        local detached = pcall(function() wrapper:RemoveFromParent() end)
+        if detached then
+            pcall(function() parent:AddChildToVerticalBox(wrapper) end)
+
+            local reattached = nil
+            pcall(function() reattached = wrapper.Slot.Parent end)
+            if isValid(reattached) then
+                pcall(function() wrapper:SetVisibility(VISIBLE) end)
+                pcall(function() wrapper:ForceLayoutPrepass() end)
+                log("another mod appended a row below Mods; moved Mods back to the end")
+            else
+                -- Detached and could not be put back. Say so loudly: the row is
+                -- off the rail until the menu is rebuilt, and silence here is
+                -- what made that look like the mod removing itself.
+                log("the Mods row was detached but could not be re-attached; " ..
+                    "it will return when the start menu is reopened")
+            end
         end
     end
 
@@ -1102,6 +1118,74 @@ local function openPanel()
     end)
 end
 
+-- Puts the Mods row back at the bottom of the rail once the panel is out of the
+-- way, and keeps doing so for a moment.
+--
+-- Switching a mod on from the panel is now a live event on this rail: UE4SS
+-- RestartMod brings the mod up mid-session and its own acquisition sweep finds
+-- the start menu that is already open, so it appends its row while the panel is
+-- still covering everything. Every rail mod appends with AddChildToVerticalBox,
+-- so the newcomer lands below Mods and the two swap places -- and modsIndex,
+-- computed at injection, is then pointing at somebody else's row.
+--
+-- Two reasons this waits for the panel to close instead of correcting live:
+--
+--   * refreshRailPosition detaches and re-appends the Mods wrapper, and while
+--     the panel is up that wrapper's icon is the one widget still accepting
+--     input. Pulling it out of the tree mid-session is how the panel would stop
+--     responding -- a worse bug than a row in the wrong order.
+--   * nothing on the rail is visible or reachable until the panel is gone, so
+--     correcting earlier buys nothing.
+--
+-- The repeats exist because the newcomer's arrival is not synchronous with
+-- anything here: RestartMod only queues, the loader reinstalls the mod on its
+-- own event loop, and the mod then waits out its own readiness delay
+-- (FieldEquipPro 100ms, this mod 750ms). A single pass at close would easily run
+-- before the row it is meant to notice exists. refreshRailPosition is a walk over
+-- a handful of children and does nothing when the order is already right, so
+-- repeating it is cheap and idempotent.
+--
+-- These only make the correction early enough that the player never sees the
+-- wrong order. The permanent safety net is the FocusEvent hook, which reconciles
+-- on every rail move once the panel is closed, so a newcomer arriving after the
+-- last pass here is still put in its place the moment the player navigates.
+local RAIL_RECONCILE_DELAYS_MS = { 0, 300, 900, 2000 }
+
+-- `expectNewRows` is true when a mod was just started and is about to append a
+-- row. Without one, closing the panel cannot have changed the rail, so a single
+-- immediate pass is the whole job.
+local function reconcileRailAfterPanel(context, expectNewRows)
+    if context == nil then return end
+
+    local schedule = RAIL_RECONCILE_DELAYS_MS
+    if not expectNewRows then schedule = { 0 } end
+
+    for _, delay in ipairs(schedule) do
+        local function pass()
+            -- The context may have been replaced by a new start menu, or the
+            -- panel reopened, between scheduling and now.
+            if activeContext ~= context or panel.isOpen() then return end
+
+            -- And the player may simply have left the menu. Moving a row around
+            -- a widget tree that is being torn down is how the row ends up
+            -- detached with nowhere to go back to, and these passes run for two
+            -- seconds after the panel closes -- long enough to still be firing
+            -- while the menu is on its way out.
+            local onScreen = false
+            pcall(function() onScreen = context.mainMenu:IsInViewport() == true end)
+            if not isValid(context.mainMenu) or not onScreen then return end
+
+            pcall(refreshRailPosition, context)
+        end
+
+        if delay <= 0 then
+            pass()
+        else
+            ExecuteWithDelay(delay, function() onGameThread(pass) end)
+        end
+    end
+end
+
 -- The player must always be able to get out.
 --
 -- While the panel is up, handleButton consumes every button before anything
@@ -1117,8 +1201,26 @@ local function closePanel()
         if not closed then
             log("panel close failed: " .. tostring(closeError))
         end
+        -- The panel is down; the rail is nobody's screen now. Start whatever was
+        -- switched on during this session, so those mods inject their rows into
+        -- a menu that is not underneath a modal panel.
+        local started = 0
+        local flushed, startedOrError = pcall(function()
+            return panel.flushPendingStarts()
+        end)
+        if flushed then
+            started = tonumber(startedOrError) or 0
+        else
+            log("could not start the mods switched on here: " ..
+                tostring(startedOrError))
+        end
+
         if activeContext ~= nil then
             pcall(setNativeMenuInputEnabled, activeContext, true)
+            -- Reconcile the rail before handing focus back, not after: focusMods
+            -- uses context.modsIndex, and that index is exactly what goes stale
+            -- when another row appears.
+            reconcileRailAfterPanel(activeContext, started > 0)
             pcall(focusMods, activeContext)
         end
         if panel.isOpen() then
@@ -1472,9 +1574,37 @@ if not notifyOk then
         .. tostring(notifyError))
 end
 
--- Construction notification is the only acquisition trigger. A hot reload
--- against an already-existing widget is intentionally fail-closed; reopen the
--- menu or relaunch the game instead of scanning the global object array.
+-- Construction notification cannot fire for a menu that was already built
+-- before this mod started, and that is a real way for this mod to start: UE4SS
+-- RestartMod reinstalls a mod mid-session, and the player switching mods on is
+-- doing it from a panel drawn over the very start menu this row belongs in.
+-- The notification above then waits for a construction that already happened,
+-- the mod loads correctly and injects nothing, and the row only appears once
+-- the menu has been closed and reopened.
+--
+-- So sweep once for a menu that is already up. This is not the "scan the global
+-- object array" that used to be avoided here: it is the same FindAllOf that
+-- resolveMainMenuByKey already runs on every injection cycle, behind the same
+-- isCanonicalMainMenuCandidate filter, feeding the same queue and the same
+-- readiness delay. A display-only copy or a widget from a discarded world is
+-- rejected here exactly as it is everywhere else, and a menu that arrives
+-- normally is deduplicated by injectedMenus.
+--
+-- Defined here, next to the notification it backstops, but fired at the very
+-- end of this file: it can queue an injection, and injectModsEntry calls
+-- ensureInputHooks, which is not assigned until further down.
+local function acquireExistingMainMenu()
+    local ok, widgets = pcall(function()
+        return FindAllOf("WBP_Console_MainMenu_C")
+    end)
+    if not ok or type(widgets) ~= "table" then return end
+
+    for _, widget in ipairs(widgets) do
+        if isCanonicalMainMenuCandidate(widget) then
+            queueMenuInjection(objectName(widget))
+        end
+    end
+end
 
 -- Every hook below only has anything to do once a Mods row exists on the rail.
 -- Registering them at load time meant this mod had callbacks running on common
@@ -1751,6 +1881,16 @@ end)
 
 if not commandOk then
     log("console command unavailable: " .. tostring(commandError))
+end
+
+-- Last, so a start menu that is already open when this mod starts is picked up
+-- only once everything an injection needs is in place. Reads live UObjects, so
+-- it goes to the game thread rather than running on whatever thread the loader
+-- started this chunk on.
+local sweepOk, sweepError =
+    pcall(function() ExecuteInGameThread(acquireExistingMainMenu) end)
+if not sweepOk then
+    log("could not sweep for an already-open start menu: " .. tostring(sweepError))
 end
 
 log(string.format("loaded %s | %d mods registered | console: modmenu list",

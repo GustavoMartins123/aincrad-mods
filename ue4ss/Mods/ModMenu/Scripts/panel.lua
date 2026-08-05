@@ -83,6 +83,12 @@ local isOpen = false
 local previewMod = nil
 local lastPreviewError = nil
 
+-- Mods switched on from the panel, waiting to be started until the panel is
+-- gone. Filled by toggleBool, drained by Panel.flushPendingStarts. A set, not a
+-- list: toggling the same mod on and off and on again is one pending start, not
+-- three.
+local pendingStarts = {}
+
 local function isValid(object)
     if object == nil then return false end
     local ok, valid = pcall(function() return object:IsValid() end)
@@ -702,31 +708,11 @@ local function toggleBool(row)
         -- left the row displaying the value it had before the press, so the menu
         -- said OFF about a mod that was written on -- and pressing again to
         -- "fix" it read the new state and switched it back off.
-        if nextState == true then
-            local startError = nil
-            if type(RestartMod) ~= "function" then
-                -- A real Lua global registered by the loader, not a UObject
-                -- method, so this test is meaningful here.
-                startError = "this UE4SS build does not expose RestartMod"
-            else
-                local called, callError = pcall(function()
-                    RestartMod(row.entry.mod)
-                end)
-                if not called then startError = tostring(callError) end
-            end
-
-            if startError == nil then
-                -- Queued, not started. RestartMod only enqueues a reinstall and
-                -- resolves the folder name later, on the loader's event loop; a
-                -- name it cannot match is a warning in UE4SS.log and nothing
-                -- here. So this must not claim the mod is running.
-                log("UE4SS start queued for " .. row.entry.mod ..
-                    "; UE4SS.log has the outcome")
-            else
-                log(row.entry.mod .. " is switched on for the next launch, but " ..
-                    "could not be started now: " .. startError)
-            end
-        end
+        --
+        -- The start itself is deferred to panel close; see flushPendingStarts.
+        -- Switching back off drops the pending start rather than leaving one
+        -- queued against a mod the player has since turned off.
+        pendingStarts[row.entry.mod] = nextState == true or nil
 
         buildRows()
         Panel.render()
@@ -839,6 +825,76 @@ end
 
 function Panel.isOpen()
     return isOpen
+end
+
+-- Starts the mods switched on during this panel session, and reports how many
+-- were queued so the caller knows whether the rail is about to change.
+--
+-- Deferred rather than done at the keypress, because a mod started while the
+-- panel is up comes back into a start menu that is already open and injects its
+-- rail row immediately -- building a donor list and forcing a layout prepass
+-- underneath a panel that is covering the whole menu. That is the stutter on
+-- switching a mod on, and the half-resolved tree behind it: two mods editing
+-- the same widget hierarchy, one of them from under a modal panel that owns the
+-- screen and the input.
+--
+-- Waiting costs nothing. enabled.txt is already written, the row already reads
+-- ON, and nothing on the rail is visible until the panel closes anyway -- so
+-- the only thing the delay changes is that the newcomer lands on a rail nobody
+-- is standing on. The caller then reconciles the order.
+local function startPendingMod(modName)
+    -- enabled.txt is the truth, and it can have moved since the press -- through
+    -- this panel or from anywhere else. Never start a mod that is not switched
+    -- on at the moment the start actually happens, or toggling one on and back
+    -- off before closing would start it anyway.
+    local read, enabled = pcall(store.isModEnabled, modName)
+    if not read then
+        log("could not confirm the load state of " .. modName ..
+            " before starting it: " .. tostring(enabled))
+        return false
+    end
+    if enabled ~= true then
+        log(modName .. " was switched off again before it started; leaving it alone")
+        return false
+    end
+
+    if type(RestartMod) ~= "function" then
+        -- A real Lua global registered by the loader, not a UObject method, so
+        -- this test means what it says here.
+        log(modName .. " is switched on for the next launch, but could not be " ..
+            "started now: this UE4SS build does not expose RestartMod")
+        return false
+    end
+
+    local called, callError = pcall(function() RestartMod(modName) end)
+    if not called then
+        log(modName .. " is switched on for the next launch, but could not be " ..
+            "started now: " .. tostring(callError))
+        return false
+    end
+
+    -- Queued, not started. RestartMod only enqueues a reinstall and resolves the
+    -- folder name later, on the loader's event loop; a name it cannot match is a
+    -- warning in UE4SS.log and nothing here. So this must not claim the mod is
+    -- running.
+    log("UE4SS start queued for " .. modName .. "; UE4SS.log has the outcome")
+    return true
+end
+
+function Panel.flushPendingStarts()
+    local names = {}
+    for modName in pairs(pendingStarts) do names[#names + 1] = modName end
+    -- Cleared up front: a start that fails is not retried on the next close.
+    pendingStarts = {}
+    if #names == 0 then return 0 end
+    -- Deterministic order, so one session's log reads like the next.
+    table.sort(names)
+
+    local queued = 0
+    for _, modName in ipairs(names) do
+        if startPendingMod(modName) then queued = queued + 1 end
+    end
+    return queued
 end
 
 function Panel.open()

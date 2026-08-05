@@ -79,6 +79,14 @@ local rearmEquipmentEntry
 local isCanonicalMainMenuCandidate
 local activeEquipmentContextIsAttached
 local beginEquipmentReturnToMain
+-- Assigned below, next to iconInsideWrapper. Used by the stale-row prune, which
+-- is written earlier in this file but only ever runs at injection time.
+local railRowLabel
+
+-- The row's visible name, and the only thing that marks a rail row as this
+-- mod's. It is written into the icon and read back when pruning, so the two must
+-- stay the same string -- hence one constant rather than a literal at each site.
+local EQUIPMENT_ROW_LABEL = "Equipment"
 
 local SCRIPT_DIR = (function()
     local source = (debug.getinfo(1, "S") or {}).source or ""
@@ -912,21 +920,45 @@ local function injectEquipmentEntry(mainMenu)
     end
 
     -- Restart All Mods resets Lua tables but can leave the already-mutated UMG
-    -- tree alive. Remove children beyond the attached authored wrappers before
-    -- appending this build's single row; Logout may exist but be collapsed.
+    -- tree alive, so a leftover Equipment row from a previous load of this mod
+    -- has to go before this one is appended.
+    --
+    -- Only this mod's rows. This used to delete every child past the authored
+    -- wrappers, on position alone, which is only ever correct while this mod is
+    -- the sole occupant of the rail below the native rows. It is not: ModMenu
+    -- and FastTravelMod append rows of exactly the same shape -- a donor
+    -- CanvasPanel holding a MenuIcon -- and this prune ate them. It went unseen
+    -- while this mod always injected first, on the construction notification;
+    -- being started mid-session through ModMenu's RestartMod puts this code
+    -- after their rows exist, and it removed the Mods row that had just started
+    -- it. "removed 2 stale Equipment rail row(s)" in UE4SS.log, with one of them
+    -- belonging to ModMenu, is what that looked like.
+    --
+    -- A row is this mod's when it says so, in the label every rail mod writes
+    -- into its own icon. A row that cannot be identified is left alone: keeping
+    -- a stale row until the menu is recreated is recoverable, deleting another
+    -- mod's row is not.
     local removedLegacyRows = 0
+    local keptForeignRows = 0
     pcall(function()
         local childCount = parent:GetChildrenCount()
-        while childCount > authoredWrapperCount do
-            local legacyRow = parent:GetChildAt(childCount - 1)
-            if not isValidObject(legacyRow) then break end
-            legacyRow:RemoveFromParent()
-            removedLegacyRows = removedLegacyRows + 1
-            local nextCount = parent:GetChildrenCount()
-            if nextCount >= childCount then break end
-            childCount = nextCount
+        -- Back to front, so removing one cannot shift the index of the next.
+        for index = childCount - 1, authoredWrapperCount, -1 do
+            local legacyRow = parent:GetChildAt(index)
+            if isValidObject(legacyRow) then
+                if railRowLabel(legacyRow) == EQUIPMENT_ROW_LABEL then
+                    legacyRow:RemoveFromParent()
+                    removedLegacyRows = removedLegacyRows + 1
+                else
+                    keptForeignRows = keptForeignRows + 1
+                end
+            end
         end
     end)
+    if keptForeignRows > 0 then
+        log("left " .. tostring(keptForeignRows)
+            .. " rail row(s) belonging to other mods in place")
+    end
     if removedLegacyRows > 0 then
         log("removed " .. tostring(removedLegacyRows)
             .. " stale Equipment rail row(s) from an older hot reload")
@@ -960,7 +992,7 @@ local function injectEquipmentEntry(mainMenu)
         if not applyEquipmentIconTexture(equipmentIcon, mainList) then
             error("dedicated Equipment icon texture is unavailable")
         end
-        local equipmentText = textLibrary:Conv_StringToText("Equipment")
+        local equipmentText = textLibrary:Conv_StringToText(EQUIPMENT_ROW_LABEL)
         equipmentIcon:SetMenuName(equipmentText)
         equipmentIcon.MenuName:SetText(equipmentText)
     end)
@@ -1111,6 +1143,20 @@ local function iconInsideWrapper(panel)
     return nil
 end
 
+-- The visible label of a rail row, which is how this mod tells its own injected
+-- rows apart from another mod's. Every rail mod writes its own name into the
+-- icon's MenuName, so the row carries its owner with it and nothing has to be
+-- shared between mods to read it back. Returns nil when the row cannot be
+-- identified at all -- callers must treat that as "not mine".
+railRowLabel = function(wrapper)
+    local icon = iconInsideWrapper(wrapper)
+    if not isValidObject(icon) then return nil end
+    local label = nil
+    pcall(function() label = icon.MenuName:GetText():ToString() end)
+    if type(label) == "string" and label ~= "" then return label end
+    return nil
+end
+
 -- The injected rows sitting after Equipment, in visual order.
 local function railRowsBelowEquipment(context)
     local rows = {}
@@ -1194,7 +1240,7 @@ focusEquipment = function(context)
     local _, _, textLibrary = resolveLibraries()
     if isValidObject(textLibrary) then
         pcall(function()
-            local equipmentText = textLibrary:Conv_StringToText("Equipment")
+            local equipmentText = textLibrary:Conv_StringToText(EQUIPMENT_ROW_LABEL)
             context.equipmentIcon:SetMenuName(equipmentText)
             context.equipmentIcon.MenuName:SetText(equipmentText)
         end)
@@ -1317,7 +1363,7 @@ restoreEquipmentEntryPresentation = function(context)
     local _, _, textLibrary = resolveLibraries()
     if isValidObject(textLibrary) then
         pcall(function()
-            local equipmentText = textLibrary:Conv_StringToText("Equipment")
+            local equipmentText = textLibrary:Conv_StringToText(EQUIPMENT_ROW_LABEL)
             context.equipmentIcon:SetMenuName(equipmentText)
             context.equipmentIcon.MenuName:SetText(equipmentText)
         end)
@@ -2055,9 +2101,37 @@ if not notifyOk then
         .. tostring(notifyError))
 end
 
--- Construction notification is the only acquisition trigger. A hot reload
--- against an already-existing widget is intentionally fail-closed; reopen the
--- menu or relaunch the game instead of scanning the global object array.
+-- Construction notification cannot fire for a menu that was already built
+-- before this mod started, and that is now a normal way for this mod to start:
+-- ModMenu switches it on mid-session through UE4SS RestartMod, usually from a
+-- panel drawn over the very start menu this row belongs in. The notification
+-- above then waits for a construction that already happened, the mod loads
+-- correctly and injects nothing, and the row only appears once the player has
+-- closed and reopened the menu.
+--
+-- So sweep once, at startup, for a menu that is already up. This is not the
+-- "scan the global object array" that used to be avoided here: it is the same
+-- FindAllOf that resolveMainMenuByKey already runs on every injection cycle,
+-- behind the same isCanonicalMainMenuCandidate filter, feeding the same queue
+-- and the same readiness delay. A display-only copy or a widget from a
+-- discarded world is rejected here exactly as it is everywhere else, and a
+-- menu that arrives normally is deduplicated by injectedMenus.
+local function acquireExistingMainMenu()
+    local ok, widgets = pcall(function()
+        return FindAllOf("WBP_Console_MainMenu_C")
+    end)
+    if not ok or type(widgets) ~= "table" then return end
+
+    for _, widget in ipairs(widgets) do
+        if isCanonicalMainMenuCandidate(widget) then
+            queueMenuInjection(objectName(widget))
+        end
+    end
+end
+
+-- Defined here, next to the notification it backstops, but fired at the very
+-- end of this file: it can queue an injection, and everything that injection
+-- goes on to touch has to exist first.
 
 safeHook("/Script/ROD.RODConsoleMainMenuWidgetBase:OnButtonDownMenuItemDelegate",
     function(_, widgetParameter, buttonParameter)
@@ -2530,6 +2604,16 @@ do
     if attachment == nil then
         error("ModMenuBridge attach failed: " .. tostring(attachmentError))
     end
+end
+
+-- Last, so a start menu that is already open when this mod starts is picked up
+-- only once everything an injection needs is in place. Reads live UObjects, so
+-- it goes to the game thread rather than running on whatever thread the loader
+-- started this chunk on.
+local sweepOk, sweepError =
+    pcall(function() ExecuteInGameThread(acquireExistingMainMenu) end)
+if not sweepOk then
+    log("could not sweep for an already-open start menu: " .. tostring(sweepError))
 end
 
 print(string.format("[%s] loaded %s\n", MOD_NAME, MOD_VERSION))
