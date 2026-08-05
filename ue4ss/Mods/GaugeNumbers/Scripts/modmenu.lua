@@ -8,12 +8,18 @@
 --   label    row label in the menu.
 --   summary  one line shown under the label.
 --   apply    "live" | "menu" | "restart"
+--   preview  optional. Ask the menu to write Scripts/preview.lua while these
+--            rows are expanded, so this mod can mount its HUD preview only
+--            while they are actually being edited. Opting in here is what makes
+--            the preview this mod's business: ModMenu names no mod, and works
+--            the same whether or not this file sets it.
 --   settings tunables, in display order. ENABLED is required.
 
 return {
     label = "Gauge Numbers",
     summary = "Live HP, Stamina and SP values plus an EXP bar on the HUD",
     apply = "live",
+    preview = true,
     settings = {
         { key = "ENABLED", label = "Enabled", type = "bool", default = true },
         { key = "SHOW_HP", label = "HP readout", type = "bool", default = true },

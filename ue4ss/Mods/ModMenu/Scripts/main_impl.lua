@@ -1,4 +1,4 @@
--- ModMenu v1.5.6
+-- ModMenu v1.5.7
 -- Adds a native-styled "Mods" entry to Echoes of Aincrad's start menu, opening a
 -- panel that enables/disables the other mods and retunes their values in-game.
 --
@@ -12,7 +12,7 @@
 -- mod's Lua state, because UE4SS gives each mod its own.
 
 local MOD_NAME = "ModMenu"
-local MOD_VERSION = "v1.5.6"
+local MOD_VERSION = "v1.5.7"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -24,18 +24,47 @@ local MAIN_MENU_LIST_CLASS =
 local MAX_NATIVE_MENU_ITEMS = 7
 local MENU_ICON_FRAGMENT = "WBP_Console_MainMenu_MenuIcon_C"
 
--- Confirmed against the native switch in FieldEquipmentMenu.
+-- EInputButtonKindInWidget, taken from the game's own reflection dump
+-- (mod_template Data/headers/ROD_enums.hpp) rather than inferred from observed
+-- presses. Watching the log tells you a code arrived; it does not tell you
+-- which member it is, and 15/16 were written here the wrong way round on that
+-- basis -- 15 is Right and 16 is Left, so Left raised a value and Right
+-- lowered it.
 local ACCEPT_BUTTON = 1
 local BACK_BUTTON = 2
 local DPAD_UP = 13
 local DPAD_DOWN = 14
-local DPAD_LEFT = 15
-local DPAD_RIGHT = 16
+local DPAD_RIGHT = 15
+local DPAD_LEFT = 16
 local LSTICK_UP = 17
 local LSTICK_DOWN = 18
--- Codes 15 and 16 were observed directly in UE4SS.log from the controller's
--- horizontal D-pad. Analog horizontal codes remain deliberately unregistered
--- until they are observed rather than inferred.
+local LSTICK_RIGHT = 19
+local LSTICK_LEFT = 20
+local RSTICK_UP = 21
+local RSTICK_DOWN = 22
+local RSTICK_RIGHT = 23
+local RSTICK_LEFT = 24
+
+-- One direction reaches this mod on three different devices, and the enum
+-- gives each device its own code. Every navigation decision below is taken
+-- from this map instead of from a hand-written pair of codes, so a direction
+-- cannot be handled on the D-pad and fall through to the native menu on a
+-- stick. Registering only the codes that had been seen in a log is what left
+-- both analog horizontals and the whole right stick unclaimed.
+local DIRECTION = {}
+for _, entry in ipairs({
+    { DPAD_UP, "up" }, { LSTICK_UP, "up" }, { RSTICK_UP, "up" },
+    { DPAD_DOWN, "down" }, { LSTICK_DOWN, "down" }, { RSTICK_DOWN, "down" },
+    { DPAD_LEFT, "left" }, { LSTICK_LEFT, "left" }, { RSTICK_LEFT, "left" },
+    { DPAD_RIGHT, "right" }, { LSTICK_RIGHT, "right" }, { RSTICK_RIGHT, "right" },
+}) do
+    DIRECTION[entry[1]] = entry[2]
+end
+
+local function directionOf(button)
+    if type(button) ~= "number" then return nil end
+    return DIRECTION[button]
+end
 
 local VISIBLE = 0
 local COLLAPSED = 1
@@ -181,10 +210,18 @@ end
 
 store.init(SCRIPT_DIR, bridge)
 
+-- A marker left set by a crash or a hard exit would tell a mod its settings
+-- page is open when no menu exists at all, so clear them at startup. Driven by
+-- what each mod's own manifest declares -- this menu names no mod and needs
+-- none of them present.
 do
-    local cleared, clearError = store.clearPreview("GaugeNumbers")
-    if not cleared then
-        log("GaugeNumbers preview cleanup failed: " .. tostring(clearError))
+    for _, entry in ipairs(registry) do
+        if entry.preview == true then
+            local cleared, clearError = store.clearPreview(entry.mod)
+            if not cleared then
+                log(entry.mod .. " preview cleanup failed: " .. tostring(clearError))
+            end
+        end
     end
 end
 
@@ -889,7 +926,17 @@ local function setNativeMenuInputEnabled(context, enabled)
         targets[#targets + 1] = target
     end
 
-    addTarget(context.mainList)
+    -- The rows, and deliberately not the list that owns them.
+    --
+    -- The list is the router: the Mods row was given it as its owner input
+    -- widget (SetOwnerInputWidget at injection), so input reaches the panel
+    -- through it. Switching the list off would take the panel's own input with
+    -- it and leave a modal panel nothing could drive -- a worse version of the
+    -- bug being fixed. It also is not what moves: a RODListWidgetBase changes
+    -- focus by handing it to one of its operable children, so a rail whose rows
+    -- all refuse input has nowhere to move the cursor to, which is the whole
+    -- effect wanted here. Only the Mods row stays live, and it is re-enabled
+    -- explicitly below.
     for index = 0, context.nativeCount - 1 do
         local item = nil
         pcall(function() item = context.mainList["Item_" .. tostring(index)] end)
@@ -907,37 +954,60 @@ local function setNativeMenuInputEnabled(context, enabled)
         end
     end
 
+    -- Never gate a UFunction call on `type(widget.Method) == "function"`.
+    -- Indexing a UObject with a UFunction name hands back UE4SS's UFunction
+    -- *userdata* (LuaUObject.cpp -> push_functionproperty), and a name that
+    -- does not resolve hands back an invalid RemoteObject userdata, so the test
+    -- is false for every method on every widget and was true for none of them.
+    -- That is why this function reported "0/9" in every log it ever wrote: the
+    -- panel was never modal, the native list kept navigating underneath it, and
+    -- Up moved the real menu's cursor while Down happened to look clean only
+    -- because the native cursor was already parked on the last row and had
+    -- nowhere further to go.
     local applied = 0
     for _, target in ipairs(targets) do
         if isValid(target) and isValid(context.mainMenu) then
-            local ok = false
-            if type(target.SetIsEnabled) == "function" then
-                if pcall(function() target:SetIsEnabled(enabled) end) then ok = true end
+            -- SetIsEnabled is deliberately not used: it greys the rail out, and
+            -- the rail is still on screen beside the panel. Input is what has to
+            -- stop, not the presentation.
+            pcall(function() target:SetIsFocusable(enabled) end)
+            pcall(function() target:SetInputEnable(enabled) end)
+            pcall(function() target:BP_SetInputInteractionEnable(enabled) end)
+            -- URODInputWidgetBase also exposes SetInputEnableIndividual /
+            -- SetInputEnableIndividualAll, and they are deliberately not used.
+            -- SetInputEnable is the widget-wide gate above them, so it already
+            -- covers every direction, and it is exactly reversible. The
+            -- per-button switches are not: the game sets them per row, this mod
+            -- never captured what they were, and restoring them wholesale on
+            -- close would hand the rail back more permissive than it was found.
+            -- Turning one switch off is the whole job here.
+
+            -- The setters are void, so "the call did not throw" says nothing.
+            -- These two getters exist on the same class; ask the widget what
+            -- state it is actually in and count that.
+            local live = nil
+            pcall(function() live = target:IsInputEnable() end)
+            if live == nil then
+                pcall(function() live = target:IsInputInteractionEnable() end)
             end
-            if type(target.SetIsFocusable) == "function" then
-                if pcall(function() target:SetIsFocusable(enabled) end) then ok = true end
-            end
-            if type(target.SetInputEnable) == "function" then
-                if pcall(function() target:SetInputEnable(enabled) end) then ok = true end
-            end
-            if type(target.BP_SetInputInteractionEnable) == "function" then
-                if pcall(function() target:BP_SetInputInteractionEnable(enabled) end) then ok = true end
-            end
-            if ok then applied = applied + 1 end
+            if live == enabled then applied = applied + 1 end
         end
     end
 
     if isValid(context.icon) and isValid(context.mainMenu) then
-        if type(context.icon.SetInputEnable) == "function" then
-            pcall(function() context.icon:SetInputEnable(true) end)
-        end
-        if type(context.icon.BP_SetInputInteractionEnable) == "function" then
-            pcall(function() context.icon:BP_SetInputInteractionEnable(true) end)
-        end
+        pcall(function() context.icon:SetInputEnable(true) end)
+        pcall(function() context.icon:BP_SetInputInteractionEnable(true) end)
     end
 
-    dbg(string.format("outer menu input %s on %d/%d widget(s); Mods row kept live",
-        enabled and "enabled" or "disabled", applied, #targets))
+    if applied < #targets then
+        -- Worth saying out loud rather than hiding behind DEBUG_LOGS: a partial
+        -- capture is exactly the state where the menu underneath still moves.
+        log(string.format("outer menu input %s on only %d/%d widget(s)",
+            enabled and "enabled" or "disabled", applied, #targets))
+    else
+        dbg(string.format("outer menu input %s on %d/%d widget(s); Mods row kept live",
+            enabled and "enabled" or "disabled", applied, #targets))
+    end
 end
 
 local function isModsIcon(widget)
@@ -1032,13 +1102,32 @@ local function openPanel()
     end)
 end
 
+-- The player must always be able to get out.
+--
+-- While the panel is up, handleButton consumes every button before anything
+-- native sees it, so a panel that will not close is a start menu that cannot be
+-- used and cannot be dismissed. Restoring the outer menu's input is therefore
+-- unconditional: it does not wait on panel.close() reporting success, and it
+-- runs even if that call throws. Those two are separate failures and only one
+-- of them traps the player.
 local function closePanel()
     if not panel.isOpen() then return end
     onGameThread(function()
-        pcall(panel.close)
+        local closed, closeError = pcall(panel.close)
+        if not closed then
+            log("panel close failed: " .. tostring(closeError))
+        end
         if activeContext ~= nil then
-            setNativeMenuInputEnabled(activeContext, true)
+            pcall(setNativeMenuInputEnabled, activeContext, true)
             pcall(focusMods, activeContext)
+        end
+        if panel.isOpen() then
+            -- Nothing below this is a recovery path, so say so plainly rather
+            -- than leaving the player to work out why the menu stopped
+            -- responding.
+            log("panel still reports itself open after close; the start menu " ..
+                "may need to be reopened")
+            return
         end
         dbg("panel closed")
     end)
@@ -1089,19 +1178,31 @@ local function routeToPanel(button)
         log("panel received button code " .. tostring(button))
     end
 
+    -- Back is deliberately outside the input lock. The lock exists to stop one
+    -- physical press from stepping the cursor two or three rows because the
+    -- same press arrives on three hooks; closing is idempotent (closePanel
+    -- returns immediately once the panel is shut), so repeating it costs
+    -- nothing. Inside the lock, a Back that landed within another press's 60ms
+    -- window was swallowed by the consume below and dropped without acting,
+    -- which turns "the way out" into something that works most of the time.
+    -- The way out is the one action that must never be rate-limited.
+    if button == BACK_BUTTON then
+        closePanel()
+        return true
+    end
+
     local action = nil
-    if button == DPAD_UP or button == LSTICK_UP then
+    local direction = directionOf(button)
+    if direction == "up" then
         action = function() panel.move(-1) end
-    elseif button == DPAD_DOWN or button == LSTICK_DOWN then
+    elseif direction == "down" then
         action = function() panel.move(1) end
-    elseif button == DPAD_LEFT then
+    elseif direction == "left" then
         action = function() panel.adjust(-1) end
-    elseif button == DPAD_RIGHT then
+    elseif direction == "right" then
         action = function() panel.adjust(1) end
     elseif button == ACCEPT_BUTTON then
         action = function() panel.activate() end
-    elseif button == BACK_BUTTON then
-        action = function() closePanel() end
     end
 
     -- Taking the shared input lock for a button that maps to nothing would
@@ -1140,6 +1241,7 @@ local function handleButton(widgetParameter, buttonParameter)
     if not isValid(widget) then return end
 
     if isModsIcon(widget) then
+        local direction = directionOf(button)
         if button == ACCEPT_BUTTON then
             consumeButton(buttonParameter)
             openPanel()
@@ -1148,14 +1250,20 @@ local function handleButton(widgetParameter, buttonParameter)
             -- Match Equipment's proven close path: leave the native input hook
             -- before EndMenu tears down the widget that originated this event.
             ExecuteWithDelay(0, closeMainMenuFromMods)
-        elseif button == DPAD_UP or button == LSTICK_UP then
+        elseif direction == "up" then
             consumeButton(buttonParameter)
             -- Mods owns both of its boundaries. Depending on another mod's hook
             -- order here made Up work or fail nondeterministically.
             withInputLock(function() focusRowAbove(activeContext) end)
-        elseif button == DPAD_DOWN or button == LSTICK_DOWN then
+        elseif direction == "down" then
             consumeButton(buttonParameter)
             withInputLock(function() focusFirstNative(activeContext) end)
+        elseif direction ~= nil then
+            -- Left and right mean nothing on the rail, but the Mods row is not
+            -- part of the authored list, so letting them through hands the
+            -- native list a press aimed at a row it does not own. Swallowed
+            -- without acting: every direction leaves this row the same way.
+            consumeButton(buttonParameter)
         end
         return
     end
@@ -1173,8 +1281,9 @@ local function handleButton(widgetParameter, buttonParameter)
     pcall(function() index = widget:GetItemIndex() end)
     if index == nil then return end
 
-    local down = button == DPAD_DOWN or button == LSTICK_DOWN
-    local up = button == DPAD_UP or button == LSTICK_UP
+    local direction = directionOf(button)
+    local down = direction == "down"
+    local up = direction == "up"
     if (down and index == context.modsIndex - 1) or (up and index == 0) then
         consumeButton(buttonParameter)
         withInputLock(function() focusMods(context) end)
@@ -1502,9 +1611,15 @@ ensureInputHooks = function()
     -- drops the context the moment the row stops being attached to it.
     safeHook("/Script/ROD.RODWidgetBPFunctionLibrary:EndMenu", function()
         if panel.isOpen() then closePanel() end
-        -- If this EndMenu came from the Mods row, retain the close lock until
-        -- the next real menu injection. One physical Back press reaches several
-        -- hooked functions and must never call EndMenu more than once.
+        -- Release the close lock here rather than leaving it latched until the
+        -- next injection. The lock is only there to stop one physical Back
+        -- press -- which reaches several hooked functions -- from calling
+        -- EndMenu more than once, and by the time this post-hook runs the menu
+        -- is already closing, so it has done its job. Latching it meant that a
+        -- start menu reopened without being reconstructed (no NotifyOnNewObject,
+        -- so no re-injection, so nothing to clear the flag) had a Mods row that
+        -- swallowed Back and did nothing with it for the rest of the session.
+        ExecuteWithDelay(250, function() menuCloseBusy = false end)
     end)
 
     log("input hooks installed")
@@ -1517,14 +1632,21 @@ end
 -- Controller input reaches the panel through the button hooks above. Keyboard
 -- arrows do not always travel that path, so they are bound directly and gated on
 -- the panel being open.
-local function bindPanelKey(key, action)
+-- `locked` false runs the action every time, for the same reason Back bypasses
+-- the lock in routeToPanel: a keypress that only closes something must not be
+-- dropped because another press is inside its 60ms window.
+local function bindPanelKey(key, action, locked)
     local ok, err = pcall(function()
         RegisterKeyBind(key, function()
             if not panel.isOpen() then return end
             -- Shares the lock with the button hooks: the same keypress often
             -- arrives through both paths.
             ExecuteInGameThread(function()
-                withInputLock(action)
+                if locked == false then
+                    action()
+                else
+                    withInputLock(action)
+                end
                 if activeContext ~= nil then
                     pcall(resetNativeSelection, activeContext)
                 end
@@ -1544,16 +1666,22 @@ local function keyCode(name)
     return nil
 end
 
+-- BACKSPACE joins ESCAPE as a way out. The panel consumes every button while
+-- it is up, so if the one bound close key does not arrive on someone's setup
+-- there is no other exit -- no mouse path, and Back on the controller is the
+-- same code either way. A second keyboard key costs nothing and removes the
+-- single point of failure.
 for _, binding in ipairs({
-    { "UP_ARROW", function() panel.move(-1) end },
-    { "DOWN_ARROW", function() panel.move(1) end },
-    { "LEFT_ARROW", function() panel.adjust(-1) end },
-    { "RIGHT_ARROW", function() panel.adjust(1) end },
-    { "RETURN", function() panel.activate() end },
-    { "ESCAPE", function() closePanel() end },
+    { "UP_ARROW", function() panel.move(-1) end, true },
+    { "DOWN_ARROW", function() panel.move(1) end, true },
+    { "LEFT_ARROW", function() panel.adjust(-1) end, true },
+    { "RIGHT_ARROW", function() panel.adjust(1) end, true },
+    { "RETURN", function() panel.activate() end, true },
+    { "ESCAPE", function() closePanel() end, false },
+    { "BACKSPACE", function() closePanel() end, false },
 }) do
     local code = keyCode(binding[1])
-    if code ~= nil then bindPanelKey(code, binding[2]) end
+    if code ~= nil then bindPanelKey(code, binding[2], binding[3]) end
 end
 
 --========================================================--

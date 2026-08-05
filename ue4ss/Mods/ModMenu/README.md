@@ -1,6 +1,6 @@
 # ModMenu
 
-ModMenu **v1.5.6** adds a native-styled **Mods** entry to Echoes of Aincrad's
+ModMenu **v1.5.7** adds a native-styled **Mods** entry to Echoes of Aincrad's
 Start Menu. It enables or disables compatible UE4SS Lua mods and edits their
 supported settings without leaving the game.
 
@@ -131,8 +131,22 @@ their last fully validated configuration and never parse an incomplete table.
 |---|---|---|
 | `Scripts/config.lua` | Player or mod author | Canonical settings, never rewritten by ModMenu |
 | `Scripts/runtime.lua` | ModMenu | Optional live overrides applied over `config.lua` |
+| `Scripts/preview.lua` | ModMenu | Only if the mod set `preview = true`: is its settings page open right now |
 
 **Reset** removes runtime overrides and returns control to `config.lua`.
+
+### Knowing when your settings are on screen
+
+A mod that wants to react to being edited -- showing a live preview of a value
+while the player is changing it, say -- sets `preview = true` in its own
+`Scripts/modmenu.lua` and reads `Scripts/preview.lua` from its own folder. The
+file returns `{ ACTIVE = true }` while that mod's rows are expanded and
+`{ ACTIVE = false }` otherwise, and it is transient state, never a saved
+setting.
+
+Only one mod holds it at a time, and only a mod that asked for it is written to
+at all. ModMenu names no mod anywhere in its code and requires none to be
+installed: the declaration in the mod's own manifest is the entire contract.
 
 None of this touches a mod listed on/off only. That mod has no settings
 contract, so ModMenu writes nothing inside its folder and never plants a
@@ -186,8 +200,9 @@ Exposing that mod's *settings* is the opt-in, and the work happens entirely in
 that mod's own folder:
 
 1. Add `Scripts/modmenu.lua` to the mod, returning `label`, `summary`, `apply`
-   and `settings`. The folder name is the identity, so the manifest does not
-   repeat it.
+   and `settings`, plus `preview` if the mod wants to know when its rows are
+   expanded. The folder name is the identity, so the manifest does not repeat
+   it.
 2. Use the exact setting keys the mod's `config.lua` defines.
 3. Match numeric bounds and choices to that mod's own validator.
 4. Ensure the mod reads its exact `Scripts/runtime.lua`, overlays it over

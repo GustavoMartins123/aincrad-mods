@@ -174,6 +174,13 @@ local function validateEntry(entry, effective)
     if not APPLY_MODES[entry.apply] then
         return nil, entry.mod .. " has an unsupported apply mode"
     end
+    -- Optional. A mod sets this when it wants to be told, through its own
+    -- Scripts/preview.lua, that its settings page is currently expanded --
+    -- a live preview, typically. Declaring it is the mod's business; the menu
+    -- neither knows nor cares which mods do.
+    if entry.preview ~= nil and type(entry.preview) ~= "boolean" then
+        return nil, entry.mod .. " preview must be boolean when declared"
+    end
     if type(entry.settings) ~= "table" or #entry.settings == 0 then
         return nil, entry.mod .. " has no registered settings"
     end
@@ -392,6 +399,9 @@ local function basicEntry(modName)
         apply = "restart",
         settings = {},
         configured = false,
+        -- No manifest, so nothing was declared: no rows to expand and nothing
+        -- to be told about.
+        preview = false,
     }
 end
 

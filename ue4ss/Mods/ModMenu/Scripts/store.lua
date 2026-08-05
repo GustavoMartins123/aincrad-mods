@@ -191,7 +191,17 @@ local function publishPreview(path, contents)
         return false, "staged preview read failed: " .. tostring(stagedReadError)
     end
     if stagedText ~= nil then
-        return false, "staged preview already exists: " .. nextPath
+        -- A leftover .next is debris from a publication that died between the
+        -- stage and the rename, not a concurrent writer: this marker is written
+        -- only from ModMenu's panel, on the game thread, one call at a time.
+        -- Treating it as a hard error made one interrupted write poison every
+        -- later one for the life of the install, and the panel could not be
+        -- closed for as long as it lasted. Clear it and carry on.
+        local cleared, clearError = removeFile(nextPath)
+        if not cleared then
+            return false, "stale staged preview could not be cleared (" ..
+                nextPath .. "): " .. tostring(clearError)
+        end
     end
 
     local staged, stageError = writeFile(nextPath, contents)
@@ -232,6 +242,18 @@ end
 function Store.setPreview(modName, active)
     if type(active) ~= "boolean" then
         return false, "preview state must be boolean"
+    end
+
+    -- The marker exists for one installed mod to read. Nothing about ModMenu
+    -- requires that mod to be present -- discovery lists whatever is on disk --
+    -- so on an install without it the preview path points inside a directory
+    -- that does not exist and every write fails. There is no consumer and
+    -- nothing to publish: that is success, not an error to propagate into the
+    -- panel's control flow.
+    local installed, installedError =
+        bridge.readFile(Store.scriptDirFor(modName) .. "main.lua")
+    if installedError == nil and installed == nil then
+        return true, nil
     end
 
     local path = previewPathFor(modName)

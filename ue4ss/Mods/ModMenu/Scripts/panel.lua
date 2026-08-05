@@ -68,11 +68,19 @@ local scrollOffset = 0
 local rows = {}
 local isOpen = false
 
--- GaugeNumbers owns the native HUD preview. ModMenu only publishes the
--- transient marker that tells it when that mod's settings are actually open.
--- ModMenu clears stale markers during startup and on panel close; no recurring
--- timer is needed while the user edits settings.
-local GAUGE_PREVIEW_MOD = "GaugeNumbers"
+-- "Your settings page is open" -- published to the mod whose rows are expanded,
+-- and to no one else.
+--
+-- A mod that wants to react to being edited (a live preview, say) declares
+-- `preview = true` in its own Scripts/modmenu.lua and reads the marker from its
+-- own Scripts/preview.lua. That declaration is the entire contract: ModMenu
+-- names no mod, requires no mod, and behaves identically whether or not any
+-- mod uses it. It used to name one directly, which made an unrelated mod's
+-- absence a fault in this menu.
+--
+-- Exactly one mod can hold the marker at a time -- the expanded one -- so
+-- previewMod is what has to be cleared, not a name known up front.
+local previewMod = nil
 local lastPreviewError = nil
 
 local function isValid(object)
@@ -95,24 +103,44 @@ function Panel.init(dependencies)
     resolveUmgLibrary = dependencies.resolveUmgLibrary or resolveUmgLibrary
 end
 
-local function publishGaugePreview(active)
+local function writePreviewMarker(modName, active)
     local called, written, writeError = pcall(function()
-        return store.setPreview(GAUGE_PREVIEW_MOD, active)
+        return store.setPreview(modName, active)
     end)
     if not called then
         writeError = written
         written = false
     end
     if written ~= true then
-        local message = tostring(writeError or "preview state publication failed")
+        local message = tostring(modName) .. ": " ..
+            tostring(writeError or "preview state publication failed")
         if lastPreviewError ~= message then
             lastPreviewError = message
-            log("GaugeNumbers preview unavailable: " .. message)
+            log("preview marker unavailable for " .. message)
         end
         return false
     end
     lastPreviewError = nil
     return true
+end
+
+-- Moves the marker to `modName`, or clears it entirely when that is nil. Always
+-- best effort: this marker drives an optional convenience in some other mod and
+-- is never a reason to refuse the player an action in this one.
+local function setPreviewOwner(modName)
+    if previewMod == modName then return end
+    if previewMod ~= nil then
+        writePreviewMarker(previewMod, false)
+        previewMod = nil
+    end
+    if modName ~= nil and writePreviewMarker(modName, true) then
+        previewMod = modName
+    end
+end
+
+-- True when the mod's own manifest asked for the marker.
+local function wantsPreview(entry)
+    return type(entry) == "table" and entry.preview == true
 end
 
 -- The panel draws into the start menu that is already on screen.
@@ -730,9 +758,11 @@ function Panel.activate()
         local opening = expandedMod ~= row.entry.mod
         local nextExpanded = opening and row.entry.mod or nil
         if nextExpanded ~= expandedMod then
-            if not publishGaugePreview(nextExpanded == GAUGE_PREVIEW_MOD) then
-                return
-            end
+            -- Best effort. This used to refuse to expand when the marker could
+            -- not be written, so on an install missing the one mod it named,
+            -- no mod's settings could be opened at all -- Enter did nothing,
+            -- with the reason only in the log.
+            setPreviewOwner((opening and wantsPreview(row.entry)) and row.entry.mod or nil)
         end
         expandedMod = nextExpanded
         buildRows()
@@ -796,14 +826,25 @@ function Panel.open()
     return true
 end
 
+-- Closing always succeeds.
+--
+-- This used to return false without closing when the preview marker could not
+-- be published, on the reasoning that a stuck marker is the more dangerous
+-- state. It is not, and the reasoning does not survive contact with what
+-- actually happens: refusing to close does not clear the marker either, so it
+-- stays exactly as stuck -- and now the player is stuck with it, holding a
+-- panel that swallows every button (handleButton consumes everything while
+-- isOpen) over a start menu they can no longer use. Back does nothing, Escape
+-- does nothing, and there is no mouse path out. That is the "I can use the
+-- menu but I cannot close it" report.
+--
+-- It needed no exotic conditions. The marker was addressed to one named mod
+-- that this menu does not require and does not ship with, so on any install
+-- without that folder io.open failed and the very first Back press trapped the
+-- player. The marker is now addressed only to a mod that asked for it, and
+-- either way a marker is never worth the way out.
 function Panel.close()
-    if not publishGaugePreview(false) then
-        -- Leaving the panel open is the fail-closed state: GaugeNumbers must
-        -- never remain mounted in the menu because the marker could not be
-        -- cleared.
-        log("GaugeNumbers preview close blocked; marker was not cleared")
-        return false
-    end
+    setPreviewOwner(nil)
     isOpen = false
     destroyPanel()
     expandedMod = nil
