@@ -2099,23 +2099,20 @@ ensureInputHooks = function()
                 pcall(refreshRailPosition, context)
             end
 
-            -- While the panel is up, watch and report — never correct.
+            -- While the panel is up, defer native selection cleanup until the
+            -- matching post-hook.
             --
-            -- This used to pull focus back to the Mods row, which fed itself:
-            -- re-focusing moved the focus, that raised this event again on the
-            -- next frame, and the pair looped for as long as the panel stayed
-            -- open, logging every frame. A re-entrancy flag did not help,
-            -- because the repeat arrives a frame later with the flag already
-            -- cleared. Disabling the native widgets' input is the actual fix; if
-            -- focus still moves, that fix did not take and saying so once is
-            -- worth more than fighting it.
+            -- The authored list applies its selection animation inside
+            -- FocusEvent, after this pre-hook. Mark this exact event for a
+            -- post-hook cleanup; clearing here is too early and lets the native
+            -- selector reappear beside the modal panel. Do not refocus Mods:
+            -- that raises another FocusEvent on the next frame and loops.
             if panel.isOpen() then
-                pendingFocusRedirects[listKey] = nil
-                pcall(resetNativeSelection, context)
+                pendingFocusRedirects[listKey] = "panel_selection_reset"
                 if not warnedFocusWhilePanelOpen then
                     warnedFocusWhilePanelOpen = true
-                    log("native focus is still moving with the panel open; " ..
-                        "the input disable did not take on this build")
+                    dbg("native FocusEvent reached the modal panel; " ..
+                        "clearing its selection post-event")
                 end
                 return
             end
@@ -2195,6 +2192,25 @@ ensureInputHooks = function()
             local redirect = pendingFocusRedirects[listKey]
             if redirect == nil then return end
             pendingFocusRedirects[listKey] = nil
+
+            if redirect == "panel_selection_reset" then
+                local context = activeContext
+                if context == nil or context.listKey ~= listKey then
+                    reportRailError(
+                        "modal native-selection reset lost its rail context")
+                    return
+                end
+                if not panel.isOpen() then return end
+                local reset, resetError = xpcall(function()
+                    resetNativeSelection(context)
+                end, debug.traceback)
+                if not reset then
+                    reportRailError("modal native-selection reset failed: " ..
+                        tostring(resetError))
+                end
+                return
+            end
+
             if activeContext ~= nil and not panel.isOpen() then
                 local rows, railError = collectRailRows(activeContext)
                 if rows == nil then
