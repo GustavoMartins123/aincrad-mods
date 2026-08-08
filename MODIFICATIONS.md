@@ -529,7 +529,7 @@ Changed above.
 **Original archive:** None of the six Nexus baselines contains ModMenu or
 `ModMenuBridge.lua`
 
-**Current script version:** v1.7.2
+**Current script version:** v1.5.8
 
 ### Added
 
@@ -577,6 +577,13 @@ Changed above.
 - Fixed Equipment-to-Mods and Mods-to-Equipment focus asymmetry.
 - Fixed mod-header toggles changing the wrong mod's enable marker.
 - Fixed custom rows writing invalid native list indexes.
+- Fixed SAO Battle Equipment, Field Equipment and other injected rows pushing
+  Mods outside controller/keyboard navigation. The bridge now follows the live
+  visual rail by UObject identity, excludes a hidden authored row directly, and
+  owns directional hand-offs without requiring cooperation from another mod.
+- Added direct `ClickEventNotify`, LMB geometry and hovered/focused Enter paths
+  for the injected Mods row. All three are event-driven; none polls the cursor
+  or widget tree per frame.
 - Fixed lobby-to-mission transitions requiring manual OFF/ON cycles. Each
   loaded mod now retains its persisted setting while map-owned references are
   invalidated and reacquired.

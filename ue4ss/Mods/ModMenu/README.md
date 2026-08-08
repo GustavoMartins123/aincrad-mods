@@ -1,6 +1,6 @@
 # ModMenu
 
-ModMenu **v1.5.7** adds a native-styled **Mods** entry to Echoes of Aincrad's
+ModMenu **v1.5.8** adds a native-styled **Mods** entry to Echoes of Aincrad's
 Start Menu.
 
 It discovers installed UE4SS Lua mods directly from the `Mods` directory. Every
@@ -50,6 +50,10 @@ starts from a clean `Mods` directory state.
 
 Open the Start Menu, move below its final native or modded row to **Mods**, and
 confirm.
+
+The Start Menu row supports D-pad/stick navigation, keyboard arrows and Enter,
+and a direct left-click across the row wrapper. Enter also opens it while the
+mouse is over the row.
 
 - `Up/Down` moves through the panel.
 - `Enter` expands a mod or toggles a boolean setting.
@@ -304,8 +308,11 @@ list arrays cannot be grown safely from UE4SS Lua, so each custom row uses a
 `MenuIcon` clone in a donor wrapper outside those arrays. Only the navigation
 boundaries are bridged.
 
-ModMenu waits for other injected entries, keeps its row at the bottom and
-returns upward focus to the row directly above it.
+ModMenu reads the live rail by wrapper/icon identity on input and focus events,
+excludes hidden authored rows directly, and bridges Up/Down across every visible
+native or injected neighbour. Other Start Menu mods do not need to know that
+ModMenu exists or assign compatible indexes. The Mods row is kept at the bottom.
+There is no rail polling or per-frame widget scan.
 
 ## Diagnostics
 
@@ -313,7 +320,7 @@ The UE4SS console exposes these read-only commands:
 
 ```text
 modmenu list       show discovered mods and their current values
-modmenu probe      dump the live Start Menu widget tree
+modmenu probe      dump the widget tree, visible rail order and hidden native rows
 modmenu buttons    enable or disable input-button diagnostic logging
 ```
 

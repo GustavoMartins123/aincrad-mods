@@ -1,4 +1,4 @@
--- ModMenu v1.5.7
+-- ModMenu v1.5.8
 -- Adds a native-styled "Mods" entry to Echoes of Aincrad's start menu, opening a
 -- panel that enables/disables the other mods and retunes their values in-game.
 --
@@ -12,7 +12,7 @@
 -- mod's Lua state, because UE4SS gives each mod its own.
 
 local MOD_NAME = "ModMenu"
-local MOD_VERSION = "v1.5.7"
+local MOD_VERSION = "v1.5.8"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -127,6 +127,7 @@ local ensureInputHooks
 -- into "enter the Mods row" instead.
 local listFocusIndexes = {}
 local pendingFocusRedirects = {}
+local lastRailError = nil
 -- Reported once per panel session rather than once per frame.
 local warnedFocusWhilePanelOpen = false
 
@@ -168,6 +169,37 @@ end
 
 local function contains(value, fragment)
     return string.find(tostring(value or ""), fragment, 1, true) ~= nil
+end
+
+local function menuContextIsMounted(context)
+    if context == nil or not isValid(context.mainMenu)
+        or not isValid(context.wrapperPanel) or not isValid(context.wrapperParent) then
+        return false
+    end
+
+    local menuVisible = false
+    local rowVisible = false
+    pcall(function() menuVisible = context.mainMenu:IsVisible() == true end)
+    pcall(function() rowVisible = context.wrapperPanel:IsVisible() == true end)
+    if not menuVisible or not rowVisible then return false end
+
+    local attachedParent = nil
+    pcall(function() attachedParent = context.wrapperPanel.Slot.Parent end)
+    if not isValid(attachedParent)
+        or objectName(attachedParent) ~= objectName(context.wrapperParent) then
+        return false
+    end
+
+    local component = nil
+    pcall(function()
+        component = dereferenceWeakObject(context.mainMenu.ParentComponent)
+    end)
+    if not isValid(component) then return false end
+
+    local mounted = nil
+    pcall(function() mounted = component:GetWidget() end)
+    return isValid(mounted)
+        and objectName(mounted) == objectName(context.mainMenu)
 end
 
 --========================================================--
@@ -320,12 +352,16 @@ end
 local function resolveNativeMenuCount(mainMenu, mainList)
     local finalNativeIndex = nil
     pcall(function() finalNativeIndex = tonumber(mainMenu.NumContent) end)
-    local count = finalNativeIndex ~= nil and finalNativeIndex + 1 or nil
-    if count == nil or count < 1 or count > MAX_NATIVE_MENU_ITEMS then
-        count = 0
-        for index = 0, MAX_NATIVE_MENU_ITEMS - 1 do
-            local item = menuItemAndPanel(mainList, index)
-            if isValid(item) then count = index + 1 end
+    if finalNativeIndex == nil or finalNativeIndex % 1 ~= 0
+        or finalNativeIndex < 0 or finalNativeIndex >= MAX_NATIVE_MENU_ITEMS then
+        return nil, "canonical NumContent is invalid: " .. tostring(finalNativeIndex)
+    end
+
+    local count = finalNativeIndex + 1
+    for index = 0, count - 1 do
+        local item, wrapper = menuItemAndPanel(mainList, index)
+        if not isValid(item) or not isValid(wrapper) then
+            return nil, "authored menu row " .. tostring(index) .. " is unavailable"
         end
     end
 
@@ -336,11 +372,14 @@ local function resolveNativeMenuCount(mainMenu, mainList)
         local previousVisibility = nil
         pcall(function() visibility = wrapper:GetVisibility() end)
         pcall(function() previousVisibility = previousWrapper:GetVisibility() end)
+        if visibility == nil or previousVisibility == nil then
+            return nil, "authored row visibility is unavailable"
+        end
         if visibility ~= COLLAPSED and visibility ~= HIDDEN then break end
         if previousVisibility == COLLAPSED or previousVisibility == HIDDEN then break end
         count = count - 1
     end
-    return count
+    return count, nil
 end
 
 local function iconInsideWrapper(wrapper)
@@ -360,7 +399,7 @@ end
 
 -- Counts the rows other mods have already appended to this rail, so the Mods
 -- entry lands underneath them with a matching item index.
-local function countForeignInjectedRows(parent, mainList, nativeCount)
+local function countForeignInjectedRows(parent, mainList)
     local authored = {}
     -- The full authored range, not just the active rows. Progression hides the
     -- final entry (Logout) without removing its wrapper, so stopping at
@@ -370,65 +409,151 @@ local function countForeignInjectedRows(parent, mainList, nativeCount)
     -- is not the last visible one.
     for index = 0, MAX_NATIVE_MENU_ITEMS - 1 do
         local _, wrapper = menuItemAndPanel(mainList, index)
-        if isValid(wrapper) then authored[objectName(wrapper)] = true end
+        if not isValid(wrapper) then
+            return nil, "authored wrapper " .. tostring(index) .. " is unavailable"
+        end
+        authored[objectName(wrapper)] = true
     end
 
     local childCount = nil
     pcall(function() childCount = parent:GetChildrenCount() end)
-    if type(childCount) ~= "number" then return 0 end
+    if type(childCount) ~= "number" then
+        return nil, "rail child count is unavailable"
+    end
 
     local foreign = 0
     for index = 0, childCount - 1 do
         local child = nil
         pcall(function() child = parent:GetChildAt(index) end)
-        if isValid(child) and not authored[objectName(child)]
-            and iconInsideWrapper(child) ~= nil then
-            foreign = foreign + 1
+        if not isValid(child) then
+            return nil, "rail child " .. tostring(index) .. " is unavailable"
         end
-    end
-    return foreign
-end
-
--- True when another mod's injected row sits above this one on the rail.
---
--- The boundary with the native rows belongs to whichever injected row is
--- physically first, and that has to be re-read from the live tree on every
--- press. foreignRows only says how many other injected rows exist, not where
--- they are, so gating on it made this mod stand down whenever any other row was
--- present at all -- while FastTravelMod had recorded at injection time that it
--- was not the first injected row and had stood down too. On a floor, where both
--- mods inject, that left nobody carrying focus off the last native row and
--- neither custom row could be reached. In town the pair never met, because with
--- no travel destination FastTravelMod injects nothing.
-local function hasInjectedRowAbove(context)
-    if context == nil then return false end
-    local parent = context.wrapperParent
-    if not isValid(parent) or not isValid(context.wrapperPanel) then return false end
-
-    local childCount = nil
-    pcall(function() childCount = parent:GetChildrenCount() end)
-    if type(childCount) ~= "number" then return false end
-
-    local authored = {}
-    for index = 0, MAX_NATIVE_MENU_ITEMS - 1 do
-        local _, wrapper = menuItemAndPanel(context.mainList, index)
-        if isValid(wrapper) then authored[objectName(wrapper)] = true end
-    end
-
-    local ownKey = objectName(context.wrapperPanel)
-    for index = 0, childCount - 1 do
-        local child = nil
-        pcall(function() child = parent:GetChildAt(index) end)
-        if isValid(child) then
-            local key = objectName(child)
-            -- Reaching our own row first means everything above it is native.
-            if key == ownKey then return false end
-            if not authored[key] and iconInsideWrapper(child) ~= nil then
-                return true
+        if not authored[objectName(child)] and iconInsideWrapper(child) ~= nil then
+            local visibility = nil
+            pcall(function() visibility = child:GetVisibility() end)
+            if visibility == nil then
+                return nil, "rail row visibility is unavailable"
+            end
+            if visibility ~= COLLAPSED and visibility ~= HIDDEN then
+                foreign = foreign + 1
             end
         end
     end
-    return false
+    return foreign, nil
+end
+
+-- Builds the navigable rail from the live widget tree. Authored and injected
+-- rows are identified by UObject identity; ItemIndex is presentation metadata
+-- only and never decides which row exists or which row is adjacent. A hidden
+-- authored row (normally Item_6/Logout) is excluded directly by its wrapper's
+-- visibility, including when another mod has assigned indexes beyond it.
+--
+-- This walk happens only on input/focus/reconciliation events. The rail has at
+-- most a handful of children, so coexistence has no per-frame cost.
+local function collectRailRows(context)
+    if context == nil or not isValid(context.mainList)
+        or not isValid(context.wrapperParent) or not isValid(context.wrapperPanel) then
+        return nil, "rail context is unavailable"
+    end
+
+    local authored = {}
+    for index = 0, MAX_NATIVE_MENU_ITEMS - 1 do
+        local item, wrapper = menuItemAndPanel(context.mainList, index)
+        if not isValid(item) or not isValid(wrapper) then
+            return nil, "authored row " .. tostring(index) .. " is unavailable"
+        end
+        authored[objectName(wrapper)] = {
+            icon = item,
+            nativeIndex = index,
+        }
+    end
+
+    local childCount = nil
+    pcall(function() childCount = context.wrapperParent:GetChildrenCount() end)
+    if type(childCount) ~= "number" then
+        return nil, "rail child count is unavailable"
+    end
+
+    local rows = {}
+    local iconKeys = {}
+    local ownSeen = false
+    local ownWrapperKey = objectName(context.wrapperPanel)
+    local injectedStarted = false
+    for position = 0, childCount - 1 do
+        local wrapper = nil
+        pcall(function() wrapper = context.wrapperParent:GetChildAt(position) end)
+        if not isValid(wrapper) then
+            return nil, "rail child " .. tostring(position) .. " is unavailable"
+        end
+
+        local visibility = nil
+        pcall(function() visibility = wrapper:GetVisibility() end)
+        if visibility == nil then
+            return nil, "rail row " .. tostring(position) .. " has no visibility"
+        end
+
+        local authoredRow = authored[objectName(wrapper)]
+        local icon = authoredRow and authoredRow.icon or iconInsideWrapper(wrapper)
+        if isValid(icon) and visibility ~= COLLAPSED and visibility ~= HIDDEN then
+            local injected = authoredRow == nil
+            if not injected and injectedStarted then
+                return nil, "an authored row appears below an injected row"
+            end
+            if injected then injectedStarted = true end
+
+            local iconKey = objectName(icon)
+            if iconKeys[iconKey] then
+                return nil, "duplicate rail icon identity: " .. tostring(iconKey)
+            end
+            iconKeys[iconKey] = true
+            local row = {
+                wrapper = wrapper,
+                icon = icon,
+                iconKey = iconKey,
+                injected = injected,
+                nativeIndex = authoredRow and authoredRow.nativeIndex or nil,
+            }
+            rows[#rows + 1] = row
+            if objectName(wrapper) == ownWrapperKey then ownSeen = true end
+        end
+    end
+
+    if not ownSeen then return nil, "Mods wrapper is not a visible rail row" end
+    if #rows == 0 or rows[1].injected then
+        return nil, "rail has no visible authored row"
+    end
+    return rows, nil
+end
+
+local function reportRailError(message)
+    message = tostring(message)
+    if lastRailError == message then return end
+    lastRailError = message
+    log("rail navigation unavailable: " .. message)
+end
+
+local function railRowForWidget(rows, widget)
+    if type(rows) ~= "table" or not isValid(widget) then return nil, nil end
+    local widgetKey = objectName(widget)
+    for index, row in ipairs(rows) do
+        if row.iconKey == widgetKey then return row, index end
+    end
+    return nil, nil
+end
+
+local function railBoundaries(rows)
+    local firstNative, lastNative = nil, nil
+    local firstInjected, lastInjected = nil, nil
+    for _, row in ipairs(rows or {}) do
+        if row.injected then
+            firstInjected = firstInjected or row
+            lastInjected = row
+        else
+            firstNative = firstNative or row
+            lastNative = row
+        end
+    end
+    return firstNative, lastNative, firstInjected, lastInjected
 end
 
 -- Draws a letter over the row instead of relying on a texture. The donor wrapper
@@ -566,11 +691,26 @@ local function refreshRailPosition(context)
         end
     end
 
-    -- countForeignInjectedRows counts every injected row including this one, so
-    -- the others are one fewer.
-    local injected = countForeignInjectedRows(parent, context.mainList, context.nativeCount)
-    local others = math.max(0, injected - 1)
-    local index = context.nativeCount + others
+    local rows, railError = collectRailRows(context)
+    if rows == nil then
+        reportRailError(railError)
+        return
+    end
+    lastRailError = nil
+
+    local ownRowPosition = nil
+    local injected = 0
+    for position, row in ipairs(rows) do
+        if row.injected then injected = injected + 1 end
+        if row.iconKey == context.iconKey then ownRowPosition = position end
+    end
+    if ownRowPosition == nil then
+        reportRailError("Mods icon is absent from the visible rail")
+        return
+    end
+
+    local others = injected - 1
+    local index = ownRowPosition - 1
     if index ~= context.modsIndex or others ~= context.foreignRows then
         context.modsIndex = index
         context.foreignRows = others
@@ -674,14 +814,17 @@ local function injectModsEntry(mainMenu)
     -- were rejected one layer up, in isCanonicalMainMenuCandidate, which is why
     -- that went unnoticed.
     local parentComponent = nil
-    local parentActor = nil
     pcall(function()
         parentComponent = dereferenceWeakObject(mainMenu.ParentComponent)
-        parentActor = dereferenceWeakObject(mainMenu.ParentActor)
     end)
-    if not isValid(parentComponent) and not isValid(parentActor) then
+    local mountedMenu = nil
+    if isValid(parentComponent) then
+        pcall(function() mountedMenu = parentComponent:GetWidget() end)
+    end
+    if not isValid(mountedMenu)
+        or objectName(mountedMenu) ~= objectName(mainMenu) then
         injectedMenus[menuKey] = false
-        log("ignored display-only main-menu overlay: " .. menuKey)
+        log("ignored unmounted/display-only main-menu overlay: " .. menuKey)
         return
     end
 
@@ -709,14 +852,22 @@ local function injectModsEntry(mainMenu)
         return
     end
 
-    local nativeCount = resolveNativeMenuCount(mainMenu, mainList)
+    local nativeCount, nativeCountError = resolveNativeMenuCount(mainMenu, mainList)
+    if nativeCount == nil then
+        log("cannot inject Mods entry: " .. tostring(nativeCountError))
+        return
+    end
     local lastItem = menuItemAndPanel(mainList, nativeCount - 1)
     if not isValid(lastItem) then
         log("cannot inject Mods entry: final active native item is unavailable")
         return
     end
 
-    local foreignRows = countForeignInjectedRows(parent, mainList, nativeCount)
+    local foreignRows, foreignRowsError = countForeignInjectedRows(parent, mainList)
+    if foreignRows == nil then
+        log("cannot inject Mods entry: " .. tostring(foreignRowsError))
+        return
+    end
     local modsIndex = nativeCount + foreignRows
 
     local iconClass = StaticFindObject(MAIN_MENU_ICON_CLASS)
@@ -813,7 +964,7 @@ local function resetNativeSelection(context)
         end)
     end
 
-    for index = 0, context.nativeCount - 1 do
+    for index = 0, MAX_NATIVE_MENU_ITEMS - 1 do
         local item = nil
         pcall(function() item = context.mainList["Item_" .. tostring(index)] end)
         resetItem(item)
@@ -828,7 +979,7 @@ local function resetNativeSelection(context)
         end)
     end)
 
-    for index = 0, context.nativeCount - 1 do
+    for index = 0, MAX_NATIVE_MENU_ITEMS - 1 do
         pcall(function()
             local item = context.mainList["Item_" .. tostring(index)]
             if isValid(item) then item:SetDefaultAnimation() end
@@ -838,17 +989,11 @@ end
 
 local function focusIcon(context, icon, index)
     if context == nil or not isValid(icon) then return end
-    -- Keep the focus tracker aligned with injected rows as well as authored rows.
-    -- The native list never receives a custom index, but the previous focus still
-    -- needs to know that the live rail is currently on Mods when the next native
-    -- FocusEvent arrives.
-    if type(index) == "number" and context.listKey ~= nil then
-        listFocusIndexes[context.listKey] = index
-    end
     -- CurrentIndex is the cursor into the currently active authored rows, not
-    -- every compiled Item_0..Item_6 slot. Equipment starts at nativeCount and
-    -- Mods follows it, so neither custom index may enter the native cursor.
+    -- every compiled Item_0..Item_6 slot. Only a row proved to be authored may
+    -- update it; injected ItemIndex values are never native cursor positions.
     if type(index) == "number" and index >= 0 and index < context.nativeCount then
+        if context.listKey ~= nil then listFocusIndexes[context.listKey] = index end
         pcall(function() context.mainList.CurrentIndex = index end)
     end
     pcall(function() icon:SetInactive(false) end)
@@ -865,13 +1010,21 @@ local function focusIcon(context, icon, index)
     end
 end
 
+local focusRailRow
+
 local function focusMods(context)
     if context == nil or not isValid(context.icon) then return end
-    -- The Mods row is outside the native animation array, so selecting it cannot
-    -- make the list deselect its own current row.
-    resetNativeSelection(context)
-    focusIcon(context, context.icon, context.modsIndex)
-    enforceIconLetter(context)
+    local rows, railError = collectRailRows(context)
+    if rows == nil then
+        reportRailError(railError)
+        return
+    end
+    local row = railRowForWidget(rows, context.icon)
+    if row == nil then
+        reportRailError("Mods icon is not a visible rail row")
+        return
+    end
+    focusRailRow(context, row)
 end
 
 local function clearModsSelection(context)
@@ -880,50 +1033,72 @@ local function clearModsSelection(context)
     enforceIconLetter(context)
 end
 
--- Upwards out of the Mods row lands on the row directly above it, which is
--- another mod's injected entry when one is present and the last native row
--- otherwise.
+focusRailRow = function(context, row)
+    if context == nil or row == nil or not isValid(row.icon) then return false end
+
+    local rows, railError = collectRailRows(context)
+    if rows == nil then
+        reportRailError(railError)
+        return false
+    end
+    lastRailError = nil
+
+    local liveRow = railRowForWidget(rows, row.icon)
+    if liveRow == nil then
+        reportRailError("focus target left the visible rail")
+        return false
+    end
+    row = liveRow
+
+    -- No authored animation knows about injected rows. Clear every non-target
+    -- injected icon explicitly, and clear the native array before focusing a
+    -- custom row so exactly one row is presented as selected.
+    for _, candidate in ipairs(rows) do
+        if candidate.injected and candidate.iconKey ~= row.iconKey then
+            pcall(function() candidate.icon:SetDefaultAnimation() end)
+        end
+    end
+
+    if row.injected then
+        resetNativeSelection(context)
+        focusIcon(context, row.icon, nil)
+    else
+        clearModsSelection(context)
+        focusIcon(context, row.icon, row.nativeIndex)
+    end
+    if row.iconKey == context.iconKey then enforceIconLetter(context) end
+    return true
+end
+
+local function moveFromRailWidget(context, widget, delta)
+    if context == nil or not isValid(widget) then return false end
+    pcall(refreshRailPosition, context)
+
+    local rows, railError = collectRailRows(context)
+    if rows == nil then
+        reportRailError(railError)
+        return false
+    end
+    local _, current = railRowForWidget(rows, widget)
+    if current == nil then
+        reportRailError("input widget is not a visible rail row")
+        return false
+    end
+
+    local target = current + delta
+    if target < 1 then target = #rows end
+    if target > #rows then target = 1 end
+    return focusRailRow(context, rows[target])
+end
+
 local function focusRowAbove(context)
     if context == nil then return end
-    pcall(refreshRailPosition, context)
-    clearModsSelection(context)
-
-    -- A custom rail row sits outside the authored animation array. Reset every
-    -- native row before handing focus to it so the result is independent of the
-    -- direction from which Mods was entered.
-    for index = 0, context.nativeCount - 1 do
-        pcall(function()
-            local item = context.mainList["Item_" .. tostring(index)]
-            item:StopAllAnimations()
-            item:SetDefaultAnimation()
-        end)
-    end
-
-    if context.foreignRows > 0 then
-        local parent = context.wrapperParent
-        local count = nil
-        pcall(function() count = parent:GetChildrenCount() end)
-        local previousIcon = nil
-        for index = 0, (tonumber(count) or 0) - 1 do
-            local child = nil
-            pcall(function() child = parent:GetChildAt(index) end)
-            if isValid(child) then
-                if objectName(child) == objectName(context.wrapperPanel) then break end
-                local candidate = iconInsideWrapper(child)
-                if candidate ~= nil then previousIcon = candidate end
-            end
-        end
-        if isValid(previousIcon) then
-            focusIcon(context, previousIcon, context.modsIndex - 1)
-            return
-        end
-    end
-    focusIcon(context, context.lastItem, context.nativeCount - 1)
+    moveFromRailWidget(context, context.icon, -1)
 end
 
 local function focusFirstNative(context)
-    clearModsSelection(context)
-    focusIcon(context, context.firstItem, 0)
+    if context == nil then return end
+    moveFromRailWidget(context, context.icon, 1)
 end
 
 -- The panel is modal. Disable the native list, all authored entries and every
@@ -1029,6 +1204,65 @@ end
 local function isModsIcon(widget)
     if activeContext == nil or not isValid(widget) then return false end
     return objectName(widget) == activeContext.iconKey
+end
+
+local function isNavigationFocused(widget)
+    if not isValid(widget) then return nil, "focus widget is unavailable" end
+    local focused = nil
+    local ok, focusError = pcall(function()
+        focused = widget:HasAnyUserFocus()
+    end)
+    if not ok or type(focused) ~= "boolean" then
+        return nil, "HasAnyUserFocus is unreadable: " .. tostring(focusError)
+    end
+    return focused, nil
+end
+
+-- Mouse delegates are registered by the native list for authored rows, not for
+-- a clone appended outside its arrays. Hit-test the exact visible Mods wrapper
+-- on LMB/Enter events, using the reflected Slate geometry API. This is an input
+-- event path, not a cursor poll.
+local function isMouseOverModsRow(context)
+    if context == nil or not isValid(context.icon)
+        or not isValid(context.wrapperPanel) then
+        return nil, "Mods row is unavailable"
+    end
+    local slateLibrary = StaticFindObject(
+        "/Script/UMG.Default__SlateBlueprintLibrary")
+    if not isValid(slateLibrary) then
+        return nil, "SlateBlueprintLibrary is unavailable"
+    end
+
+    local under = nil
+    local hitOk, hitError = pcall(function()
+        local geometry = context.wrapperPanel:GetCachedGeometry()
+        local mousePosition = context.icon:GetScreenMousePosition()
+        under = slateLibrary:IsUnderLocation(geometry, mousePosition)
+    end)
+    if not hitOk or type(under) ~= "boolean" then
+        return nil, "Mods row hit-test failed: " .. tostring(hitError)
+    end
+    return under, nil
+end
+
+local function focusedInjectedRailRow(context)
+    local rows, railError = collectRailRows(context)
+    if rows == nil then return nil, railError end
+
+    local focusedRow = nil
+    for _, row in ipairs(rows) do
+        if row.injected then
+            local focused, focusError = isNavigationFocused(row.icon)
+            if focused == nil then return nil, focusError end
+            if focused then
+                if focusedRow ~= nil then
+                    return nil, "more than one injected row reports navigation focus"
+                end
+                focusedRow = row
+            end
+        end
+    end
+    return focusedRow, nil
 end
 
 --========================================================--
@@ -1171,9 +1405,7 @@ local function reconcileRailAfterPanel(context, expectNewRows)
             -- detached with nowhere to go back to, and these passes run for two
             -- seconds after the panel closes -- long enough to still be firing
             -- while the menu is on its way out.
-            local onScreen = false
-            pcall(function() onScreen = context.mainMenu:IsInViewport() == true end)
-            if not isValid(context.mainMenu) or not onScreen then return end
+            if not menuContextIsMounted(context) then return end
 
             pcall(refreshRailPosition, context)
         end
@@ -1217,9 +1449,8 @@ local function closePanel()
 
         if activeContext ~= nil then
             pcall(setNativeMenuInputEnabled, activeContext, true)
-            -- Reconcile the rail before handing focus back, not after: focusMods
-            -- uses context.modsIndex, and that index is exactly what goes stale
-            -- when another row appears.
+            -- Reconcile the rail before handing focus back, so the live physical
+            -- order is authoritative when focusMods resolves its exact row.
             reconcileRailAfterPanel(activeContext, started > 0)
             pcall(focusMods, activeContext)
         end
@@ -1342,11 +1573,30 @@ local function handleButton(widgetParameter, buttonParameter)
 
     if not isValid(widget) then return end
 
-    if isModsIcon(widget) then
-        local direction = directionOf(button)
+    local context = activeContext
+    if context == nil then return end
+    local widgetName = objectName(widget)
+    if not isModsIcon(widget) and not contains(widgetName, MENU_ICON_FRAGMENT) then
+        return
+    end
+
+    local rows, railError = collectRailRows(context)
+    if rows == nil then
+        reportRailError(railError)
+        return
+    end
+    lastRailError = nil
+    local row = railRowForWidget(rows, widget)
+    if row == nil then return end
+
+    local direction = directionOf(button)
+    if row.iconKey == context.iconKey then
         if button == ACCEPT_BUTTON then
             consumeButton(buttonParameter)
-            openPanel()
+            -- Keyboard Enter can reach both this hook and the direct keybind.
+            -- Taking the shared lock here prevents the same physical press from
+            -- opening the panel and immediately activating its first row.
+            withInputLock(openPanel)
         elseif button == BACK_BUTTON then
             consumeButton(buttonParameter)
             -- Match Equipment's proven close path: leave the native input hook
@@ -1354,8 +1604,8 @@ local function handleButton(widgetParameter, buttonParameter)
             ExecuteWithDelay(0, closeMainMenuFromMods)
         elseif direction == "up" then
             consumeButton(buttonParameter)
-            -- Mods owns both of its boundaries. Depending on another mod's hook
-            -- order here made Up work or fail nondeterministically.
+            -- Physical adjacency is owned here, independent of another mod's
+            -- hook order or its cached custom index.
             withInputLock(function() focusRowAbove(activeContext) end)
         elseif direction == "down" then
             consumeButton(buttonParameter)
@@ -1370,25 +1620,22 @@ local function handleButton(widgetParameter, buttonParameter)
         return
     end
 
-    -- Downwards off the last row on the rail wraps into Mods. When another mod
-    -- owns the row directly above the native ones, that mod claims this boundary
-    -- and hands focus down over itself, so only the case where Mods is the first
-    -- injected row is claimed here.
-    local context = activeContext
-    if context == nil then return end
-    if not contains(objectName(widget), "WBP_Console_MainMenu_List_C") then return end
-    if hasInjectedRowAbove(context) then return end
-
-    local index = nil
-    pcall(function() index = widget:GetItemIndex() end)
-    if index == nil then return end
-
-    local direction = directionOf(button)
-    local down = direction == "down"
-    local up = direction == "up"
-    if (down and index == context.modsIndex - 1) or (up and index == 0) then
+    -- ModMenu owns only directional hand-offs between physical rail rows. It
+    -- never consumes Accept/Back on another mod's icon, so that row retains its
+    -- own action while no longer needing special knowledge of its neighbours.
+    if row.injected and (direction == "up" or direction == "down") then
         consumeButton(buttonParameter)
-        withInputLock(function() focusMods(context) end)
+        local delta = direction == "up" and -1 or 1
+        withInputLock(function() moveFromRailWidget(context, widget, delta) end)
+        return
+    end
+
+    local firstNative, lastNative = railBoundaries(rows)
+    if (direction == "down" and row == lastNative)
+        or (direction == "up" and row == firstNative) then
+        consumeButton(buttonParameter)
+        local delta = direction == "up" and -1 or 1
+        withInputLock(function() moveFromRailWidget(context, widget, delta) end)
     end
 end
 
@@ -1409,19 +1656,15 @@ local function isCanonicalMainMenuCandidate(mainMenu)
         return false
     end
 
-    local inViewport = false
     local parentComponent = nil
-    local parentActor = nil
-    pcall(function() inViewport = mainMenu:IsInViewport() end)
     pcall(function()
         parentComponent = dereferenceWeakObject(mainMenu.ParentComponent)
-        parentActor = dereferenceWeakObject(mainMenu.ParentActor)
     end)
 
     -- The interactive start menu is canonically owned by the game's world-space
-    -- widget component/actor. Field Equipment's display-only copy and detached
-    -- objects from a discarded world have neither owner and are rejected.
-    return isValid(parentComponent) or isValid(parentActor)
+    -- widget component. Field Equipment's display-only copy and detached
+    -- objects from a discarded world have no such owner and are rejected.
+    return isValid(parentComponent)
 end
 
 local function resolveMainMenuByKey(menuKey)
@@ -1738,36 +1981,96 @@ ensureInputHooks = function()
 
             local widget = unwrap(widgetParameter)
             if not isValid(widget) then return end
-            if not isModsIcon(widget) then clearModsSelection(context) end
 
-            local index = nil
-            pcall(function() index = widget:GetItemIndex() end)
+            local rows, railError = collectRailRows(context)
+            if rows == nil then
+                pendingFocusRedirects[listKey] = nil
+                reportRailError(railError)
+                return
+            end
+            lastRailError = nil
+
+            local row = railRowForWidget(rows, widget)
+            if row ~= nil and row.injected then
+                if row.iconKey ~= context.iconKey then clearModsSelection(context) end
+                pendingFocusRedirects[listKey] = nil
+                return
+            end
+            clearModsSelection(context)
+
+            local index = row and row.nativeIndex or nil
+            if index == nil then
+                -- A hidden authored row is absent from `rows`. Recognise it by
+                -- exact UObject identity, never by a stale/custom ItemIndex.
+                local widgetKey = objectName(widget)
+                for authoredIndex = 0, MAX_NATIVE_MENU_ITEMS - 1 do
+                    local authoredItem = menuItemAndPanel(
+                        context.mainList, authoredIndex)
+                    if isValid(authoredItem)
+                        and objectName(authoredItem) == widgetKey then
+                        index = authoredIndex
+                        break
+                    end
+                end
+            end
             if index == nil then return end
 
             local previousIndex = listFocusIndexes[listKey]
             listFocusIndexes[listKey] = index
-
-            -- When another mod owns the row directly above the native ones it
-            -- drives this boundary itself, and stealing focus here would fight
-            -- it. Asked of the live rail, not of the injection-time count.
-            if hasInjectedRowAbove(context) then return end
-
-            local lastNativeIndex = context.modsIndex - 1
-            local wrappedDown = previousIndex == lastNativeIndex and index == 0
-            local wrappedUp = previousIndex == 0 and index == lastNativeIndex
-            if wrappedDown or wrappedUp then
-                pendingFocusRedirects[listKey] = true
+            local firstNative, lastNative, firstInjected, lastInjected =
+                railBoundaries(rows)
+            if firstNative == nil or lastNative == nil
+                or firstInjected == nil or lastInjected == nil then
+                pendingFocusRedirects[listKey] = nil
+                reportRailError("rail boundaries are incomplete")
+                return
             end
-            dbg(string.format("focus %s -> %s (last native %d)%s",
-                tostring(previousIndex), tostring(index), lastNativeIndex,
-                (wrappedDown or wrappedUp) and " => redirect to Mods" or ""))
+
+            local redirect = nil
+            if previousIndex == lastNative.nativeIndex
+                and index == firstNative.nativeIndex then
+                redirect = "first"
+            elseif previousIndex == firstNative.nativeIndex
+                and index == lastNative.nativeIndex then
+                redirect = "last"
+            elseif row == nil and previousIndex == lastNative.nativeIndex then
+                redirect = "first"
+            elseif row == nil and previousIndex == firstNative.nativeIndex then
+                redirect = "last"
+            end
+            pendingFocusRedirects[listKey] = redirect
+            dbg(string.format("focus %s -> %s%s",
+                tostring(previousIndex), tostring(index),
+                redirect and (" => redirect to " .. redirect ..
+                    " injected row") or ""))
         end,
         function(self)
             local listKey = objectName(unwrap(self))
-            if pendingFocusRedirects[listKey] ~= true then return end
+            local redirect = pendingFocusRedirects[listKey]
+            if redirect == nil then return end
             pendingFocusRedirects[listKey] = nil
             if activeContext ~= nil and not panel.isOpen() then
-                focusMods(activeContext)
+                local rows, railError = collectRailRows(activeContext)
+                if rows == nil then
+                    reportRailError(railError)
+                    return
+                end
+                local _, _, firstInjected, lastInjected = railBoundaries(rows)
+                local target = redirect == "first" and firstInjected or lastInjected
+                if target == nil then
+                    reportRailError("focus redirect has no injected target")
+                    return
+                end
+                focusRailRow(activeContext, target)
+            end
+        end)
+
+    safeHook("/Script/ROD.RODInputWidgetBase:ClickEventNotify",
+        function(self, widgetParameter, buttonParameter, _)
+            local widget = unwrap(widgetParameter)
+            if isModsIcon(widget) or isModsIcon(unwrap(self)) then
+                consumeButton(buttonParameter)
+                openPanel()
             end
         end)
 
@@ -1827,14 +2130,78 @@ end
 
 -- Controller input reaches the panel through the button hooks above. Keyboard
 -- arrows do not always travel that path, so they are bound directly and gated on
--- the panel being open.
+-- either the panel being open or an injected rail row owning navigation focus.
 -- `locked` false runs the action every time, for the same reason Back bypasses
 -- the lock in routeToPanel: a keypress that only closes something must not be
 -- dropped because another press is inside its 60ms window.
-local function bindPanelKey(key, action, locked)
+local function activeRailContext()
+    local context = activeContext
+    if not menuContextIsMounted(context) or not isValid(context.icon) then return nil end
+    return context
+end
+
+local function moveFocusedInjectedRow(delta)
+    local context = activeRailContext()
+    if context == nil then return end
+    local row, focusError = focusedInjectedRailRow(context)
+    if focusError ~= nil then
+        reportRailError(focusError)
+        return
+    end
+    if row == nil then return end
+    withInputLock(function()
+        moveFromRailWidget(context, row.icon, delta)
+    end)
+end
+
+local function activateModsFromKeyboard()
+    local context = activeRailContext()
+    if context == nil then return end
+
+    local focused, focusError = isNavigationFocused(context.icon)
+    if focused == nil then
+        reportRailError(focusError)
+        return
+    end
+    if not focused then
+        local hovered, hoverError = isMouseOverModsRow(context)
+        if hovered == nil then
+            reportRailError(hoverError)
+            return
+        end
+        if not hovered then return end
+    end
+
+    withInputLock(function()
+        focusMods(context)
+        openPanel()
+    end)
+end
+
+local function activateModsFromMouse()
+    if panel.isOpen() then return end
+    local context = activeRailContext()
+    if context == nil then return end
+    local hovered, hoverError = isMouseOverModsRow(context)
+    if hovered == nil then
+        reportRailError(hoverError)
+        return
+    end
+    if not hovered then return end
+
+    withInputLock(function()
+        focusMods(context)
+        openPanel()
+    end)
+end
+
+local function bindPanelKey(key, action, locked, railAction)
     local ok, err = pcall(function()
         RegisterKeyBind(key, function()
-            if not panel.isOpen() then return end
+            if not panel.isOpen() then
+                if railAction ~= nil then ExecuteInGameThread(railAction) end
+                return
+            end
             -- Shares the lock with the button hooks: the same keypress often
             -- arrives through both paths.
             ExecuteInGameThread(function()
@@ -1868,22 +2235,86 @@ end
 -- same code either way. A second keyboard key costs nothing and removes the
 -- single point of failure.
 for _, binding in ipairs({
-    { "UP_ARROW", function() panel.move(-1) end, true },
-    { "DOWN_ARROW", function() panel.move(1) end, true },
+    { "UP_ARROW", function() panel.move(-1) end, true,
+        function() moveFocusedInjectedRow(-1) end },
+    { "DOWN_ARROW", function() panel.move(1) end, true,
+        function() moveFocusedInjectedRow(1) end },
     { "LEFT_ARROW", function() panel.adjust(-1) end, true },
     { "RIGHT_ARROW", function() panel.adjust(1) end, true },
-    { "RETURN", function() panel.activate() end, true },
+    { "RETURN", function() panel.activate() end, true,
+        activateModsFromKeyboard },
     { "ESCAPE", function() closePanel() end, false },
     { "BACKSPACE", function() closePanel() end, false },
 }) do
     local code = keyCode(binding[1])
-    if code ~= nil then bindPanelKey(code, binding[2], binding[3]) end
+    if code ~= nil then
+        bindPanelKey(code, binding[2], binding[3], binding[4])
+    end
+end
+
+do
+    local mouseCode = keyCode("LEFT_MOUSE_BUTTON")
+    if mouseCode ~= nil then
+        local mouseOk, mouseError = pcall(function()
+            RegisterKeyBind(mouseCode, function()
+                ExecuteInGameThread(activateModsFromMouse)
+            end)
+        end)
+        if not mouseOk then
+            log("left-mouse bridge unavailable: " .. tostring(mouseError))
+        end
+    end
 end
 
 --========================================================--
 --                   CONSOLE COMMAND                      --
 --========================================================--
 -- Read-only diagnostics only. State changes have one canonical path: the panel.
+
+local function probeRail(emit)
+    local context = activeContext
+    if context == nil then
+        emit("rail: no active Mods context")
+        return
+    end
+    emit("rail mounted: " .. tostring(menuContextIsMounted(context)))
+
+    local rows, railError = collectRailRows(context)
+    if rows == nil then
+        emit("rail unavailable: " .. tostring(railError))
+        return
+    end
+
+    for position, row in ipairs(rows) do
+        local label = nil
+        local itemIndex = nil
+        local focused = nil
+        pcall(function() label = row.icon.MenuName:GetText():ToString() end)
+        pcall(function() itemIndex = row.icon:GetItemIndex() end)
+        pcall(function() focused = row.icon:HasAnyUserFocus() end)
+        emit(string.format(
+            "rail[%d] %s label=%s item=%s native=%s focus=%s",
+            position - 1,
+            row.injected and "injected" or "authored",
+            tostring(label),
+            tostring(itemIndex),
+            tostring(row.nativeIndex),
+            tostring(focused)))
+    end
+
+    for index = 0, MAX_NATIVE_MENU_ITEMS - 1 do
+        local item, wrapper = menuItemAndPanel(context.mainList, index)
+        if isValid(item) and isValid(wrapper) then
+            local visibility = nil
+            pcall(function() visibility = wrapper:GetVisibility() end)
+            if visibility == COLLAPSED or visibility == HIDDEN then
+                emit(string.format(
+                    "authored Item_%d excluded by visibility=%s identity=%s",
+                    index, tostring(visibility), objectName(item)))
+            end
+        end
+    end
+end
 
 local function runCommand(params, reply)
     local sub = params[1] and string.lower(tostring(params[1])) or "list"
@@ -1925,7 +2356,11 @@ local function runCommand(params, reply)
     end
 
     if sub == "probe" then
-        ExecuteInGameThread(function() panel.probe(function(line) log(line) end) end)
+        ExecuteInGameThread(function()
+            local function emit(line) log(line) end
+            panel.probe(emit)
+            probeRail(emit)
+        end)
         reply("probe written to the UE4SS log")
         return
     end
