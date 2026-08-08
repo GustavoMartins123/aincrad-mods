@@ -1,6 +1,6 @@
 # ModMenu
 
-ModMenu **v1.5.9** adds a native-styled **Mods** entry to Echoes of Aincrad's
+ModMenu **v1.5.11** adds a native-styled **Mods** entry to Echoes of Aincrad's
 Start Menu.
 
 It discovers installed UE4SS Lua mods directly from the `Mods` directory. Every
@@ -51,9 +51,10 @@ starts from a clean `Mods` directory state.
 Open the Start Menu, move below its final native or modded row to **Mods**, and
 confirm.
 
-The Start Menu row supports D-pad/stick navigation, keyboard arrows and Enter,
-and a direct left-click across the row wrapper. Enter also opens it while the
-mouse is over the row.
+The Start Menu row supports D-pad/stick navigation, keyboard arrows and Enter.
+With the mouse, the first left-click selects Mods and the second confirms it,
+matching the native/Equipment interaction. Enter also opens it while the mouse
+is over the row.
 
 - `Up/Down` moves through the panel.
 - `Enter` expands a mod or toggles a boolean setting.

@@ -1,4 +1,4 @@
--- ModMenu v1.5.9
+-- ModMenu v1.5.11
 -- Adds a native-styled "Mods" entry to Echoes of Aincrad's start menu, opening a
 -- panel that enables/disables the other mods and retunes their values in-game.
 --
@@ -12,7 +12,7 @@
 -- mod's Lua state, because UE4SS gives each mod its own.
 
 local MOD_NAME = "ModMenu"
-local MOD_VERSION = "v1.5.9"
+local MOD_VERSION = "v1.5.11"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -69,6 +69,7 @@ end
 local VISIBLE = 0
 local COLLAPSED = 1
 local HIDDEN = 2
+local HIT_TEST_INVISIBLE = 3
 
 local SCRIPT_DIR = (function()
     local source = (debug.getinfo(1, "S") or {}).source or ""
@@ -586,6 +587,38 @@ local function authoredIndexForKey(context, widgetKey)
     return nil
 end
 
+-- Native submenus temporarily collapse every authored wrapper except the row
+-- being opened. In that state the rail is presentation-only: Settings can be
+-- both the first and last visible native row, so adjacency and wrap detection
+-- have no valid meaning. Item_6 is outside nativeCount and intentionally does
+-- not affect this check.
+local function nativeRailIsFullyPresented(context)
+    if context == nil or not isValid(context.mainList)
+        or type(context.nativeCount) ~= "number" then
+        return nil, "native rail context is unavailable"
+    end
+
+    local visible = 0
+    for index = 0, context.nativeCount - 1 do
+        local item, wrapper = menuItemAndPanel(context.mainList, index)
+        if not isValid(item) or not isValid(wrapper) then
+            return nil, "native row " .. tostring(index) .. " is unavailable"
+        end
+        local visibility = nil
+        local read, readError = pcall(function()
+            visibility = wrapper:GetVisibility()
+        end)
+        if not read or type(visibility) ~= "number" then
+            return nil, "native row " .. tostring(index) ..
+                " visibility is unreadable: " .. tostring(readError)
+        end
+        if visibility ~= COLLAPSED and visibility ~= HIDDEN then
+            visible = visible + 1
+        end
+    end
+    return visible == context.nativeCount, nil
+end
+
 -- Draws a letter over the row instead of relying on a texture. The donor wrapper
 -- is the CanvasPanel already proven to accept the Mods icon and a TextBlock.
 -- Avoid passing FAnchors from Lua: invalid native struct marshaling aborts the
@@ -630,7 +663,11 @@ local function applyIconLetter(context)
         slot:SetAutoSize(true)
         slot:SetPosition({ X = offset.X, Y = offset.Y })
         slot:SetZOrder(30)
-        label:SetVisibility(VISIBLE)
+        -- The letter is decoration above the real URODInputWidgetBase. Visible
+        -- widgets participate in Slate hit testing, so the Z-order 30 TextBlock
+        -- was swallowing hover/LMB before either the icon or its owner list saw
+        -- the pointer. Keep it rendered while letting input reach the icon.
+        label:SetVisibility(HIT_TEST_INVISIBLE)
         label:SetRenderOpacity(1.0)
         context.icon.IconImage:SetVisibility(HIDDEN)
     end)
@@ -654,7 +691,7 @@ local function enforceIconLetter(context)
     end
     local ok, err = pcall(function()
         context.icon.IconImage:SetVisibility(HIDDEN)
-        context.letterWidget:SetVisibility(VISIBLE)
+        context.letterWidget:SetVisibility(HIT_TEST_INVISIBLE)
         context.letterWidget:SetRenderOpacity(1.0)
     end)
     if not ok then log("could not enforce centred Mods icon: " .. tostring(err)) end
@@ -672,6 +709,13 @@ end
 -- is actually there.
 local function refreshRailPosition(context)
     if context == nil then return end
+    local fullyPresented, presentationError = nativeRailIsFullyPresented(context)
+    if fullyPresented == nil then
+        reportRailError(presentationError)
+        return false
+    end
+    if not fullyPresented then return false end
+
     local parent = context.wrapperParent
     local wrapper = context.wrapperPanel
     if not isValid(parent) or not isValid(wrapper) then return end
@@ -748,6 +792,7 @@ local function refreshRailPosition(context)
         dbg(string.format("rail position refreshed: index %d (%d native, %d other injected)",
             index, context.nativeCount, others))
     end
+    return true
 end
 
 -- The native list owns the only wrapper geometry that lays a row out correctly,
@@ -1044,18 +1089,18 @@ end
 local focusRailRow
 
 local function focusMods(context)
-    if context == nil or not isValid(context.icon) then return end
+    if context == nil or not isValid(context.icon) then return false end
     local rows, railError = collectRailRows(context)
     if rows == nil then
         reportRailError(railError)
-        return
+        return false
     end
     local row = railRowForKey(rows, context.iconKey)
     if row == nil then
         reportRailError("Mods icon is not a visible rail row")
-        return
+        return false
     end
-    focusRailRow(context, row)
+    return focusRailRow(context, row)
 end
 
 local function clearModsSelection(context)
@@ -1255,31 +1300,22 @@ local function isNavigationFocused(widget)
     return focused, nil
 end
 
--- Mouse delegates are registered by the native list for authored rows, not for
--- a clone appended outside its arrays. Hit-test the exact visible Mods wrapper
--- on LMB/Enter events, using the reflected Slate geometry API. This is an input
--- event path, not a cursor poll.
-local function isMouseOverModsRow(context)
-    if context == nil or not isValid(context.icon)
-        or not isValid(context.wrapperPanel) then
+-- World-space menu geometry is not screen geometry on this build: testing the
+-- wrapper with IsUnderLocation made clicks on Settings resolve as Mods. The
+-- interactive URODInputWidgetBase already owns the authoritative hover state,
+-- which is also the path proven live by FieldEquipPro in the same menu.
+local function isMouseHoveringMods(context)
+    if context == nil or not isValid(context.icon) then
         return nil, "Mods row is unavailable"
     end
-    local slateLibrary = StaticFindObject(
-        "/Script/UMG.Default__SlateBlueprintLibrary")
-    if not isValid(slateLibrary) then
-        return nil, "SlateBlueprintLibrary is unavailable"
-    end
-
-    local under = nil
-    local hitOk, hitError = pcall(function()
-        local geometry = context.wrapperPanel:GetCachedGeometry()
-        local mousePosition = context.icon:GetScreenMousePosition()
-        under = slateLibrary:IsUnderLocation(geometry, mousePosition)
+    local hovered = nil
+    local hoverOk, hoverError = pcall(function()
+        hovered = context.icon:GetIsMouseHover()
     end)
-    if not hitOk or type(under) ~= "boolean" then
-        return nil, "Mods row hit-test failed: " .. tostring(hitError)
+    if not hoverOk or type(hovered) ~= "boolean" then
+        return nil, "GetIsMouseHover is unreadable: " .. tostring(hoverError)
     end
-    return under, nil
+    return hovered, nil
 end
 
 --========================================================--
@@ -2054,6 +2090,22 @@ ensureInputHooks = function()
             -- Cheap: a walk over a handful of children. Catches a mod that
             -- injected its row after this one did.
             if not panel.isOpen() then
+                local fullyPresented, presentationError =
+                    nativeRailIsFullyPresented(context)
+                if fullyPresented == nil then
+                    pendingFocusRedirects[listKey] = nil
+                    reportRailError(presentationError)
+                    return
+                end
+                if not fullyPresented then
+                    -- A native submenu owns focus while its opening animation
+                    -- suppresses the rail. Do not reinterpret its selected row
+                    -- as a wrap boundary or rewrite the Mods ItemIndex.
+                    pendingFocusRedirects[listKey] = nil
+                    listFocusIndexes[listKey] = nil
+                    clearModsSelection(context)
+                    return
+                end
                 pcall(refreshRailPosition, context)
             end
 
@@ -2121,10 +2173,12 @@ ensureInputHooks = function()
             end
 
             local redirect = nil
-            if previousIndex == lastNative.nativeIndex
+            if previousIndex ~= index
+                and previousIndex == lastNative.nativeIndex
                 and index == firstNative.nativeIndex then
                 redirect = "first"
-            elseif previousIndex == firstNative.nativeIndex
+            elseif previousIndex ~= index
+                and previousIndex == firstNative.nativeIndex
                 and index == lastNative.nativeIndex then
                 redirect = "last"
             elseif row == nil and previousIndex == lastNative.nativeIndex then
@@ -2162,32 +2216,6 @@ ensureInputHooks = function()
                     return
                 end
                 focusRailRow(activeContext, target)
-            end
-        end)
-
-    safeHook("/Script/ROD.RODInputWidgetBase:ClickEventNotify",
-        function(self, widgetParameter, buttonParameter, _)
-            local widget = hookValue(widgetParameter, "clicked input widget")
-            local owner = hookValue(self, "click input owner")
-            if isModsIcon(widget) or isModsIcon(owner) then
-                consumeButton(buttonParameter)
-                openPanel()
-            end
-        end)
-
-    safeHook("/Script/ROD.RODListWidgetBase:ClickEvent",
-        function(_, widgetParameter, buttonParameter, _)
-            if isModsIcon(hookValue(widgetParameter, "clicked list widget")) then
-                consumeButton(buttonParameter)
-                openPanel()
-            end
-        end)
-
-    safeHook("/Script/ROD.RODConsoleMainMenuWidgetBase:OnClickMenuItemDelegate",
-        function(_, widgetParameter, buttonParameter)
-            if isModsIcon(hookValue(widgetParameter, "clicked menu widget")) then
-                consumeButton(buttonParameter)
-                openPanel()
             end
         end)
 
@@ -2237,6 +2265,12 @@ end
 local function activeRailContext()
     local context = activeContext
     if not menuContextIsMounted(context) or not isValid(context.icon) then return nil end
+    local fullyPresented, presentationError = nativeRailIsFullyPresented(context)
+    if fullyPresented == nil then
+        reportRailError(presentationError)
+        return nil
+    end
+    if not fullyPresented then return nil end
     return context
 end
 
@@ -2250,7 +2284,7 @@ local function activateModsFromKeyboard()
         return
     end
     if not focused then
-        local hovered, hoverError = isMouseOverModsRow(context)
+        local hovered, hoverError = isMouseHoveringMods(context)
         if hovered == nil then
             reportRailError(hoverError)
             return
@@ -2268,15 +2302,27 @@ local function activateModsFromMouse()
     if panel.isOpen() then return end
     local context = activeRailContext()
     if context == nil then return end
-    local hovered, hoverError = isMouseOverModsRow(context)
+    local hovered, hoverError = isMouseHoveringMods(context)
     if hovered == nil then
         reportRailError(hoverError)
         return
     end
     if not hovered then return end
 
+    local focused, focusError = isNavigationFocused(context.icon)
+    if focused == nil then
+        reportRailError(focusError)
+        return
+    end
+
     if takeInputLock() then
-        focusMods(context)
+        if not focused then
+            if focusMods(context) then
+                log("LMB selected Mods through native hover")
+            end
+            return
+        end
+        log("LMB confirmed Mods through native hover")
         openPanel()
     end
 end
