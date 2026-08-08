@@ -14,6 +14,9 @@ release-reference pages for their respective projects:
 - [Aincrad Open World](https://www.nexusmods.com/echoesofaincrad/mods/55)
 - [Field Equipment Mod](https://www.nexusmods.com/echoesofaincrad/mods/64)
 
+For locally inspecting encrypted game assets in FModel without recording an
+AES key, see [FModel local AES and material inspection](docs/fmodel-local-aes-and-material-inspection.md).
+
 For an exact source-by-source comparison against the original Nexus archives,
 see [Modifications from the Original Nexus Releases](MODIFICATIONS.md).
 
@@ -406,22 +409,24 @@ the mod's version, target screen, and the native travel state.
 ### World Enemy Director
 
 World Enemy Director preserves the game's natural enemy actors and can create
-up to seven additional enemies per natural spawn through
-`RODGameState.RODSpawnActor`. Each candidate must first produce a valid,
+up to seven additional enemies per natural spawn through direct deferred actor
+creation outside `URODManagerEnemy::EnemySpawnPool`. The native bridge registers
+each exact issued actor in the game-state and AI-group arrays. Each candidate
+must first produce a valid,
 non-partial `UNavigationPath` on the active NavMesh and remain separated from
 other enemies. A request tests up to 12 spiral-distributed candidates over
 multiple director cycles, with one synchronous path query per cycle. The spawn
 option starts the native Behavior Tree, leaves
 perception enabled, and rejects unresolved collisions. Additional species can
 be randomised from classes that the current world has already loaded. Every
-extra is owned by the exact server actor returned by the game's population
-API.
+extra is tracked by its exact native weak index and serial before deferred
+creation is finished.
 
 The Mods panel exposes the spawn multiplier and cap, spawn radius, natural-boss
 mutation, scale range, fixed or random colour, health, attack, defence,
 movement speed, and experience multipliers. Natural quest actors are never
-replaced; only exact actors created and owned by this mod may be destroyed when
-the multiplier is reduced or the mod is disabled.
+replaced. Already-issued extras remain under the game's lifecycle when the
+multiplier is reduced or the mod is disabled.
 
 Combat multipliers are applied after the enemy's native initialization through
 its exact Gameplay Ability System attributes. Health targets `Health` and
@@ -438,10 +443,15 @@ seconds before any extras are issued. If boss classification nevertheless
 arrives after an owned actor was issued, spawning fails closed and requires a
 mission restart rather than destroying an initializing actor.
 
-Confirmed travel releases outgoing-world references before Unreal collects the
-mission. A standalone `ClientRestart` or quest teleport within the same world
-preserves ownership and temporarily quarantines processing, preventing the
-director from rediscovering and multiplying its own extras.
+Confirmed travel clears the internal `Async` GC root only from UObject graphs
+whose Outer chain reaches an exact issued actor, then releases outgoing-world
+references before Unreal collects the mission. It does not destroy actors or
+touch natural enemies. The same sanitation runs after issued batches and before
+safe-area or same-world teleports, while weak identities remain non-owning for
+later passes. Killed extras release their cap slots; queued work is distributed
+one slot per origin per sweep and is cancelled when an uncreated origin leaves
+the active radius. A standalone `ClientRestart` or quest teleport temporarily
+quarantines processing without rediscovering and multiplying existing extras.
 
 Visual size changes target only the enemy skeletal mesh. Character capsules,
 NavMesh agents, controllers, perception, and movement remain at native scale,

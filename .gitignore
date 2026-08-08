@@ -8,6 +8,8 @@
 !/.gitignore
 !/README.md
 !/MODIFICATIONS.md
+!/docs/
+!/docs/**
 !/ue4ss/
 
 # Inside ue4ss, keep the settings file and the mods. UE4SS itself is a
@@ -30,8 +32,12 @@
 # Written by the in-game Mods menu. Per-machine state, not source: config.lua
 # holds the defaults worth committing, runtime.lua is whatever you last set.
 /ue4ss/Mods/*/Scripts/runtime.lua
+/ue4ss/Mods/*/Scripts/runtime.rev*
+/ue4ss/Mods/*/Scripts/preview.lua*
 
 # Logs and dumps produced at runtime.
 *.log
 /ue4ss/*.txt
 /ue4ss/Mods/**/dumps/
+
+runtime.rev

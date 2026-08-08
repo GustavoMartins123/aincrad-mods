@@ -40,6 +40,12 @@ end
 
 Store.runtimePathFor = runtimePathFor
 
+local function previewPathFor(modName)
+    return Store.scriptDirFor(modName) .. "preview.lua"
+end
+
+Store.previewPathFor = previewPathFor
+
 -- An integral value is written without a decimal point so the file stays
 -- readable; nothing downstream distinguishes 1 from 1.0, every consumer either
 -- does plain arithmetic on it or runs it through tonumber.
@@ -167,6 +173,101 @@ local function removeFile(path)
     local removed, removeError = os.remove(path)
     if removed == true then return true, nil end
     return false, tostring(removeError)
+end
+
+-- The preview marker is transient, not a user setting. Publish it by staging
+-- the complete file first and then replacing the canonical path. It is
+-- explicitly cleared by ModMenu on startup and close; it must not expire while
+-- the user is holding an input and editing a value.
+local function publishPreview(path, contents)
+    local nextPath = path .. ".next"
+    local previousText, previousReadError = bridge.readFile(path)
+    if previousReadError ~= nil then
+        return false, "current preview read failed: " .. tostring(previousReadError)
+    end
+
+    local stagedText, stagedReadError = bridge.readFile(nextPath)
+    if stagedReadError ~= nil then
+        return false, "staged preview read failed: " .. tostring(stagedReadError)
+    end
+    if stagedText ~= nil then
+        -- A leftover .next is debris from a publication that died between the
+        -- stage and the rename, not a concurrent writer: this marker is written
+        -- only from ModMenu's panel, on the game thread, one call at a time.
+        -- Treating it as a hard error made one interrupted write poison every
+        -- later one for the life of the install, and the panel could not be
+        -- closed for as long as it lasted. Clear it and carry on.
+        local cleared, clearError = removeFile(nextPath)
+        if not cleared then
+            return false, "stale staged preview could not be cleared (" ..
+                nextPath .. "): " .. tostring(clearError)
+        end
+    end
+
+    local staged, stageError = writeFile(nextPath, contents)
+    if not staged then
+        return false, "could not stage preview: " .. tostring(stageError)
+    end
+
+    local removed, removeError = removeFile(path)
+    if not removed then
+        local stagedRemoved, stagedRemoveError = removeFile(nextPath)
+        return false, string.format(
+            "current preview removal failed (%s); staged cleanup=%s",
+            tostring(removeError),
+            tostring(stagedRemoved and "ok" or stagedRemoveError)
+        )
+    end
+
+    local published, publishError = os.rename(nextPath, path)
+    if published == true then return true, nil end
+
+    -- This is a transactional rollback of the marker, not an alternate
+    -- preview source. If publication failed, restore the exact previous marker
+    -- or leave the canonical marker absent.
+    local restored = true
+    local restoreError = nil
+    if previousText ~= nil then
+        restored, restoreError = writeFile(path, previousText)
+    end
+    local stagedRemoved, stagedRemoveError = removeFile(nextPath)
+    return false, string.format(
+        "preview publish failed (%s); rollback=%s staged=%s",
+        tostring(publishError),
+        tostring(restored and "ok" or restoreError),
+        tostring(stagedRemoved and "ok" or stagedRemoveError)
+    )
+end
+
+function Store.setPreview(modName, active)
+    if type(active) ~= "boolean" then
+        return false, "preview state must be boolean"
+    end
+
+    -- The marker exists for one installed mod to read. Nothing about ModMenu
+    -- requires that mod to be present -- discovery lists whatever is on disk --
+    -- so on an install without it the preview path points inside a directory
+    -- that does not exist and every write fails. There is no consumer and
+    -- nothing to publish: that is success, not an error to propagate into the
+    -- panel's control flow.
+    local installed, installedError =
+        bridge.readFile(Store.scriptDirFor(modName) .. "main.lua")
+    if installedError == nil and installed == nil then
+        return true, nil
+    end
+
+    local path = previewPathFor(modName)
+    local contents = table.concat({
+        "return {",
+        "    ACTIVE = " .. tostring(active) .. ",",
+        "}",
+        "",
+    }, "\n")
+    return publishPreview(path, contents)
+end
+
+function Store.clearPreview(modName)
+    return Store.setPreview(modName, false)
 end
 
 -- runtime.lua is watched from independent Lua states. Writing it directly with
@@ -297,6 +398,10 @@ function Store.enabledPathFor(modName)
     return Store.scriptDirFor(modName) .. "../enabled.txt"
 end
 
+function Store.enabledOffPathFor(modName)
+    return Store.scriptDirFor(modName) .. "../enabled.txt.off"
+end
+
 function Store.isModEnabled(modName)
     local path = Store.enabledPathFor(modName)
     local contents, readError = bridge.readFile(path)
@@ -307,32 +412,61 @@ function Store.isModEnabled(modName)
 end
 
 function Store.setModEnabled(modName, enabled)
-    local path = Store.enabledPathFor(modName)
+    local enabledPath = Store.enabledPathFor(modName)
+    local disabledPath = Store.enabledOffPathFor(modName)
     if type(enabled) ~= "boolean" then return false, "enabled state must be boolean" end
 
     if enabled then
-        local existing, readError = bridge.readFile(path)
+        local existingEnabled, readError = bridge.readFile(enabledPath)
         if readError ~= nil then
             return false, "enabled.txt state read failed: " .. tostring(readError)
         end
-        if existing ~= nil then return true, nil end
-        return writeFile(path, "enabled\n")
+        if existingEnabled == nil then
+            local ok, writeError = writeFile(enabledPath, "enabled\n")
+            if not ok then
+                return false, "could not create enabled.txt: " .. tostring(writeError)
+            end
+        end
+        local existingDisabled, offReadError = bridge.readFile(disabledPath)
+        if offReadError == nil and existingDisabled ~= nil then
+            os.remove(disabledPath)
+        end
+        return true, nil
     end
 
-    local existing, readError = bridge.readFile(path)
-    if readError ~= nil then
-        return false, "enabled.txt state read failed: " .. tostring(readError)
+    local existingDisabled, offReadError = bridge.readFile(disabledPath)
+    if offReadError ~= nil then
+        return false, "enabled.txt.off state read failed: " .. tostring(offReadError)
     end
-    if existing == nil then return true, nil end
+    if existingDisabled == nil then
+        local ok, writeError = writeFile(disabledPath, "disabled\n")
+        if not ok then
+            return false, "could not create enabled.txt.off: " .. tostring(writeError)
+        end
+    end
 
-    local removed, removeError = os.remove(path)
-    if removed == true then return true, nil end
-    return false, "could not remove enabled.txt: " .. tostring(removeError)
+    local existingEnabled, readError = bridge.readFile(enabledPath)
+    if readError == nil and existingEnabled ~= nil then
+        local removed, removeError = os.remove(enabledPath)
+        if not removed then
+            return false, "could not remove enabled.txt: " .. tostring(removeError)
+        end
+    end
+
+    return true, nil
 end
 
--- Changes the launch marker and the live ENABLED override as one transaction.
--- If either write fails, restore the previous runtime table and launch marker.
+-- Changes the launch marker and, for a mod that has a settings contract, its
+-- live ENABLED override as one transaction. If either write fails, restore the
+-- previous runtime table and launch marker.
+--
+-- A mod without a contract has no runtime.lua of ours to write: enabled.txt is
+-- the whole of its state, and this must not plant a settings file inside a mod
+-- that never asked for one.
 function Store.setEnabledState(modName, runtimeKey, enabled)
+    if runtimeKey == nil then
+        return Store.setModEnabled(modName, enabled)
+    end
     if type(runtimeKey) ~= "string" or runtimeKey == "" then
         return false, "registered mod has no canonical ENABLED key"
     end
