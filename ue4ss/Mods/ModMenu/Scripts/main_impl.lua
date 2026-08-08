@@ -1,4 +1,4 @@
--- ModMenu v1.5.11
+-- ModMenu v1.5.12
 -- Adds a native-styled "Mods" entry to Echoes of Aincrad's start menu, opening a
 -- panel that enables/disables the other mods and retunes their values in-game.
 --
@@ -12,7 +12,7 @@
 -- mod's Lua state, because UE4SS gives each mod its own.
 
 local MOD_NAME = "ModMenu"
-local MOD_VERSION = "v1.5.11"
+local MOD_VERSION = "v1.5.12"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -698,6 +698,52 @@ local function enforceIconLetter(context)
     return ok
 end
 
+-- Re-establishes the complete native input contract of the injected row.
+-- Restoring SetInputEnable alone is insufficient after the modal SubMenu canvas
+-- has been opened and collapsed again: the row may still have a stale owner or
+-- the main menu may no longer be accepting pointer interaction, leaving
+-- GetIsMouseHover permanently false even though controller focus still works.
+local function rearmModsEntry(context)
+    if context == nil or not isValid(context.mainMenu)
+        or not isValid(context.mainList) or not isValid(context.icon)
+        or not isValid(context.wrapperPanel) then
+        return false, "Mods row input context is unavailable"
+    end
+    if not menuContextIsMounted(context) then
+        return false, "Mods row is not mounted in the live start menu"
+    end
+
+    local rearmed, rearmError = xpcall(function()
+        local icon = context.icon
+        icon:SetItemIndex(context.modsIndex)
+        icon:SetOwnerInputWidget(context.mainList)
+        icon:SetInactive(false)
+        icon:SetBlank(false)
+        icon:SetInputEnable(true)
+        icon:BP_SetInputInteractionEnable(true)
+        icon:SetVisibility(VISIBLE)
+        icon:SetRenderOpacity(1.0)
+        context.wrapperPanel:SetVisibility(VISIBLE)
+        context.wrapperPanel:SetRenderOpacity(1.0)
+        context.mainMenu:SetInteraction(true)
+
+        local inputEnabled = icon:IsInputEnable()
+        local interactionEnabled = icon:IsInputInteractionEnable()
+        if inputEnabled ~= true or interactionEnabled ~= true then
+            error(string.format(
+                "input verification failed (input=%s, interaction=%s)",
+                tostring(inputEnabled), tostring(interactionEnabled)))
+        end
+        if not enforceIconLetter(context) then
+            error("centred Mods icon could not be restored")
+        end
+    end, debug.traceback)
+    if not rearmed then
+        return false, "Mods row rearm failed: " .. tostring(rearmError)
+    end
+    return true, nil
+end
+
 -- Keeps the Mods row last on the rail and its item index honest.
 --
 -- The index used to be computed once at injection and then trusted forever,
@@ -791,6 +837,11 @@ local function refreshRailPosition(context)
         pcall(function() context.icon:SetItemIndex(index) end)
         dbg(string.format("rail position refreshed: index %d (%d native, %d other injected)",
             index, context.nativeCount, others))
+    end
+    local rearmed, rearmError = rearmModsEntry(context)
+    if not rearmed then
+        reportRailError(rearmError)
+        return false
     end
     return true
 end
@@ -1243,7 +1294,6 @@ local function setNativeMenuInputEnabled(context, enabled)
             -- SetIsEnabled is deliberately not used: it greys the rail out, and
             -- the rail is still on screen beside the panel. Input is what has to
             -- stop, not the presentation.
-            pcall(function() target:SetIsFocusable(enabled) end)
             pcall(function() target:SetInputEnable(enabled) end)
             pcall(function() target:BP_SetInputInteractionEnable(enabled) end)
             -- URODInputWidgetBase also exposes SetInputEnableIndividual /
@@ -1267,7 +1317,13 @@ local function setNativeMenuInputEnabled(context, enabled)
         end
     end
 
-    if isValid(context.icon) and isValid(context.mainMenu) then
+    if enabled then
+        local rearmed, rearmError = rearmModsEntry(context)
+        if not rearmed then reportRailError(rearmError) end
+    elseif isValid(context.icon) and isValid(context.mainMenu) then
+        -- The Mods icon remains the sole ROD input sink while the modal panel is
+        -- open. Do not call rearmModsEntry here: restoring main-menu pointer
+        -- interaction belongs exclusively to the close transition.
         pcall(function() context.icon:SetInputEnable(true) end)
         pcall(function() context.icon:BP_SetInputInteractionEnable(true) end)
     end
@@ -2271,6 +2327,11 @@ local function activeRailContext()
         return nil
     end
     if not fullyPresented then return nil end
+    local rearmed, rearmError = rearmModsEntry(context)
+    if not rearmed then
+        reportRailError(rearmError)
+        return nil
+    end
     return context
 end
 
@@ -2299,7 +2360,21 @@ local function activateModsFromKeyboard()
 end
 
 local function activateModsFromMouse()
-    if panel.isOpen() then return end
+    if panel.isOpen() then
+        if not takeInputLock() then return end
+        local handled, actionOrError = panel.clickHovered()
+        if handled == nil then
+            log("panel mouse input failed closed: " .. tostring(actionOrError))
+            closePanel()
+            return
+        end
+        if handled and actionOrError == "close" then
+            closePanel()
+        elseif handled then
+            dbg("panel LMB action: " .. tostring(actionOrError))
+        end
+        return
+    end
     local context = activeRailContext()
     if context == nil then return end
     local hovered, hoverError = isMouseHoveringMods(context)

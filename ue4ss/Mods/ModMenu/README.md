@@ -1,6 +1,6 @@
 # ModMenu
 
-ModMenu **v1.5.11** adds a native-styled **Mods** entry to Echoes of Aincrad's
+ModMenu **v1.5.12** adds a native-styled **Mods** entry to Echoes of Aincrad's
 Start Menu.
 
 It discovers installed UE4SS Lua mods directly from the `Mods` directory. Every
@@ -60,6 +60,9 @@ is over the row.
 - `Enter` expands a mod or toggles a boolean setting.
 - `Left/Right` changes a value or toggles a mod header.
 - `Back` or `Esc` closes the panel.
+- With the mouse, clicking a mod name expands or collapses it; clicking the left
+  or right half of a value decreases or increases it. Either half toggles an
+  `ON/OFF` value, and `[ CLOSE ]` closes the panel.
 
 ```text
 MODS

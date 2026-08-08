@@ -8,7 +8,8 @@
 --           so nothing of the original menu shows through. Cloning a class that
 --           is known to exist and known to be creatable from Lua avoids guessing
 --           at a widget path that may not be loaded.
---   rows    two UMG TextBlocks each (label on the left, value on the right).
+--   rows    two UMG TextBlocks each (label on the left, value on the right),
+--           over transparent UButtons that supply exact Slate mouse targets.
 --   style   copied off a native menu icon's MenuName text rather than built by
 --           hand, because FSlateFontInfo cannot be constructed from Lua. The
 --           panel therefore inherits the game's own typography for free.
@@ -23,9 +24,11 @@ local Panel = {}
 local VISIBLE = 0
 local COLLAPSED = 1
 local HIDDEN = 2
+local HIT_TEST_INVISIBLE = 3
 
 local TEXTBLOCK_CLASS = "/Script/UMG.TextBlock"
 local IMAGE_CLASS = "/Script/UMG.Image"
+local BUTTON_CLASS = "/Script/UMG.Button"
 
 local PANEL_LEFT = 220.0
 local PANEL_TOP = 120.0
@@ -325,7 +328,7 @@ local function styleText(widget, color)
     end)
 end
 
-local function placeInCanvas(widget, x, y, width)
+local function placeInCanvas(widget, x, y, width, height, zOrder)
     if not isValid(canvas) or not isValid(widget) then return false end
     local slot = nil
     pcall(function() slot = canvas:AddChildToCanvas(widget) end)
@@ -341,10 +344,45 @@ local function placeInCanvas(widget, x, y, width)
     pcall(function() slot:SetAutoSize(width == nil) end)
     pcall(function() slot:SetPosition({ X = x, Y = y }) end)
     if width ~= nil then
-        pcall(function() slot:SetSize({ X = width, Y = ROW_HEIGHT }) end)
+        pcall(function() slot:SetSize({ X = width, Y = height or ROW_HEIGHT }) end)
     end
-    pcall(function() slot:SetZOrder(50) end)
+    pcall(function() slot:SetZOrder(zOrder or 50) end)
     return true
+end
+
+-- A transparent UButton remains part of Slate's real hit-test grid. Reading its
+-- inherited UWidget:IsHovered() state on LMB therefore identifies an exact panel
+-- target without converting the world-space menu's geometry to screen space.
+-- Text is rendered above it as HIT_TEST_INVISIBLE, so the visible glyphs cannot
+-- steal the pointer from the button underneath.
+local function constructHitTarget(x, y, width, height)
+    local button = constructWidget(BUTTON_CLASS, host)
+    if not isValid(button) then return nil end
+    if not placeInCanvas(button, x, y, width, height, 45) then return nil end
+
+    local configured, configureError = pcall(function()
+        -- UButton exposes IsFocusable as a reflected property on this build; it
+        -- has no reflected SetIsFocusable UFunction.
+        button.IsFocusable = false
+        button:SetColorAndOpacity({ R = 1.0, G = 1.0, B = 1.0, A = 0.0 })
+        button:SetBackgroundColor({ R = 1.0, G = 1.0, B = 1.0, A = 0.0 })
+        button:SetVisibility(VISIBLE)
+        button:SetRenderOpacity(1.0)
+        if button.IsFocusable ~= false then
+            error("IsFocusable write did not stick")
+        end
+    end)
+    if not configured then
+        log("could not configure a panel mouse target: " .. tostring(configureError))
+        return nil
+    end
+    return button
+end
+
+local function makeTextNonInteractive(widget)
+    if isValid(widget) then
+        pcall(function() widget:SetVisibility(HIT_TEST_INVISIBLE) end)
+    end
 end
 
 -- The start menu's root is a RetainerBox (it renders the whole menu through a
@@ -519,22 +557,51 @@ local function buildPanel()
         pcall(function() title:SetText(FText("MODS")) end)
         styleText(title, HEADER_COLOR)
         placeInCanvas(title, LABEL_X, PANEL_TOP + 36.0, nil)
+        makeTextNonInteractive(title)
     end
 
     local footer = constructWidget(TEXTBLOCK_CLASS, host)
     if isValid(footer) then
         pcall(function()
             footer:SetText(FText(
-                "Up/Down select    Left/Right change    Enter expand/toggle    Back close" ..
-                "        * restart required    + reopen menu"))
+                "Mouse: name expand | value -/+ | Close    Keys: arrows | Enter | Back" ..
+                "    * restart    + reopen"))
         end)
         styleText(footer, MUTED_COLOR)
         placeInCanvas(footer, LABEL_X, PANEL_TOP + PANEL_HEIGHT - 44.0, nil)
+        makeTextNonInteractive(footer)
     end
 
-    titleWidgets = { title = title, footer = footer, background = background }
+    local closeX = PANEL_LEFT + PANEL_WIDTH - 154.0
+    local closeY = PANEL_TOP + 27.0
+    local closeHit = constructHitTarget(closeX, closeY, 112.0, 40.0)
+    if not isValid(closeHit) then
+        log("cannot build panel: close mouse target is unavailable")
+        destroyPanel()
+        return false
+    end
+
+    local closeText = constructWidget(TEXTBLOCK_CLASS, host)
+    if isValid(closeText) then
+        pcall(function() closeText:SetText(FText("[ CLOSE ]")) end)
+        styleText(closeText, MUTED_COLOR)
+        placeInCanvas(closeText, closeX + 12.0, closeY + 7.0, nil)
+        makeTextNonInteractive(closeText)
+    end
+
+    titleWidgets = {
+        title = title,
+        footer = footer,
+        background = background,
+        closeText = closeText,
+        closeHit = closeHit,
+    }
 
     -- Fixed viewport: render maps these widgets onto a moving window in `rows`.
+    local rowHitLeft = PANEL_LEFT + 32.0
+    local valueHitLeft = VALUE_X - 24.0
+    local valueHitRight = PANEL_LEFT + PANEL_WIDTH - 40.0
+    local valueHalfWidth = (valueHitRight - valueHitLeft) / 2.0
     for index = 1, MAX_VISIBLE_ROWS do
         local label = constructWidget(TEXTBLOCK_CLASS, host)
         local value = constructWidget(TEXTBLOCK_CLASS, host)
@@ -542,23 +609,61 @@ local function buildPanel()
         if isValid(label) then
             styleText(label, NORMAL_COLOR)
             placeInCanvas(label, LABEL_X, y, nil)
+            makeTextNonInteractive(label)
         end
         if isValid(value) then
             styleText(value, NORMAL_COLOR)
             placeInCanvas(value, VALUE_X, y, nil)
+            makeTextNonInteractive(value)
         end
-        rowWidgets[index] = { label = label, value = value, y = y }
+
+        local labelHit = constructHitTarget(
+            rowHitLeft, y - 3.0, valueHitLeft - rowHitLeft, ROW_HEIGHT)
+        local decrementHit = constructHitTarget(
+            valueHitLeft, y - 3.0, valueHalfWidth, ROW_HEIGHT)
+        local incrementHit = constructHitTarget(
+            valueHitLeft + valueHalfWidth, y - 3.0, valueHalfWidth, ROW_HEIGHT)
+        if not isValid(labelHit) or not isValid(decrementHit)
+            or not isValid(incrementHit) then
+            log("cannot build panel: row " .. tostring(index) ..
+                " mouse targets are unavailable")
+            destroyPanel()
+            return false
+        end
+
+        rowWidgets[index] = {
+            label = label,
+            value = value,
+            labelHit = labelHit,
+            decrementHit = decrementHit,
+            incrementHit = incrementHit,
+            y = y,
+        }
     end
 
     -- No AddToViewport: the host is the start menu, already on screen. The
     -- panel's widgets sit above it on Z order alone.
-    log("panel built with " .. tostring(MAX_VISIBLE_ROWS) .. " virtual row slots")
+    log("panel built with " .. tostring(MAX_VISIBLE_ROWS) ..
+        " virtual row slots and " .. tostring(MAX_VISIBLE_ROWS * 3 + 1) ..
+        " exact mouse targets")
     return true
 end
 
 --========================================================--
 --                       RENDERING                        --
 --========================================================--
+
+local function setHitTargetsVisibility(widgets, visibility)
+    if isValid(widgets.labelHit) then
+        pcall(function() widgets.labelHit:SetVisibility(visibility) end)
+    end
+    if isValid(widgets.decrementHit) then
+        pcall(function() widgets.decrementHit:SetVisibility(visibility) end)
+    end
+    if isValid(widgets.incrementHit) then
+        pcall(function() widgets.incrementHit:SetVisibility(visibility) end)
+    end
+end
 
 function Panel.render()
     if not isOpen then return end
@@ -572,6 +677,7 @@ function Panel.render()
         if row == nil then
             if isValid(labelWidget) then pcall(function() labelWidget:SetVisibility(COLLAPSED) end) end
             if isValid(valueWidget) then pcall(function() valueWidget:SetVisibility(COLLAPSED) end) end
+            setHitTargetsVisibility(widgets, COLLAPSED)
         else
             local selected = modelIndex == selectionIndex
             local color = selected and SELECTED_COLOR
@@ -580,7 +686,7 @@ function Panel.render()
             local marker = selected and "> " or "  "
 
             if isValid(labelWidget) then
-                pcall(function() labelWidget:SetVisibility(VISIBLE) end)
+                pcall(function() labelWidget:SetVisibility(HIT_TEST_INVISIBLE) end)
                 pcall(function() labelWidget:SetText(FText(marker .. describeLabel(row))) end)
                 styleText(labelWidget, color)
                 local slot = nil
@@ -592,10 +698,11 @@ function Panel.render()
                 end
             end
             if isValid(valueWidget) then
-                pcall(function() valueWidget:SetVisibility(VISIBLE) end)
+                pcall(function() valueWidget:SetVisibility(HIT_TEST_INVISIBLE) end)
                 pcall(function() valueWidget:SetText(FText(describeValue(row))) end)
                 styleText(valueWidget, color)
             end
+            setHitTargetsVisibility(widgets, VISIBLE)
         end
     end
 
@@ -802,6 +909,79 @@ function Panel.activate()
     end
 
     toggleBool(row)
+end
+
+local function readHitTargetHover(widget, description)
+    if not isValid(widget) then
+        return nil, tostring(description) .. " mouse target is invalid"
+    end
+    local hovered = nil
+    local hoverOk, hoverError = pcall(function() hovered = widget:IsHovered() end)
+    if not hoverOk or type(hovered) ~= "boolean" then
+        return nil, tostring(description) .. " hover is unreadable: " ..
+            tostring(hoverError)
+    end
+    return hovered, nil
+end
+
+local function selectMouseRow(modelIndex)
+    selectionIndex = modelIndex
+    ensureSelectionVisible()
+    Panel.render()
+end
+
+-- Handles exactly one LMB press through the transparent UButton hit targets
+-- built with the panel. A label selects its row and expands/collapses a mod
+-- header. The left and right halves of the value perform the same -1/+1 action
+-- as controller Left/Right, including boolean and mod enable toggles.
+--
+-- nil means the canonical hit-test contract failed and the caller must close the
+-- modal panel; false means the click was simply outside every interactive area.
+function Panel.clickHovered()
+    if not isOpen then return false, nil end
+
+    if titleWidgets == nil then
+        return nil, "panel title widgets are unavailable"
+    end
+    local closeHovered, closeError =
+        readHitTargetHover(titleWidgets.closeHit, "close")
+    if closeHovered == nil then return nil, closeError end
+    if closeHovered then return true, "close" end
+
+    for slotIndex, widgets in ipairs(rowWidgets) do
+        local modelIndex = scrollOffset + slotIndex
+        local row = rows[modelIndex]
+        if row ~= nil then
+            local labelHovered, labelError =
+                readHitTargetHover(widgets.labelHit, "row label")
+            if labelHovered == nil then return nil, labelError end
+            if labelHovered then
+                selectMouseRow(modelIndex)
+                if row.kind == "mod" then Panel.activate() end
+                return true, "label"
+            end
+
+            local decrementHovered, decrementError =
+                readHitTargetHover(widgets.decrementHit, "value decrement")
+            if decrementHovered == nil then return nil, decrementError end
+            if decrementHovered then
+                selectMouseRow(modelIndex)
+                Panel.adjust(-1)
+                return true, "decrement"
+            end
+
+            local incrementHovered, incrementError =
+                readHitTargetHover(widgets.incrementHit, "value increment")
+            if incrementHovered == nil then return nil, incrementError end
+            if incrementHovered then
+                selectMouseRow(modelIndex)
+                Panel.adjust(1)
+                return true, "increment"
+            end
+        end
+    end
+
+    return false, nil
 end
 
 function Panel.resetSelectedMod()

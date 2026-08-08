@@ -529,7 +529,7 @@ Changed above.
 **Original archive:** None of the six Nexus baselines contains ModMenu or
 `ModMenuBridge.lua`
 
-**Current script version:** v1.5.11
+**Current script version:** v1.5.12
 
 ### Added
 
@@ -584,6 +584,14 @@ Changed above.
 - Uses the injected icon's native `GetIsMouseHover()` state for LMB and hovered
   Enter. The first click selects Mods and the second confirms it; no screen-
   geometry approximation or parallel click-delegate path remains.
+- Added exact Slate mouse targets to the settings panel. Transparent UMG buttons
+  cover each visible label and both halves of each value, while the rendered text
+  is hit-test-invisible; LMB can now expand, select, decrement, increment, toggle,
+  and close without any world-to-screen geometry approximation.
+- Rearms the Mods row's owner, item index, input gates and main-menu interaction
+  after the panel closes and before a closed-panel mouse action. The gates are
+  read back and a failed rearm disables that action explicitly instead of leaving
+  a controller-only row that silently ignores later mouse clicks.
 - Made outer-rail arrows use only the ProcessEvent input path, preventing one
   keyboard press from being applied once by `RegisterKeyBind` and again by the
   native widget callback.
