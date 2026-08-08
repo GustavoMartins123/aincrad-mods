@@ -1,6 +1,6 @@
 # ModMenu
 
-ModMenu **v1.5.12** adds a native-styled **Mods** entry to Echoes of Aincrad's
+ModMenu **v1.5.15** adds a native-styled **Mods** entry to Echoes of Aincrad's
 Start Menu.
 
 It discovers installed UE4SS Lua mods directly from the `Mods` directory. Every
@@ -52,9 +52,8 @@ Open the Start Menu, move below its final native or modded row to **Mods**, and
 confirm.
 
 The Start Menu row supports D-pad/stick navigation, keyboard arrows and Enter.
-With the mouse, the first left-click selects Mods and the second confirms it,
-matching the native/Equipment interaction. Enter also opens it while the mouse
-is over the row.
+With the mouse, one left-click over Mods opens the panel directly. Enter also
+opens it while the mouse is over the row.
 
 - `Up/Down` moves through the panel.
 - `Enter` expands a mod or toggles a boolean setting.
@@ -81,8 +80,10 @@ valid UE4SS Lua mod that publishes no settings contract. It can still be shown
 and managed, but there is nothing to expand.
 
 The panel virtualises twelve visible rows. Expanding a mod with more settings
-automatically scrolls the fixed viewport, so controller navigation remains
-independent of the expanded list's length.
+automatically scrolls the viewport, so controller navigation remains independent
+of the expanded list's length. Its width and height are measured from the live
+Start Menu `SubMenu` canvas, keeping the close target, values and footer inside
+the available area.
 
 ## Automatic discovery
 
@@ -316,7 +317,13 @@ ModMenu reads the live rail by wrapper/icon identity on input and focus events,
 excludes hidden authored rows directly, and bridges Up/Down across every visible
 native or injected neighbour. Other Start Menu mods do not need to know that
 ModMenu exists or assign compatible indexes. The Mods row is kept at the bottom.
-There is no rail polling or per-frame widget scan.
+Up from the first visible row and Down from Mods wrap across the complete physical
+rail. While the panel is open, ModMenu does not write input, visibility or focus
+state into native rows or rows injected by another mod. Guarded input hooks consume
+native keyboard/controller events, while a transparent button owned by the panel
+covers the canonical `SubMenu` canvas and keeps underlying rows out of Slate mouse
+hover. Removing the panel removes that shield; there is no foreign-widget restore
+transaction, rail polling or per-frame widget scan.
 
 ## Diagnostics
 

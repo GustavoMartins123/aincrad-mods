@@ -1,9 +1,8 @@
--- ModMenu v1.5.12
+-- ModMenu v1.5.15
 -- Adds a native-styled "Mods" entry to Echoes of Aincrad's start menu, opening a
 -- panel that enables/disables the other mods and retunes their values in-game.
 --
--- The rail injection follows the technique proven by FieldEquipmentMenu: the
--- native list's TArrays cannot be grown safely from UE4SS Lua, so the row is a
+-- The native list's TArrays cannot be grown safely from UE4SS Lua, so the row is a
 -- MenuIcon clone parked in a donor wrapper appended to the same VerticalBox, and
 -- only the navigation boundaries around it are bridged.
 --
@@ -12,7 +11,7 @@
 -- mod's Lua state, because UE4SS gives each mod its own.
 
 local MOD_NAME = "ModMenu"
-local MOD_VERSION = "v1.5.12"
+local MOD_VERSION = "v1.5.15"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -127,6 +126,10 @@ local ensureInputHooks
 -- track that reported focus so the list's wrap off the last row can be turned
 -- into "enter the Mods row" instead.
 local listFocusIndexes = {}
+-- Exact physical row identity for keyboard boundary handling. CurrentIndex is
+-- not authoritative once an injected row owns focus, because custom indexes are
+-- deliberately never written into the native list.
+local railFocusKeys = {}
 local pendingFocusRedirects = {}
 -- Focusing an injected UObject raises the native list's FocusEvent again. Those
 -- nested events describe the focus operation this router just requested, not a
@@ -367,8 +370,8 @@ local function menuItemAndPanel(mainList, index)
     return item, wrapper
 end
 
--- Mirrors FieldEquipmentMenu: NumContent is the final zero-based authored index,
--- and rows the game has progression-hidden are trimmed off the tail.
+-- NumContent is the final zero-based authored index, and rows the game has
+-- progression-hidden are trimmed off the tail.
 local function resolveNativeMenuCount(mainMenu, mainList)
     local finalNativeIndex = nil
     pcall(function() finalNativeIndex = tonumber(mainMenu.NumContent) end)
@@ -838,11 +841,6 @@ local function refreshRailPosition(context)
         dbg(string.format("rail position refreshed: index %d (%d native, %d other injected)",
             index, context.nativeCount, others))
     end
-    local rearmed, rearmError = rearmModsEntry(context)
-    if not rearmed then
-        reportRailError(rearmError)
-        return false
-    end
     return true
 end
 
@@ -1057,6 +1055,7 @@ local function injectModsEntry(mainMenu)
     -- table pins menu/world objects across checkpoint teardown.
     injectedMenus = { [menuKey] = true }
     listFocusIndexes = {}
+    railFocusKeys = {}
     pendingFocusRedirects = {}
     railFocusMutationDepth = {}
     -- Seed the focus tracker with wherever the list already is. Without this the
@@ -1065,7 +1064,18 @@ local function injectModsEntry(mainMenu)
     -- falls through to the native wrap.
     local startingIndex = nil
     pcall(function() startingIndex = tonumber(mainList.CurrentIndex) end)
-    listFocusIndexes[objectName(mainList)] = startingIndex
+    local listKey = objectName(mainList)
+    listFocusIndexes[listKey] = startingIndex
+    if type(startingIndex) == "number"
+        and startingIndex >= 0 and startingIndex < nativeCount then
+        local startingItem = nil
+        pcall(function()
+            startingItem = mainList["Item_" .. tostring(startingIndex)]
+        end)
+        if isValid(startingItem) then
+            railFocusKeys[listKey] = objectName(startingItem)
+        end
+    end
     log(string.format("added Mods entry at index %d (%d native rows, %d row(s) from other mods, list at %s)",
         modsIndex, nativeCount, foreignRows, tostring(startingIndex)))
 
@@ -1210,6 +1220,7 @@ focusRailRow = function(context, row)
         reportRailError("focus mutation failed: " .. tostring(focusError))
         return false
     end
+    railFocusKeys[listKey] = row.iconKey
     return true
 end
 
@@ -1234,111 +1245,6 @@ local function moveFromRailKey(context, widgetKey, delta)
     return focusRailRow(context, rows[target])
 end
 
--- The panel is modal. Disable the native list, all authored entries and every
--- foreign injected row. Only the Mods row stays live as the controller input
--- sink; its button is consumed before the outer list can act on it.
-local function setNativeMenuInputEnabled(context, enabled)
-    if context == nil or not isValid(context.mainMenu) then return end
-
-    local targets = {}
-    local targetKeys = {}
-    local function addTarget(target)
-        if not isValid(target) then return end
-        local key = objectName(target)
-        if targetKeys[key] then return end
-        targetKeys[key] = true
-        targets[#targets + 1] = target
-    end
-
-    -- The rows, and deliberately not the list that owns them.
-    --
-    -- The list is the router: the Mods row was given it as its owner input
-    -- widget (SetOwnerInputWidget at injection), so input reaches the panel
-    -- through it. Switching the list off would take the panel's own input with
-    -- it and leave a modal panel nothing could drive -- a worse version of the
-    -- bug being fixed. It also is not what moves: a RODListWidgetBase changes
-    -- focus by handing it to one of its operable children, so a rail whose rows
-    -- all refuse input has nowhere to move the cursor to, which is the whole
-    -- effect wanted here. Only the Mods row stays live, and it is re-enabled
-    -- explicitly below.
-    for index = 0, context.nativeCount - 1 do
-        local item = nil
-        pcall(function() item = context.mainList["Item_" .. tostring(index)] end)
-        addTarget(item)
-    end
-
-    local childCount = nil
-    pcall(function() childCount = context.wrapperParent:GetChildrenCount() end)
-    for index = 0, (tonumber(childCount) or 0) - 1 do
-        local wrapper = nil
-        pcall(function() wrapper = context.wrapperParent:GetChildAt(index) end)
-        local railIcon = iconInsideWrapper(wrapper)
-        if isValid(railIcon) and objectName(railIcon) ~= context.iconKey then
-            addTarget(railIcon)
-        end
-    end
-
-    -- Never gate a UFunction call on `type(widget.Method) == "function"`.
-    -- Indexing a UObject with a UFunction name hands back UE4SS's UFunction
-    -- *userdata* (LuaUObject.cpp -> push_functionproperty), and a name that
-    -- does not resolve hands back an invalid RemoteObject userdata, so the test
-    -- is false for every method on every widget and was true for none of them.
-    -- That is why this function reported "0/9" in every log it ever wrote: the
-    -- panel was never modal, the native list kept navigating underneath it, and
-    -- Up moved the real menu's cursor while Down happened to look clean only
-    -- because the native cursor was already parked on the last row and had
-    -- nowhere further to go.
-    local applied = 0
-    for _, target in ipairs(targets) do
-        if isValid(target) and isValid(context.mainMenu) then
-            -- SetIsEnabled is deliberately not used: it greys the rail out, and
-            -- the rail is still on screen beside the panel. Input is what has to
-            -- stop, not the presentation.
-            pcall(function() target:SetInputEnable(enabled) end)
-            pcall(function() target:BP_SetInputInteractionEnable(enabled) end)
-            -- URODInputWidgetBase also exposes SetInputEnableIndividual /
-            -- SetInputEnableIndividualAll, and they are deliberately not used.
-            -- SetInputEnable is the widget-wide gate above them, so it already
-            -- covers every direction, and it is exactly reversible. The
-            -- per-button switches are not: the game sets them per row, this mod
-            -- never captured what they were, and restoring them wholesale on
-            -- close would hand the rail back more permissive than it was found.
-            -- Turning one switch off is the whole job here.
-
-            -- The setters are void, so "the call did not throw" says nothing.
-            -- These two getters exist on the same class; ask the widget what
-            -- state it is actually in and count that.
-            local live = nil
-            pcall(function() live = target:IsInputEnable() end)
-            if live == nil then
-                pcall(function() live = target:IsInputInteractionEnable() end)
-            end
-            if live == enabled then applied = applied + 1 end
-        end
-    end
-
-    if enabled then
-        local rearmed, rearmError = rearmModsEntry(context)
-        if not rearmed then reportRailError(rearmError) end
-    elseif isValid(context.icon) and isValid(context.mainMenu) then
-        -- The Mods icon remains the sole ROD input sink while the modal panel is
-        -- open. Do not call rearmModsEntry here: restoring main-menu pointer
-        -- interaction belongs exclusively to the close transition.
-        pcall(function() context.icon:SetInputEnable(true) end)
-        pcall(function() context.icon:BP_SetInputInteractionEnable(true) end)
-    end
-
-    if applied < #targets then
-        -- Worth saying out loud rather than hiding behind DEBUG_LOGS: a partial
-        -- capture is exactly the state where the menu underneath still moves.
-        log(string.format("outer menu input %s on only %d/%d widget(s)",
-            enabled and "enabled" or "disabled", applied, #targets))
-    else
-        dbg(string.format("outer menu input %s on %d/%d widget(s); Mods row kept live",
-            enabled and "enabled" or "disabled", applied, #targets))
-    end
-end
-
 local function isModsIcon(widget)
     if activeContext == nil or not isValid(widget) then return false end
     return objectName(widget) == activeContext.iconKey
@@ -1358,8 +1264,7 @@ end
 
 -- World-space menu geometry is not screen geometry on this build: testing the
 -- wrapper with IsUnderLocation made clicks on Settings resolve as Mods. The
--- interactive URODInputWidgetBase already owns the authoritative hover state,
--- which is also the path proven live by FieldEquipPro in the same menu.
+-- interactive URODInputWidgetBase already owns the authoritative hover state.
 local function isMouseHoveringMods(context)
     if context == nil or not isValid(context.icon) then
         return nil, "Mods row is unavailable"
@@ -1412,23 +1317,25 @@ local function buildPanelNow()
     end
 
     -- The panel draws into the menu that is already up. It must never build its
-    -- own copy of the main-menu widget: that class is watched for construction
-    -- by this mod and by FieldEquipmentMenu, and both would try to inject a rail
-    -- row into the uninitialised copy, which crashes the game.
+    -- own copy of this watched widget class: construction observers would treat
+    -- the detached copy as a real menu and mutate an uninitialised widget tree.
     panel.attachTo(context.mainMenu, context.icon)
 
-    -- Capture the outer rail before constructing the modal panel. The same
-    -- physical Accept press continues through native callbacks after this hook;
-    -- capturing first prevents it from advancing the menu underneath.
-    setNativeMenuInputEnabled(context, false)
-    -- A mouse click can open Mods without passing through focusMods. Clear the
-    -- last authored selection before the panel is shown, otherwise the native
-    -- CurrentIndex animation remains lit beside the custom Mods row.
-    resetNativeSelection(context)
+    -- Mouse opening commonly arrives while the native CurrentIndex still owns a
+    -- different authored row. Move actual user focus onto Mods before the panel
+    -- installs its own modal input surface.
+    local focused = focusMods(context)
+    local ownsFocus, focusError = isNavigationFocused(context.icon)
+    if not focused or ownsFocus ~= true then
+        log("cannot open the panel: Mods did not acquire modal focus" ..
+            (focusError and (": " .. tostring(focusError)) or ""))
+        return
+    end
 
     if not panel.open() then
-        setNativeMenuInputEnabled(context, true)
-        log("panel could not be opened; outer menu input was restored")
+        local rearmed, rearmError = rearmModsEntry(context)
+        log("panel could not be opened; Mods row rearm " ..
+            (rearmed and "succeeded" or ("failed: " .. tostring(rearmError))))
         return
     end
 
@@ -1453,9 +1360,18 @@ local function openPanel()
         local ok, err = pcall(buildPanelNow)
         if not ok then
             log("panel failed to open: " .. tostring(err))
-            pcall(panel.close)
+            local cleaned, cleanupError = pcall(panel.close)
+            if not cleaned or panel.isOpen() then
+                log("panel cleanup after open error failed: " ..
+                    tostring(cleanupError))
+                return
+            end
             if activeContext ~= nil then
-                pcall(setNativeMenuInputEnabled, activeContext, true)
+                local rearmed, rearmError = rearmModsEntry(activeContext)
+                if not rearmed then
+                    log("Mods row rearm after panel error failed: " ..
+                        tostring(rearmError))
+                end
             end
         end
     end)
@@ -1482,9 +1398,9 @@ end
 --
 -- The repeats exist because the newcomer's arrival is not synchronous with
 -- anything here: RestartMod only queues, the loader reinstalls the mod on its
--- own event loop, and the mod then waits out its own readiness delay
--- (FieldEquipPro 100ms, this mod 750ms). A single pass at close would easily run
--- before the row it is meant to notice exists. refreshRailPosition is a walk over
+-- own event loop, and the mod then waits out its own readiness delay. A single
+-- pass at close could run before the row it is meant to notice exists.
+-- refreshRailPosition is a walk over
 -- a handful of children and does nothing when the order is already right, so
 -- repeating it is cheap and idempotent.
 --
@@ -1527,24 +1443,36 @@ local function reconcileRailAfterPanel(context, expectNewRows)
     end
 end
 
--- The player must always be able to get out.
---
--- While the panel is up, handleButton consumes every button before anything
--- native sees it, so a panel that will not close is a start menu that cannot be
--- used and cannot be dismissed. Restoring the outer menu's input is therefore
--- unconditional: it does not wait on panel.close() reporting success, and it
--- runs even if that call throws. Those two are separate failures and only one
--- of them traps the player.
+-- The player must always be able to get out. The panel owns and removes its
+-- input shield; it never changes input state on the underlying rail.
 local function closePanel()
     if not panel.isOpen() then return end
     onGameThread(function()
+        local railContext = activeContext
         local closed, closeError = pcall(panel.close)
         if not closed then
             log("panel close failed: " .. tostring(closeError))
+            return
         end
-        -- The panel is down; the rail is nobody's screen now. Start whatever was
-        -- switched on during this session, so those mods inject their rows into
-        -- a menu that is not underneath a modal panel.
+        if panel.isOpen() then
+            log("panel still reports itself open after close")
+            return
+        end
+
+        -- Restoring SubMenu visibility can invalidate pointer state on the one
+        -- injected widget this mod owns. Re-establish only that widget's native
+        -- contract; no authored or third-party row participates.
+        if railContext ~= nil and activeContext == railContext then
+            local rearmed, rearmError = rearmModsEntry(railContext)
+            if not rearmed then
+                log("Mods row rearm after panel close failed: " ..
+                    tostring(rearmError))
+                return
+            end
+        end
+
+        -- The panel and its shield are both down. Start whatever was switched
+        -- on during this session only after the normal menu is exposed again.
         local started = 0
         local flushed, startedOrError = pcall(function()
             return panel.flushPendingStarts()
@@ -1556,20 +1484,11 @@ local function closePanel()
                 tostring(startedOrError))
         end
 
-        if activeContext ~= nil then
-            pcall(setNativeMenuInputEnabled, activeContext, true)
+        if railContext ~= nil and activeContext == railContext then
             -- Reconcile the rail before handing focus back, so the live physical
             -- order is authoritative when focusMods resolves its exact row.
-            reconcileRailAfterPanel(activeContext, started > 0)
-            pcall(focusMods, activeContext)
-        end
-        if panel.isOpen() then
-            -- Nothing below this is a recovery path, so say so plainly rather
-            -- than leaving the player to work out why the menu stopped
-            -- responding.
-            log("panel still reports itself open after close; the start menu " ..
-                "may need to be reopened")
-            return
+            reconcileRailAfterPanel(railContext, started > 0)
+            pcall(focusMods, railContext)
         end
         dbg("panel closed")
     end)
@@ -1845,8 +1764,8 @@ local function isCanonicalMainMenuCandidate(mainMenu)
     end)
 
     -- The interactive start menu is canonically owned by the game's world-space
-    -- widget component. Field Equipment's display-only copy and detached
-    -- objects from a discarded world have no such owner and are rejected.
+    -- widget component. Display-only copies and detached objects from a
+    -- discarded world have no such owner and are rejected.
     return isValid(parentComponent)
 end
 
@@ -1987,6 +1906,7 @@ local notifyOk, notifyError = pcall(function()
                 -- can reach the hooks installed by an earlier menu.
                 activeContext = nil
                 listFocusIndexes = {}
+                railFocusKeys = {}
                 pendingFocusRedirects = {}
                 railFocusMutationDepth = {}
             end
@@ -2033,25 +1953,19 @@ local function acquireExistingMainMenu()
     end
 end
 
--- Going into a start-menu submenu and back out rebuilds the rail.
+-- Going into a start-menu submenu and back out can rebuild or re-gate the rail.
 --
 -- Entering Equipment (or any other native submenu) and returning does not
 -- construct a new start menu -- the same WBP_Console_MainMenu_C object stays
--- alive -- but the game rebuilds the row list underneath it. Every injected row
--- is a child of that list, so every injected row is gone, and because the menu
--- object never changed, NotifyOnNewObject does not fire and nothing here ever
--- learns about it. The Mods row simply stops existing for the rest of the
--- session. FieldEquipPro already re-arms itself on this event, which is why its
--- row comes back and everybody else's does not; that mod's own comment says as
--- much -- "returning from Equipment rebuilds this rail from scratch, which is
--- also how every other mod gets its row back".
+-- alive -- but the game may rebuild the row list underneath it or retain the
+-- injected widget with stale owner/input gates. A detached row needs the normal
+-- injection path; an attached row needs exactly one rearm after the authored
+-- rail is fully presented again.
 --
--- The rebuild is not synchronous with the event, so this checks a few times
--- rather than guessing one delay. activeMenuContextIsAttached is the existing
--- test for "is our row still on the rail it was injected into", and clearing
--- injectedMenus is what lets the normal acquisition path run again -- the same
--- two steps processMenuInjectionCycle already takes, which never reach this case
--- because that cycle's timer stops as soon as there is nothing queued.
+-- Neither outcome is synchronous with the event, so this checks a few readiness
+-- points rather than guessing one delay. `activeMenuContextIsAttached` selects
+-- the two canonical outcomes: rearm in place, or clear the primitive injection
+-- marker and reacquire the current Start Menu.
 local RAIL_REACQUIRE_DELAYS_MS = { 250, 700, 1500 }
 -- ClosedMenu belongs to RODMenuWidgetBase, so it fires for every menu in the
 -- game, and twice in a row for one Equipment exit in the logs. Without this the
@@ -2064,6 +1978,7 @@ local function reacquireRailAfterSubmenu()
     railReacquireInFlight = true
 
     local passes = #RAIL_REACQUIRE_DELAYS_MS
+    local attachedRowRearmed = false
     for _, delay in ipairs(RAIL_REACQUIRE_DELAYS_MS) do
         ExecuteWithDelay(delay, function()
             onGameThread(function()
@@ -2073,7 +1988,25 @@ local function reacquireRailAfterSubmenu()
 
                 local context = activeContext
                 if context ~= nil then
-                    if activeMenuContextIsAttached() then return end
+                    if activeMenuContextIsAttached() then
+                        if attachedRowRearmed then return end
+                        local fullyPresented, presentationError =
+                            nativeRailIsFullyPresented(context)
+                        if fullyPresented == nil then
+                            reportRailError(presentationError)
+                            return
+                        end
+                        if not fullyPresented then return end
+                        if refreshRailPosition(context) ~= true then return end
+                        local rearmed, rearmError = rearmModsEntry(context)
+                        if not rearmed then
+                            reportRailError(rearmError)
+                            return
+                        end
+                        attachedRowRearmed = true
+                        dbg("rearmed Mods after native submenu return")
+                        return
+                    end
                     local staleKey = context.mainMenuKey
                     activeContext = nil
                     if staleKey ~= nil then injectedMenus[staleKey] = nil end
@@ -2159,6 +2092,7 @@ ensureInputHooks = function()
                     -- as a wrap boundary or rewrite the Mods ItemIndex.
                     pendingFocusRedirects[listKey] = nil
                     listFocusIndexes[listKey] = nil
+                    railFocusKeys[listKey] = nil
                     clearModsSelection(context)
                     return
                 end
@@ -2201,6 +2135,7 @@ ensureInputHooks = function()
 
             local row = railRowForKey(rows, widgetKey)
             if row ~= nil and row.injected then
+                railFocusKeys[listKey] = row.iconKey
                 if row.iconKey ~= context.iconKey then clearModsSelection(context) end
                 -- An injected row has no meaningful predecessor in the native
                 -- cursor. Clearing it prevents our own focus calls from turning
@@ -2210,6 +2145,7 @@ ensureInputHooks = function()
                 return
             end
             clearModsSelection(context)
+            if row ~= nil then railFocusKeys[listKey] = row.iconKey end
 
             local index = row and row.nativeIndex or nil
             if index == nil then
@@ -2313,11 +2249,11 @@ end
 --                      KEYBOARD                          --
 --========================================================--
 
--- Controller and keyboard directions on the outer rail have one canonical path:
--- the three input hooks above. Binding the same arrows here moved the rail once
--- through RegisterKeyBind and again through OnInputButtonDown, which is the
--- observed first-press jump. Direct bindings remain modal-panel-only; Enter and
--- LMB keep explicit closed-panel actions because they also support hover.
+-- Inside the authored range, controller and keyboard directions stay on the
+-- native ProcessEvent path. Direct keyboard arrows act only at the two physical
+-- boundaries where the authored list can absorb a press without emitting those
+-- callbacks. They resolve one exact destination rather than applying a second
+-- relative move, so both paths safely converge if the native callback also runs.
 local function activeRailContext()
     local context = activeContext
     if not menuContextIsMounted(context) or not isValid(context.icon) then return nil end
@@ -2327,12 +2263,48 @@ local function activeRailContext()
         return nil
     end
     if not fullyPresented then return nil end
-    local rearmed, rearmError = rearmModsEntry(context)
-    if not rearmed then
-        reportRailError(rearmError)
-        return nil
-    end
     return context
+end
+
+-- Keyboard arrows can be handled internally by the authored list without
+-- reaching any of the ProcessEvent button hooks. At the two physical boundaries
+-- only, use the exact focus identity recorded by FocusEvent and our own focus
+-- mutations. The target is deterministic, so if a native hook also handles the
+-- same press both paths converge on the same row rather than stepping twice.
+local function wrapKeyboardRailBoundary(delta)
+    if panel.isOpen() then return end
+    local context = activeRailContext()
+    if context == nil then return end
+    if refreshRailPosition(context) ~= true then return end
+
+    local rows, railError = collectRailRows(context)
+    if rows == nil then
+        reportRailError(railError)
+        return
+    end
+    local focusKey = railFocusKeys[context.listKey]
+    if type(focusKey) ~= "string" then
+        reportRailError("focused rail identity is unavailable for keyboard wrap")
+        return
+    end
+    local _, position = railRowForKey(rows, focusKey)
+    if position == nil then
+        reportRailError("focused rail row left the visible rail")
+        return
+    end
+
+    local target = nil
+    if delta < 0 and position == 1 then
+        target = rows[#rows]
+    elseif delta > 0 and position == #rows then
+        target = rows[1]
+    end
+    if target ~= nil and takeInputLock() then
+        if focusRailRow(context, target) then
+            dbg(string.format("keyboard boundary wrap: row %d -> row %d",
+                position, delta < 0 and #rows or 1))
+        end
+    end
 end
 
 local function activateModsFromKeyboard()
@@ -2384,20 +2356,12 @@ local function activateModsFromMouse()
     end
     if not hovered then return end
 
-    local focused, focusError = isNavigationFocused(context.icon)
-    if focused == nil then
-        reportRailError(focusError)
-        return
-    end
-
     if takeInputLock() then
-        if not focused then
-            if focusMods(context) then
-                log("LMB selected Mods through native hover")
-            end
-            return
-        end
-        log("LMB confirmed Mods through native hover")
+        -- A mouse press on the injected icon first runs the authored list's
+        -- handler, which restores focus to its native CurrentIndex. Consequently
+        -- HasAnyUserFocus() can never survive until a second click. Hover already
+        -- identifies the exact Mods UObject, so it is the complete click contract.
+        log("LMB opened Mods through native hover")
         openPanel()
     end
 end
@@ -2442,8 +2406,10 @@ end
 -- same code either way. A second keyboard key costs nothing and removes the
 -- single point of failure.
 for _, binding in ipairs({
-    { "UP_ARROW", function() panel.move(-1) end, true },
-    { "DOWN_ARROW", function() panel.move(1) end, true },
+    { "UP_ARROW", function() panel.move(-1) end, true,
+        function() wrapKeyboardRailBoundary(-1) end },
+    { "DOWN_ARROW", function() panel.move(1) end, true,
+        function() wrapKeyboardRailBoundary(1) end },
     { "LEFT_ARROW", function() panel.adjust(-1) end, true },
     { "RIGHT_ARROW", function() panel.adjust(1) end, true },
     { "RETURN", function() panel.activate() end, true,

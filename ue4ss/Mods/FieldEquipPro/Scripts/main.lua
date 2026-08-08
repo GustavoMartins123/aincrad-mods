@@ -1,4 +1,4 @@
--- FieldEquipPro v1.0
+-- FieldEquipPro v1.1
 -- Add a native-styled Equipment entry to Echoes of Aincrad's start menu.
 --
 -- Selecting that entry opens the Equipment screen alone, with the character
@@ -7,7 +7,7 @@
 -- measured on this build.
 
 local MOD_NAME = "FieldEquipPro"
-local MOD_VERSION = "v1.0"
+local MOD_VERSION = "v1.1"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -2325,29 +2325,33 @@ safeHook("/Script/ROD.RODConsoleMainMenuWidgetBase:OnClickMenuItemDelegate",
 
 -- The native list registers mouse delegates for its authored rows only.
 -- UE4SS's key hook still receives LMB while the world-space menu owns input, so
--- use the injected widget's live hover/geometry as its hit-test.
+-- use the injected widget's own hover as the single authoritative hit-test.
 local function isMouseOverInjectedEquipment(context)
     if context == nil or not isValidObject(context.equipmentIcon) then
         return false, "no-icon"
     end
 
-    local hovered = false
-    pcall(function() hovered = context.equipmentIcon:GetIsMouseHover() end)
-    if hovered then return true, "hover" end
-
-    local slateLibrary = StaticFindObject(
-        "/Script/UMG.Default__SlateBlueprintLibrary")
-    if not isValidObject(slateLibrary) then return false, "no-slate" end
-
-    local geometry = nil
-    local mousePosition = nil
-    local under = false
-    local checked = pcall(function()
-        geometry = context.equipmentIcon:GetCachedGeometry()
-        mousePosition = context.equipmentIcon:GetScreenMousePosition()
-        under = slateLibrary:IsUnderLocation(geometry, mousePosition)
+    local visibility = nil
+    local inputEnabled = nil
+    local interactionEnabled = nil
+    local hovered = nil
+    local read, readError = pcall(function()
+        visibility = context.equipmentIcon:GetVisibility()
+        inputEnabled = context.equipmentIcon:IsInputEnable()
+        interactionEnabled = context.equipmentIcon:IsInputInteractionEnable()
+        hovered = context.equipmentIcon:GetIsMouseHover()
     end)
-    return checked and under == true, checked and "geometry" or "geometry-error"
+    if not read or type(visibility) ~= "number"
+        or type(inputEnabled) ~= "boolean"
+        or type(interactionEnabled) ~= "boolean"
+        or type(hovered) ~= "boolean" then
+        return nil, "Equipment hover state is unreadable: " .. tostring(readError)
+    end
+    if visibility ~= VISIBLE or inputEnabled ~= true
+        or interactionEnabled ~= true then
+        return false, "inactive"
+    end
+    return hovered, "hover"
 end
 
 local mouseBindOk, mouseBindError = pcall(function()
@@ -2362,6 +2366,10 @@ local mouseBindOk, mouseBindError = pcall(function()
         end
 
         local hit, method = isMouseOverInjectedEquipment(context)
+        if hit == nil then
+            log("Equipment LMB failed closed: " .. tostring(method))
+            return
+        end
         if not hit then return end
         if mainMenuFocusIndexes[context.listKey] ~= context.equipmentIndex then
             -- Match the authored mouse behavior: the first click selects and

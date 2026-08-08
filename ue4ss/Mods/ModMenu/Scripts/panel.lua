@@ -3,11 +3,11 @@
 -- There is no ImGui binding in this UE4SS build and no authored settings widget
 -- to borrow, so the panel is assembled from engine UMG primitives:
 --
---   host    a clone of the game's own main-menu widget class, used purely as a
---           full-screen canvas. Its authored children are collapsed on creation,
---           so nothing of the original menu shows through. Cloning a class that
---           is known to exist and known to be creatable from Lua avoids guessing
---           at a widget path that may not be loaded.
+--   host    the live main-menu widget. The panel attaches only to its canonical
+--           SubMenu canvas and never constructs or mutates another menu tree.
+--   shield  one transparent full-canvas UButton below the panel. It owns Slate
+--           mouse hit-testing while the panel is open without changing any
+--           input, visibility or focus property on the underlying rail.
 --   rows    two UMG TextBlocks each (label on the left, value on the right),
 --           over transparent UButtons that supply exact Slate mouse targets.
 --   style   copied off a native menu icon's MenuName text rather than built by
@@ -29,17 +29,17 @@ local HIT_TEST_INVISIBLE = 3
 local TEXTBLOCK_CLASS = "/Script/UMG.TextBlock"
 local IMAGE_CLASS = "/Script/UMG.Image"
 local BUTTON_CLASS = "/Script/UMG.Button"
+local SIZE_BOX_CLASS = "/Script/UMG.SizeBox"
 
 local PANEL_LEFT = 220.0
 local PANEL_TOP = 120.0
-local PANEL_WIDTH = 900.0
-local PANEL_HEIGHT = 560.0
+local PANEL_RIGHT_MARGIN = 28.0
+local PANEL_BOTTOM_MARGIN = 24.0
 local ROW_HEIGHT = 34.0
-local LABEL_X = PANEL_LEFT + 48.0
-local VALUE_X = PANEL_LEFT + 620.0
-local FIRST_ROW_Y = PANEL_TOP + 96.0
 local SETTING_INDENT = 32.0
 local MAX_VISIBLE_ROWS = 12
+local MIN_PANEL_WIDTH = 650.0
+local MIN_PANEL_HEIGHT = 560.0
 
 local SELECTED_COLOR = { R = 1.0, G = 0.85, B = 0.35, A = 1.0 }
 local NORMAL_COLOR = { R = 0.88, G = 0.92, B = 1.0, A = 1.0 }
@@ -57,6 +57,7 @@ local canvas = nil
 local rowWidgets = {}
 local titleWidgets = nil
 local styleSource = nil
+local panelLayout = nil
 -- Every widget this panel put into the host, so closing can take out exactly
 -- what it added and nothing else.
 local addedWidgets = {}
@@ -155,11 +156,10 @@ end
 -- The panel draws into the start menu that is already on screen.
 --
 -- It used to create its own clone of WBP_Console_MainMenu_C to use as a blank
--- canvas. That class is the one both this mod and FieldEquipmentMenu watch with
--- NotifyOnNewObject, so creating it made both mods try to inject a rail row into
--- a widget that had never been constructed or added to the viewport — reading a
--- null Slot, which crashed the game outright. Never construct a widget of a
--- watched class; borrow the live one instead.
+-- canvas. Construction observers treated that detached object as a live menu
+-- and tried to mutate a widget tree that had never been initialised or added to
+-- the viewport, reaching a null Slot. Never construct a watched menu class;
+-- borrow the canonical live instance instead.
 --
 -- `icon` is this mod's own rail icon, used purely as a source of font and colour
 -- so no styling widget has to be created either.
@@ -355,10 +355,10 @@ end
 -- target without converting the world-space menu's geometry to screen space.
 -- Text is rendered above it as HIT_TEST_INVISIBLE, so the visible glyphs cannot
 -- steal the pointer from the button underneath.
-local function constructHitTarget(x, y, width, height)
+local function constructHitTarget(x, y, width, height, zOrder)
     local button = constructWidget(BUTTON_CLASS, host)
     if not isValid(button) then return nil end
-    if not placeInCanvas(button, x, y, width, height, 45) then return nil end
+    if not placeInCanvas(button, x, y, width, height, zOrder or 45) then return nil end
 
     local configured, configureError = pcall(function()
         -- UButton exposes IsFocusable as a reflected property on this build; it
@@ -379,69 +379,66 @@ local function constructHitTarget(x, y, width, height)
     return button
 end
 
+local function constructInputShield(width, height)
+    local shield = constructHitTarget(0.0, 0.0, width, height, 35)
+    if not isValid(shield) then return nil end
+
+    local position = nil
+    local size = nil
+    local zOrder = nil
+    local visibility = nil
+    local verified, verifyError = pcall(function()
+        local slot = shield.Slot
+        if not isValid(slot) then error("shield canvas slot is unavailable") end
+        position = slot:GetPosition()
+        size = slot:GetSize()
+        zOrder = slot:GetZOrder()
+        visibility = shield:GetVisibility()
+    end)
+    local positionX = verified and position and tonumber(position.X) or nil
+    local positionY = verified and position and tonumber(position.Y) or nil
+    local sizeX = verified and size and tonumber(size.X) or nil
+    local sizeY = verified and size and tonumber(size.Y) or nil
+    if positionX == nil or positionY == nil or sizeX == nil or sizeY == nil
+        or math.abs(positionX) > 0.01 or math.abs(positionY) > 0.01
+        or math.abs(sizeX - width) > 0.01 or math.abs(sizeY - height) > 0.01
+        or zOrder ~= 35 or visibility ~= VISIBLE then
+        log(string.format(
+            "modal input shield verification failed: %s (pos=%s,%s size=%s,%s z=%s visibility=%s)",
+            tostring(verifyError), tostring(positionX), tostring(positionY),
+            tostring(sizeX), tostring(sizeY), tostring(zOrder), tostring(visibility)))
+        return nil
+    end
+    return shield
+end
+
 local function makeTextNonInteractive(widget)
     if isValid(widget) then
         pcall(function() widget:SetVisibility(HIT_TEST_INVISIBLE) end)
     end
 end
 
--- The start menu's root is a RetainerBox (it renders the whole menu through a
--- material), and a RetainerBox has no AddChildToCanvas. Having children is
--- therefore not enough to be a canvas — the tree has to be walked until a real
--- CanvasPanel turns up.
-local CANVAS_FRAGMENT = "CanvasPanel"
-local MAX_TREE_DEPTH = 8
-
-local function collectCanvasPanels(widget)
-    local found = {}
-    local seen = {}
-
-    local function walk(current, depth)
-        if not isValid(current) or depth > MAX_TREE_DEPTH then return end
-        local key = objectName(current)
-        if seen[key] then return end
-        seen[key] = true
-
-        if string.find(key, CANVAS_FRAGMENT, 1, true) ~= nil then
-            found[#found + 1] = current
-        end
-
-        local count = nil
-        pcall(function() count = current:GetChildrenCount() end)
-        if type(count) ~= "number" then return end
-        for index = 0, count - 1 do
-            local child = nil
-            pcall(function() child = current:GetChildAt(index) end)
-            walk(child, depth + 1)
-        end
-    end
-
-    local root = nil
-    pcall(function() root = widget.WidgetTree.RootWidget end)
-    if not isValid(root) then
-        pcall(function() root = widget:GetRootWidget() end)
-    end
-    walk(root, 0)
-    return found
-end
-
--- Attaching is the only honest test that a widget really is a usable canvas, so
--- each candidate is tried for real and the first one that accepts a child wins.
+-- WBP_Console_MainMenu_C exposes one authored UCanvasPanel named SubMenu. It is
+-- the panel's only attachment point: searching for an arbitrary canvas would be
+-- a second path and could put the input shield in a different widget subtree.
 local function resolveCanvas(widget, probe)
-    local candidates = collectCanvasPanels(widget)
-    log(string.format("found %d candidate canvas panel(s)", #candidates))
-
-    for _, candidate in ipairs(candidates) do
-        local slot = nil
-        pcall(function() slot = candidate:AddChildToCanvas(probe) end)
-        if isValid(slot) then
-            log("panel canvas resolved: " .. objectName(candidate))
-            return candidate, slot
-        end
+    local candidate = nil
+    local resolved, resolveError = pcall(function() candidate = widget.SubMenu end)
+    if not resolved or not isValid(candidate) then
+        log("canonical SubMenu canvas is unavailable: " .. tostring(resolveError))
+        return nil, nil
     end
 
-    log("no canvas accepted a child; run 'modmenu probe' and share the output")
-    return nil, nil
+    local slot = nil
+    local attached, attachError =
+        pcall(function() slot = candidate:AddChildToCanvas(probe) end)
+    if not attached or not isValid(slot) then
+        if isValid(probe) then pcall(function() probe:RemoveFromParent() end) end
+        log("canonical SubMenu rejected the panel: " .. tostring(attachError))
+        return nil, nil
+    end
+    log("panel canvas resolved: " .. objectName(candidate))
+    return candidate, slot
 end
 
 -- Walks from the canvas up through its parents, forcing anything collapsed or
@@ -496,6 +493,59 @@ local function restoreVisibilityChain()
     restoreVisibility = nil
 end
 
+local function resolvePanelLayout()
+    local sizeBoxClass = StaticFindObject(SIZE_BOX_CLASS)
+    if not isValid(sizeBoxClass) then
+        return nil, "canonical SizeBox class is unavailable"
+    end
+
+    local sizeBox = nil
+    local desiredSize = nil
+    local measured, measureError = pcall(function()
+        sizeBox = canvas.Slot.Parent
+        if not isValid(sizeBox) or not sizeBox:IsA(sizeBoxClass) then
+            error("SubMenu parent is not the canonical SizeBox")
+        end
+        host:ForceLayoutPrepass()
+        sizeBox:ForceLayoutPrepass()
+        desiredSize = sizeBox:GetDesiredSize()
+    end)
+    local canvasWidth = measured and desiredSize and tonumber(desiredSize.X) or nil
+    local canvasHeight = measured and desiredSize and tonumber(desiredSize.Y) or nil
+    if canvasWidth == nil or canvasHeight == nil
+        or canvasWidth ~= canvasWidth or canvasHeight ~= canvasHeight
+        or canvasWidth <= 0.0 or canvasHeight <= 0.0 then
+        return nil, "SubMenu SizeBox desired size is unreadable: " ..
+            tostring(measureError)
+    end
+
+    local panelWidth = canvasWidth - PANEL_LEFT - PANEL_RIGHT_MARGIN
+    local panelHeight = canvasHeight - PANEL_TOP - PANEL_BOTTOM_MARGIN
+    if panelWidth < MIN_PANEL_WIDTH or panelHeight < MIN_PANEL_HEIGHT then
+        return nil, string.format(
+            "SubMenu %.1fx%.1f leaves only %.1fx%.1f for the panel; need at least %.1fx%.1f",
+            canvasWidth, canvasHeight, panelWidth, panelHeight,
+            MIN_PANEL_WIDTH, MIN_PANEL_HEIGHT)
+    end
+
+    local layout = {
+        canvasWidth = canvasWidth,
+        canvasHeight = canvasHeight,
+        panelLeft = PANEL_LEFT,
+        panelTop = PANEL_TOP,
+        panelWidth = panelWidth,
+        panelHeight = panelHeight,
+        panelRight = PANEL_LEFT + panelWidth,
+        labelX = PANEL_LEFT + 48.0,
+        valueX = PANEL_LEFT + panelWidth - 205.0,
+        firstRowY = PANEL_TOP + 96.0,
+    }
+    log(string.format(
+        "responsive layout: canvas %.1fx%.1f, panel %.1fx%.1f",
+        canvasWidth, canvasHeight, panelWidth, panelHeight))
+    return layout, nil
+end
+
 -- Takes out only what the panel put in. The host belongs to the game, so
 -- detaching it would tear the start menu down with it.
 local function destroyPanel()
@@ -505,6 +555,7 @@ local function destroyPanel()
     addedWidgets = {}
     restoreVisibilityChain()
     canvas = nil
+    panelLayout = nil
     rowWidgets = {}
     titleWidgets = nil
     if not isValid(host) then
@@ -535,28 +586,53 @@ local function buildPanel()
         destroyPanel()
         return false
     end
+    -- resolveCanvas has already attached the probe. Track it before any later
+    -- validation can fail so destroyPanel always removes exactly what was added.
+    addedWidgets[#addedWidgets + 1] = background
 
     -- The canvas the game hands over is its SubMenu area, which stays collapsed
     -- until a submenu opens. Without this the whole panel is built correctly and
     -- renders nothing at all.
     restoreVisibility = forceVisibleChain(canvas)
+    local layoutError = nil
+    panelLayout, layoutError = resolvePanelLayout()
+    if panelLayout == nil then
+        log("cannot build panel: " .. tostring(layoutError))
+        destroyPanel()
+        return false
+    end
+    local layout = panelLayout
 
-    addedWidgets[#addedWidgets + 1] = background
+    -- This is the complete mouse-modal boundary. It belongs to ModMenu's own
+    -- panel subtree and covers the canonical canvas below every action target.
+    -- Underlying native or injected rows are neither discovered nor modified.
+    local inputShield = constructInputShield(
+        layout.canvasWidth, layout.canvasHeight)
+    if not isValid(inputShield) then
+        log("cannot build panel: modal input shield is unavailable")
+        destroyPanel()
+        return false
+    end
+
     pcall(function() background:SetVisibility(VISIBLE) end)
     pcall(function() background:SetRenderOpacity(1.0) end)
     pcall(function()
         background:SetColorAndOpacity({ R = 0.02, G = 0.03, B = 0.06, A = 0.88 })
     end)
     pcall(function() backgroundSlot:SetAutoSize(false) end)
-    pcall(function() backgroundSlot:SetPosition({ X = PANEL_LEFT, Y = PANEL_TOP }) end)
-    pcall(function() backgroundSlot:SetSize({ X = PANEL_WIDTH, Y = PANEL_HEIGHT }) end)
+    pcall(function()
+        backgroundSlot:SetPosition({ X = layout.panelLeft, Y = layout.panelTop })
+    end)
+    pcall(function()
+        backgroundSlot:SetSize({ X = layout.panelWidth, Y = layout.panelHeight })
+    end)
     pcall(function() backgroundSlot:SetZOrder(40) end)
 
     local title = constructWidget(TEXTBLOCK_CLASS, host)
     if isValid(title) then
         pcall(function() title:SetText(FText("MODS")) end)
         styleText(title, HEADER_COLOR)
-        placeInCanvas(title, LABEL_X, PANEL_TOP + 36.0, nil)
+        placeInCanvas(title, layout.labelX, layout.panelTop + 36.0, nil)
         makeTextNonInteractive(title)
     end
 
@@ -564,16 +640,22 @@ local function buildPanel()
     if isValid(footer) then
         pcall(function()
             footer:SetText(FText(
-                "Mouse: name expand | value -/+ | Close    Keys: arrows | Enter | Back" ..
-                "    * restart    + reopen"))
+                "Mouse: name | value -/+ | Close    Keys: arrows | Enter | Back"))
+            footer:SetAutoWrapText(true)
         end)
         styleText(footer, MUTED_COLOR)
-        placeInCanvas(footer, LABEL_X, PANEL_TOP + PANEL_HEIGHT - 44.0, nil)
+        placeInCanvas(
+            footer,
+            layout.labelX,
+            layout.panelTop + layout.panelHeight - 44.0,
+            layout.panelWidth - 96.0,
+            40.0,
+            50)
         makeTextNonInteractive(footer)
     end
 
-    local closeX = PANEL_LEFT + PANEL_WIDTH - 154.0
-    local closeY = PANEL_TOP + 27.0
+    local closeX = layout.panelRight - 154.0
+    local closeY = layout.panelTop + 27.0
     local closeHit = constructHitTarget(closeX, closeY, 112.0, 40.0)
     if not isValid(closeHit) then
         log("cannot build panel: close mouse target is unavailable")
@@ -593,27 +675,28 @@ local function buildPanel()
         title = title,
         footer = footer,
         background = background,
+        inputShield = inputShield,
         closeText = closeText,
         closeHit = closeHit,
     }
 
     -- Fixed viewport: render maps these widgets onto a moving window in `rows`.
-    local rowHitLeft = PANEL_LEFT + 32.0
-    local valueHitLeft = VALUE_X - 24.0
-    local valueHitRight = PANEL_LEFT + PANEL_WIDTH - 40.0
+    local rowHitLeft = layout.panelLeft + 32.0
+    local valueHitLeft = layout.valueX - 24.0
+    local valueHitRight = layout.panelRight - 40.0
     local valueHalfWidth = (valueHitRight - valueHitLeft) / 2.0
     for index = 1, MAX_VISIBLE_ROWS do
         local label = constructWidget(TEXTBLOCK_CLASS, host)
         local value = constructWidget(TEXTBLOCK_CLASS, host)
-        local y = FIRST_ROW_Y + (index - 1) * ROW_HEIGHT
+        local y = layout.firstRowY + (index - 1) * ROW_HEIGHT
         if isValid(label) then
             styleText(label, NORMAL_COLOR)
-            placeInCanvas(label, LABEL_X, y, nil)
+            placeInCanvas(label, layout.labelX, y, nil)
             makeTextNonInteractive(label)
         end
         if isValid(value) then
             styleText(value, NORMAL_COLOR)
-            placeInCanvas(value, VALUE_X, y, nil)
+            placeInCanvas(value, layout.valueX, y, nil)
             makeTextNonInteractive(value)
         end
 
@@ -645,7 +728,7 @@ local function buildPanel()
     -- panel's widgets sit above it on Z order alone.
     log("panel built with " .. tostring(MAX_VISIBLE_ROWS) ..
         " virtual row slots and " .. tostring(MAX_VISIBLE_ROWS * 3 + 1) ..
-        " exact mouse targets")
+        " exact mouse targets plus its modal input shield")
     return true
 end
 
@@ -691,9 +774,12 @@ function Panel.render()
                 styleText(labelWidget, color)
                 local slot = nil
                 pcall(function() slot = labelWidget.Slot end)
-                if isValid(slot) then
+                if isValid(slot) and panelLayout ~= nil then
                     pcall(function()
-                        slot:SetPosition({ X = LABEL_X + indent, Y = widgets.y })
+                        slot:SetPosition({
+                            X = panelLayout.labelX + indent,
+                            Y = widgets.y,
+                        })
                     end)
                 end
             end
@@ -942,6 +1028,9 @@ function Panel.clickHovered()
 
     if titleWidgets == nil then
         return nil, "panel title widgets are unavailable"
+    end
+    if not isValid(titleWidgets.inputShield) then
+        return nil, "panel modal input shield is unavailable"
     end
     local closeHovered, closeError =
         readHitTargetHover(titleWidgets.closeHit, "close")
