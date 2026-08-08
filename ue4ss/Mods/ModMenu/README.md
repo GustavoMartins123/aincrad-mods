@@ -1,6 +1,6 @@
 # ModMenu
 
-ModMenu **v1.5.8** adds a native-styled **Mods** entry to Echoes of Aincrad's
+ModMenu **v1.5.9** adds a native-styled **Mods** entry to Echoes of Aincrad's
 Start Menu.
 
 It discovers installed UE4SS Lua mods directly from the `Mods` directory. Every

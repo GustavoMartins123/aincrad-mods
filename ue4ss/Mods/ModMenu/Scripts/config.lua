@@ -13,7 +13,7 @@ return {
     -- fail explicitly.
     ICON_LETTER = "M",
     -- Position calibrated against the native 64x64 rail icon.
-    ICON_LETTER_OFFSET = { X = 30.0, Y = 30.0 },
+    ICON_LETTER_OFFSET = { X = 38.0, Y = 30.0 },
 
     -- Letter colour. 1.0 everywhere = white.
     ICON_TINT = { R = 1.00, G = 1.00, B = 1.00, A = 1.00 },

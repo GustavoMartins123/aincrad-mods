@@ -1,4 +1,4 @@
--- ModMenu v1.5.8
+-- ModMenu v1.5.9
 -- Adds a native-styled "Mods" entry to Echoes of Aincrad's start menu, opening a
 -- panel that enables/disables the other mods and retunes their values in-game.
 --
@@ -12,7 +12,7 @@
 -- mod's Lua state, because UE4SS gives each mod its own.
 
 local MOD_NAME = "ModMenu"
-local MOD_VERSION = "v1.5.8"
+local MOD_VERSION = "v1.5.9"
 
 local MAIN_MENU_ICON_CLASS =
     "/Game/ROD/Widget/Console/MainMenu/WBP_Console_MainMenu_MenuIcon.WBP_Console_MainMenu_MenuIcon_C"
@@ -127,6 +127,10 @@ local ensureInputHooks
 -- into "enter the Mods row" instead.
 local listFocusIndexes = {}
 local pendingFocusRedirects = {}
+-- Focusing an injected UObject raises the native list's FocusEvent again. Those
+-- nested events describe the focus operation this router just requested, not a
+-- second player input, so they must never be interpreted as another list wrap.
+local railFocusMutationDepth = {}
 local lastRailError = nil
 -- Reported once per panel session rather than once per frame.
 local warnedFocusWhilePanelOpen = false
@@ -165,6 +169,21 @@ local function unwrap(parameter)
     local ok, value = pcall(function() return parameter:get() end)
     if ok then return value end
     return parameter
+end
+
+-- RegisterHook parameters are RemoteUnrealParam objects whose storage is valid
+-- only during the callback. Input routing is not allowed to keep the wrapper or
+-- silently use it as if it were the decoded UObject/value: doing that eventually
+-- tries to call the RemoteUnrealParam itself and UE4SS removes the whole hook.
+local function hookValue(parameter, label)
+    if parameter == nil then
+        error(tostring(label) .. " hook parameter is unavailable")
+    end
+    local ok, value = pcall(function() return parameter:get() end)
+    if not ok then
+        error(tostring(label) .. " hook parameter decode failed: " .. tostring(value))
+    end
+    return value
 end
 
 local function contains(value, fragment)
@@ -532,9 +551,8 @@ local function reportRailError(message)
     log("rail navigation unavailable: " .. message)
 end
 
-local function railRowForWidget(rows, widget)
-    if type(rows) ~= "table" or not isValid(widget) then return nil, nil end
-    local widgetKey = objectName(widget)
+local function railRowForKey(rows, widgetKey)
+    if type(rows) ~= "table" or type(widgetKey) ~= "string" then return nil, nil end
     for index, row in ipairs(rows) do
         if row.iconKey == widgetKey then return row, index end
     end
@@ -554,6 +572,18 @@ local function railBoundaries(rows)
         end
     end
     return firstNative, lastNative, firstInjected, lastInjected
+end
+
+-- Returns an authored index only for the exact UObject stored in Item_0..Item_6.
+-- If that object is absent from collectRailRows, its wrapper is hidden/collapsed
+-- and it must be skipped instead of becoming an invisible navigation target.
+local function authoredIndexForKey(context, widgetKey)
+    if context == nil or type(widgetKey) ~= "string" then return nil end
+    for index = 0, MAX_NATIVE_MENU_ITEMS - 1 do
+        local item = menuItemAndPanel(context.mainList, index)
+        if isValid(item) and objectName(item) == widgetKey then return index end
+    end
+    return nil
 end
 
 -- Draws a letter over the row instead of relying on a texture. The donor wrapper
@@ -932,6 +962,7 @@ local function injectModsEntry(mainMenu)
     injectedMenus = { [menuKey] = true }
     listFocusIndexes = {}
     pendingFocusRedirects = {}
+    railFocusMutationDepth = {}
     -- Seed the focus tracker with wherever the list already is. Without this the
     -- first wrap after opening the menu has no previous index to compare against
     -- and cannot be recognised, so the first attempt to reach Mods silently
@@ -1019,7 +1050,7 @@ local function focusMods(context)
         reportRailError(railError)
         return
     end
-    local row = railRowForWidget(rows, context.icon)
+    local row = railRowForKey(rows, context.iconKey)
     if row == nil then
         reportRailError("Mods icon is not a visible rail row")
         return
@@ -1043,35 +1074,51 @@ focusRailRow = function(context, row)
     end
     lastRailError = nil
 
-    local liveRow = railRowForWidget(rows, row.icon)
+    local liveRow = railRowForKey(rows, row.iconKey)
     if liveRow == nil then
         reportRailError("focus target left the visible rail")
         return false
     end
     row = liveRow
 
-    -- No authored animation knows about injected rows. Clear every non-target
-    -- injected icon explicitly, and clear the native array before focusing a
-    -- custom row so exactly one row is presented as selected.
-    for _, candidate in ipairs(rows) do
-        if candidate.injected and candidate.iconKey ~= row.iconKey then
-            pcall(function() candidate.icon:SetDefaultAnimation() end)
-        end
-    end
-
+    local listKey = context.listKey
     if row.injected then
-        resetNativeSelection(context)
-        focusIcon(context, row.icon, nil)
-    else
-        clearModsSelection(context)
-        focusIcon(context, row.icon, row.nativeIndex)
+        -- There is no native cursor index for this target. Clear the predecessor
+        -- before any UObject focus call so even an asynchronously reported native
+        -- side effect cannot be mistaken for a wrap from the previous boundary.
+        listFocusIndexes[listKey] = nil
     end
-    if row.iconKey == context.iconKey then enforceIconLetter(context) end
+    railFocusMutationDepth[listKey] = (railFocusMutationDepth[listKey] or 0) + 1
+    local focused, focusError = xpcall(function()
+        -- No authored animation knows about injected rows. Clear every non-target
+        -- injected icon explicitly, and clear the native array before focusing a
+        -- custom row so exactly one row is presented as selected.
+        for _, candidate in ipairs(rows) do
+            if candidate.injected and candidate.iconKey ~= row.iconKey then
+                pcall(function() candidate.icon:SetDefaultAnimation() end)
+            end
+        end
+
+        if row.injected then
+            resetNativeSelection(context)
+            focusIcon(context, row.icon, nil)
+        else
+            clearModsSelection(context)
+            focusIcon(context, row.icon, row.nativeIndex)
+        end
+        if row.iconKey == context.iconKey then enforceIconLetter(context) end
+    end, debug.traceback)
+    local depth = (railFocusMutationDepth[listKey] or 1) - 1
+    railFocusMutationDepth[listKey] = depth > 0 and depth or nil
+    if not focused then
+        reportRailError("focus mutation failed: " .. tostring(focusError))
+        return false
+    end
     return true
 end
 
-local function moveFromRailWidget(context, widget, delta)
-    if context == nil or not isValid(widget) then return false end
+local function moveFromRailKey(context, widgetKey, delta)
+    if context == nil or type(widgetKey) ~= "string" then return false end
     pcall(refreshRailPosition, context)
 
     local rows, railError = collectRailRows(context)
@@ -1079,7 +1126,7 @@ local function moveFromRailWidget(context, widget, delta)
         reportRailError(railError)
         return false
     end
-    local _, current = railRowForWidget(rows, widget)
+    local _, current = railRowForKey(rows, widgetKey)
     if current == nil then
         reportRailError("input widget is not a visible rail row")
         return false
@@ -1089,16 +1136,6 @@ local function moveFromRailWidget(context, widget, delta)
     if target < 1 then target = #rows end
     if target > #rows then target = 1 end
     return focusRailRow(context, rows[target])
-end
-
-local function focusRowAbove(context)
-    if context == nil then return end
-    moveFromRailWidget(context, context.icon, -1)
-end
-
-local function focusFirstNative(context)
-    if context == nil then return end
-    moveFromRailWidget(context, context.icon, 1)
 end
 
 -- The panel is modal. Disable the native list, all authored entries and every
@@ -1243,26 +1280,6 @@ local function isMouseOverModsRow(context)
         return nil, "Mods row hit-test failed: " .. tostring(hitError)
     end
     return under, nil
-end
-
-local function focusedInjectedRailRow(context)
-    local rows, railError = collectRailRows(context)
-    if rows == nil then return nil, railError end
-
-    local focusedRow = nil
-    for _, row in ipairs(rows) do
-        if row.injected then
-            local focused, focusError = isNavigationFocused(row.icon)
-            if focused == nil then return nil, focusError end
-            if focused then
-                if focusedRow ~= nil then
-                    return nil, "more than one injected row reports navigation focus"
-                end
-                focusedRow = row
-            end
-        end
-    end
-    return focusedRow, nil
 end
 
 --========================================================--
@@ -1495,11 +1512,10 @@ end
 -- Without a lock a single press would step two or three rows at once.
 local inputLocked = false
 
-local function withInputLock(action)
+local function takeInputLock()
     if inputLocked then return false end
     inputLocked = true
     ExecuteWithDelay(60, function() inputLocked = false end)
-    action()
     return true
 end
 
@@ -1524,24 +1540,21 @@ local function routeToPanel(button)
         return true
     end
 
-    local action = nil
     local direction = directionOf(button)
     if direction == "up" then
-        action = function() panel.move(-1) end
+        if takeInputLock() then panel.move(-1) end
     elseif direction == "down" then
-        action = function() panel.move(1) end
+        if takeInputLock() then panel.move(1) end
     elseif direction == "left" then
-        action = function() panel.adjust(-1) end
+        if takeInputLock() then panel.adjust(-1) end
     elseif direction == "right" then
-        action = function() panel.adjust(1) end
+        if takeInputLock() then panel.adjust(1) end
     elseif button == ACCEPT_BUTTON then
-        action = function() panel.activate() end
+        if takeInputLock() then panel.activate() end
     end
 
-    -- Taking the shared input lock for a button that maps to nothing would
-    -- block the keybind carrying the same press from acting on it.
-    if action ~= nil then
-        withInputLock(action)
+    local routed = direction ~= nil or button == ACCEPT_BUTTON
+    if routed then
         if activeContext ~= nil then
             pcall(resetNativeSelection, activeContext)
         end
@@ -1558,12 +1571,18 @@ end
 --========================================================--
 
 local function consumeButton(buttonParameter)
-    pcall(function() buttonParameter:set(0) end)
+    if buttonParameter == nil then error("button hook parameter is unavailable") end
+    local ok, consumeError = pcall(function() buttonParameter:set(0) end)
+    if not ok then
+        error("button hook parameter could not be consumed: " .. tostring(consumeError))
+    end
+    return true
 end
 
 local function handleButton(widgetParameter, buttonParameter)
-    local widget = unwrap(widgetParameter)
-    local button = unwrap(buttonParameter)
+    local widget = hookValue(widgetParameter, "input widget")
+    local button = tonumber(hookValue(buttonParameter, "input button"))
+    if button == nil then error("input button did not decode to a number") end
 
     if panel.isOpen() then
         consumeButton(buttonParameter)
@@ -1576,7 +1595,8 @@ local function handleButton(widgetParameter, buttonParameter)
     local context = activeContext
     if context == nil then return end
     local widgetName = objectName(widget)
-    if not isModsIcon(widget) and not contains(widgetName, MENU_ICON_FRAGMENT) then
+    local widgetKey = widgetName
+    if widgetKey ~= context.iconKey and not contains(widgetName, MENU_ICON_FRAGMENT) then
         return
     end
 
@@ -1586,17 +1606,53 @@ local function handleButton(widgetParameter, buttonParameter)
         return
     end
     lastRailError = nil
-    local row = railRowForWidget(rows, widget)
-    if row == nil then return end
-
     local direction = directionOf(button)
+    local row = railRowForKey(rows, widgetKey)
+    if row == nil then
+        local hiddenIndex = authoredIndexForKey(context, widgetKey)
+        if hiddenIndex == nil then return end
+
+        -- An authored UObject that is absent from `rows` is not navigable. This
+        -- is normally the progression-hidden Logout Item_6. Consume its input
+        -- before the invisible row can act, then recover to a visible physical
+        -- neighbour without consulting its stale ItemIndex.
+        if direction == "up" or direction == "down" or button == ACCEPT_BUTTON then
+            consumeButton(buttonParameter)
+            if takeInputLock() then
+                local firstNative, lastNative, firstInjected, lastInjected =
+                    railBoundaries(rows)
+                local target = nil
+                if direction == "up" then
+                    target = lastNative
+                elseif direction == "down" then
+                    target = firstInjected
+                else
+                    local previous = listFocusIndexes[context.listKey]
+                    target = firstNative ~= nil
+                        and previous == firstNative.nativeIndex
+                        and lastInjected or firstInjected
+                end
+                if target == nil then
+                    reportRailError("hidden authored row has no visible neighbour")
+                else
+                    dbg("ignored hidden authored row " .. tostring(hiddenIndex) ..
+                        " and restored visible rail focus")
+                    focusRailRow(context, target)
+                end
+            end
+        elseif direction ~= nil then
+            consumeButton(buttonParameter)
+        end
+        return
+    end
+
     if row.iconKey == context.iconKey then
         if button == ACCEPT_BUTTON then
             consumeButton(buttonParameter)
             -- Keyboard Enter can reach both this hook and the direct keybind.
             -- Taking the shared lock here prevents the same physical press from
             -- opening the panel and immediately activating its first row.
-            withInputLock(openPanel)
+            if takeInputLock() then openPanel() end
         elseif button == BACK_BUTTON then
             consumeButton(buttonParameter)
             -- Match Equipment's proven close path: leave the native input hook
@@ -1606,10 +1662,10 @@ local function handleButton(widgetParameter, buttonParameter)
             consumeButton(buttonParameter)
             -- Physical adjacency is owned here, independent of another mod's
             -- hook order or its cached custom index.
-            withInputLock(function() focusRowAbove(activeContext) end)
+            if takeInputLock() then moveFromRailKey(context, row.iconKey, -1) end
         elseif direction == "down" then
             consumeButton(buttonParameter)
-            withInputLock(function() focusFirstNative(activeContext) end)
+            if takeInputLock() then moveFromRailKey(context, row.iconKey, 1) end
         elseif direction ~= nil then
             -- Left and right mean nothing on the rail, but the Mods row is not
             -- part of the authored list, so letting them through hands the
@@ -1626,7 +1682,7 @@ local function handleButton(widgetParameter, buttonParameter)
     if row.injected and (direction == "up" or direction == "down") then
         consumeButton(buttonParameter)
         local delta = direction == "up" and -1 or 1
-        withInputLock(function() moveFromRailWidget(context, widget, delta) end)
+        if takeInputLock() then moveFromRailKey(context, row.iconKey, delta) end
         return
     end
 
@@ -1635,16 +1691,51 @@ local function handleButton(widgetParameter, buttonParameter)
         or (direction == "up" and row == firstNative) then
         consumeButton(buttonParameter)
         local delta = direction == "up" and -1 or 1
-        withInputLock(function() moveFromRailWidget(context, widget, delta) end)
+        if takeInputLock() then moveFromRailKey(context, row.iconKey, delta) end
     end
 end
 
+local function handleButtonFailClosed(source, widgetParameter, buttonParameter)
+    local ok, inputError = xpcall(
+        handleButton, debug.traceback, widgetParameter, buttonParameter)
+    if ok then return end
+
+    -- The press that failed must not fall through to the authored list: that is
+    -- how a routing error selects the invisible Item_6. Keep the hook installed,
+    -- swallow this one press and emit the exact Lua line for the next test.
+    local consumed, consumeError = pcall(consumeButton, buttonParameter)
+    log(string.format(
+        "%s input failed closed (button consumed=%s): %s%s",
+        tostring(source), tostring(consumed), tostring(inputError),
+        consumed and "" or (" / consume failed: " .. tostring(consumeError))))
+end
+
+-- UE4SS removes a ProcessEvent hook permanently when its Lua callback throws.
+-- Every callback is retained strongly and contains its own error so one bad
+-- event cannot silently delete controller, keyboard or mouse navigation.
+local retainedHookCallbacks = {}
+
+local function guardedHookCallback(path, phase, callback)
+    local guarded = function(...)
+        local ok, callbackError = xpcall(callback, debug.traceback, ...)
+        if not ok then
+            log(string.format("%s %s hook failed closed: %s",
+                tostring(path), tostring(phase), tostring(callbackError)))
+        end
+    end
+    retainedHookCallbacks[#retainedHookCallbacks + 1] = guarded
+    return guarded
+end
+
 local function safeHook(path, callback, postCallback)
+    local guardedPre = guardedHookCallback(path, "pre", callback)
+    local guardedPost = postCallback ~= nil
+        and guardedHookCallback(path, "post", postCallback) or nil
     local ok, err = pcall(function()
-        if postCallback ~= nil then
-            RegisterHook(path, callback, postCallback)
+        if guardedPost ~= nil then
+            RegisterHook(path, guardedPre, guardedPost)
         else
-            RegisterHook(path, callback)
+            RegisterHook(path, guardedPre)
         end
     end)
     if not ok then log("hook unavailable: " .. path .. " / " .. tostring(err)) end
@@ -1805,6 +1896,7 @@ local notifyOk, notifyError = pcall(function()
                 activeContext = nil
                 listFocusIndexes = {}
                 pendingFocusRedirects = {}
+                railFocusMutationDepth = {}
             end
             -- Do not capture the UObject in delayed work. Only its primitive
             -- identity crosses the readiness delay.
@@ -1914,17 +2006,20 @@ ensureInputHooks = function()
 
     safeHook("/Script/ROD.RODConsoleMainMenuWidgetBase:OnButtonDownMenuItemDelegate",
         function(_, widgetParameter, buttonParameter)
-            handleButton(widgetParameter, buttonParameter)
+            handleButtonFailClosed(
+                "main-menu delegate", widgetParameter, buttonParameter)
         end)
 
     safeHook("/Script/ROD.RODInputWidgetBase:OnInputButtonDown",
         function(_, widgetParameter, buttonParameter)
-            handleButton(widgetParameter, buttonParameter)
+            handleButtonFailClosed(
+                "input-widget", widgetParameter, buttonParameter)
         end)
 
     safeHook("/Script/ROD.RODListWidgetBase:ButtonDownEvent",
         function(_, widgetParameter, buttonParameter)
-            handleButton(widgetParameter, buttonParameter)
+            handleButtonFailClosed(
+                "list-widget", widgetParameter, buttonParameter)
         end)
 
     -- Pressing down on the last row never reaches the button hooks above: the
@@ -1938,7 +2033,7 @@ ensureInputHooks = function()
     safeHook("/Script/ROD.RODListWidgetBase:FocusEvent",
         function(self, widgetParameter)
             local context = activeContext
-            local listKey = objectName(unwrap(self))
+            local listKey = objectName(hookValue(self, "focus list"))
             if listKey == nil then return end
 
             -- activeContext belongs to the exact list that received the Mods
@@ -1947,6 +2042,11 @@ ensureInputHooks = function()
             -- Touching that previous widget tree is a native use-after-free;
             -- reject the foreign list before dereferencing any stored UObject.
             if context == nil or listKey ~= context.listKey then
+                pendingFocusRedirects[listKey] = nil
+                return
+            end
+
+            if (railFocusMutationDepth[listKey] or 0) > 0 then
                 pendingFocusRedirects[listKey] = nil
                 return
             end
@@ -1979,8 +2079,9 @@ ensureInputHooks = function()
             end
             if not contains(listKey, "WBP_Console_MainMenu_List_C") then return end
 
-            local widget = unwrap(widgetParameter)
+            local widget = hookValue(widgetParameter, "focused widget")
             if not isValid(widget) then return end
+            local widgetKey = objectName(widget)
 
             local rows, railError = collectRailRows(context)
             if rows == nil then
@@ -1990,9 +2091,13 @@ ensureInputHooks = function()
             end
             lastRailError = nil
 
-            local row = railRowForWidget(rows, widget)
+            local row = railRowForKey(rows, widgetKey)
             if row ~= nil and row.injected then
                 if row.iconKey ~= context.iconKey then clearModsSelection(context) end
+                -- An injected row has no meaningful predecessor in the native
+                -- cursor. Clearing it prevents our own focus calls from turning
+                -- 5 -> injected -> 0 into a fictitious second wrap.
+                listFocusIndexes[listKey] = nil
                 pendingFocusRedirects[listKey] = nil
                 return
             end
@@ -2000,18 +2105,7 @@ ensureInputHooks = function()
 
             local index = row and row.nativeIndex or nil
             if index == nil then
-                -- A hidden authored row is absent from `rows`. Recognise it by
-                -- exact UObject identity, never by a stale/custom ItemIndex.
-                local widgetKey = objectName(widget)
-                for authoredIndex = 0, MAX_NATIVE_MENU_ITEMS - 1 do
-                    local authoredItem = menuItemAndPanel(
-                        context.mainList, authoredIndex)
-                    if isValid(authoredItem)
-                        and objectName(authoredItem) == widgetKey then
-                        index = authoredIndex
-                        break
-                    end
-                end
+                index = authoredIndexForKey(context, widgetKey)
             end
             if index == nil then return end
 
@@ -2037,6 +2131,12 @@ ensureInputHooks = function()
                 redirect = "first"
             elseif row == nil and previousIndex == firstNative.nativeIndex then
                 redirect = "last"
+            elseif row == nil then
+                -- A hidden authored row is never a valid resting place. With no
+                -- native predecessor (for example after a foreign injected row)
+                -- choose the first injected row deterministically so the cursor
+                -- remains visible instead of preserving an invalid selection.
+                redirect = "first"
             end
             pendingFocusRedirects[listKey] = redirect
             dbg(string.format("focus %s -> %s%s",
@@ -2045,7 +2145,7 @@ ensureInputHooks = function()
                     " injected row") or ""))
         end,
         function(self)
-            local listKey = objectName(unwrap(self))
+            local listKey = objectName(hookValue(self, "focus list post"))
             local redirect = pendingFocusRedirects[listKey]
             if redirect == nil then return end
             pendingFocusRedirects[listKey] = nil
@@ -2067,8 +2167,9 @@ ensureInputHooks = function()
 
     safeHook("/Script/ROD.RODInputWidgetBase:ClickEventNotify",
         function(self, widgetParameter, buttonParameter, _)
-            local widget = unwrap(widgetParameter)
-            if isModsIcon(widget) or isModsIcon(unwrap(self)) then
+            local widget = hookValue(widgetParameter, "clicked input widget")
+            local owner = hookValue(self, "click input owner")
+            if isModsIcon(widget) or isModsIcon(owner) then
                 consumeButton(buttonParameter)
                 openPanel()
             end
@@ -2076,7 +2177,7 @@ ensureInputHooks = function()
 
     safeHook("/Script/ROD.RODListWidgetBase:ClickEvent",
         function(_, widgetParameter, buttonParameter, _)
-            if isModsIcon(unwrap(widgetParameter)) then
+            if isModsIcon(hookValue(widgetParameter, "clicked list widget")) then
                 consumeButton(buttonParameter)
                 openPanel()
             end
@@ -2084,7 +2185,7 @@ ensureInputHooks = function()
 
     safeHook("/Script/ROD.RODConsoleMainMenuWidgetBase:OnClickMenuItemDelegate",
         function(_, widgetParameter, buttonParameter)
-            if isModsIcon(unwrap(widgetParameter)) then
+            if isModsIcon(hookValue(widgetParameter, "clicked menu widget")) then
                 consumeButton(buttonParameter)
                 openPanel()
             end
@@ -2128,30 +2229,15 @@ end
 --                      KEYBOARD                          --
 --========================================================--
 
--- Controller input reaches the panel through the button hooks above. Keyboard
--- arrows do not always travel that path, so they are bound directly and gated on
--- either the panel being open or an injected rail row owning navigation focus.
--- `locked` false runs the action every time, for the same reason Back bypasses
--- the lock in routeToPanel: a keypress that only closes something must not be
--- dropped because another press is inside its 60ms window.
+-- Controller and keyboard directions on the outer rail have one canonical path:
+-- the three input hooks above. Binding the same arrows here moved the rail once
+-- through RegisterKeyBind and again through OnInputButtonDown, which is the
+-- observed first-press jump. Direct bindings remain modal-panel-only; Enter and
+-- LMB keep explicit closed-panel actions because they also support hover.
 local function activeRailContext()
     local context = activeContext
     if not menuContextIsMounted(context) or not isValid(context.icon) then return nil end
     return context
-end
-
-local function moveFocusedInjectedRow(delta)
-    local context = activeRailContext()
-    if context == nil then return end
-    local row, focusError = focusedInjectedRailRow(context)
-    if focusError ~= nil then
-        reportRailError(focusError)
-        return
-    end
-    if row == nil then return end
-    withInputLock(function()
-        moveFromRailWidget(context, row.icon, delta)
-    end)
 end
 
 local function activateModsFromKeyboard()
@@ -2172,10 +2258,10 @@ local function activateModsFromKeyboard()
         if not hovered then return end
     end
 
-    withInputLock(function()
+    if takeInputLock() then
         focusMods(context)
         openPanel()
-    end)
+    end
 end
 
 local function activateModsFromMouse()
@@ -2189,17 +2275,17 @@ local function activateModsFromMouse()
     end
     if not hovered then return end
 
-    withInputLock(function()
+    if takeInputLock() then
         focusMods(context)
         openPanel()
-    end)
+    end
 end
 
-local function bindPanelKey(key, action, locked, railAction)
+local function bindPanelKey(key, action, locked, closedAction)
     local ok, err = pcall(function()
         RegisterKeyBind(key, function()
             if not panel.isOpen() then
-                if railAction ~= nil then ExecuteInGameThread(railAction) end
+                if closedAction ~= nil then ExecuteInGameThread(closedAction) end
                 return
             end
             -- Shares the lock with the button hooks: the same keypress often
@@ -2207,8 +2293,8 @@ local function bindPanelKey(key, action, locked, railAction)
             ExecuteInGameThread(function()
                 if locked == false then
                     action()
-                else
-                    withInputLock(action)
+                elseif takeInputLock() then
+                    action()
                 end
                 if activeContext ~= nil then
                     pcall(resetNativeSelection, activeContext)
@@ -2235,10 +2321,8 @@ end
 -- same code either way. A second keyboard key costs nothing and removes the
 -- single point of failure.
 for _, binding in ipairs({
-    { "UP_ARROW", function() panel.move(-1) end, true,
-        function() moveFocusedInjectedRow(-1) end },
-    { "DOWN_ARROW", function() panel.move(1) end, true,
-        function() moveFocusedInjectedRow(1) end },
+    { "UP_ARROW", function() panel.move(-1) end, true },
+    { "DOWN_ARROW", function() panel.move(1) end, true },
     { "LEFT_ARROW", function() panel.adjust(-1) end, true },
     { "RIGHT_ARROW", function() panel.adjust(1) end, true },
     { "RETURN", function() panel.activate() end, true,
